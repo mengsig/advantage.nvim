@@ -551,10 +551,11 @@ local function project_memory()
   if not pick then return nil end
   local text = read_file(root .. "/" .. pick) or ""
   text = text:gsub("@([%w._/-]+)", function(rel)
-    -- Only resolve imports that stay inside the repo: reject absolute paths and
-    -- any `..` escape so a committed AGENTS.md/CLAUDE.md can't exfiltrate files.
-    if rel:sub(1, 1) == "/" or rel:find("%.%.") then return "@" .. rel end
-    return read_file(root .. "/" .. rel) or ("@" .. rel)
+    -- Only resolve imports that stay inside the repo: reject absolute paths,
+    -- `..` escapes, and in-repo symlinks pointing outside so a committed
+    -- AGENTS.md/CLAUDE.md can't exfiltrate files. Same containment as file tools.
+    local abs = require("advantage.util").contain(rel, root, false)
+    return (abs and read_file(abs)) or ("@" .. rel)
   end)
   text = text:gsub("<!%-%-.-%-%->", "") -- strip HTML-comment noise (e.g. tool markers)
   local cap = (opts().project_budget_tokens or 2000) * 4

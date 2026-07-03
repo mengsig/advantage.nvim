@@ -150,13 +150,32 @@ measured, not asserted.
 **Context compaction.** Old transcript history is automatically compacted when
 it crosses `context.compact_at_tokens` (roughly chars/4). The newest messages stay
 verbatim; older user asks, assistant text, tool calls and results become one
-summary message. Run `/compact` or `:Advantage compact` to force it manually.
+summary message. Compaction runs in one of two modes:
+
+- **Silent auto-compact** (a background threshold crossing mid-turn) always uses
+  a free, offline heuristic — a one-line-per-message truncation. No extra model
+  call, so a turn you didn't ask to pay for never gets a surprise network
+  round-trip added to it.
+- **Manual compaction** (`/compact` or `:Advantage compact`) defaults to
+  spending one call on `context.summarizer_model` (a fast/cheap model,
+  independent of your active chat model) so a real model writes a dense,
+  structured summary — primary intent, files touched, decisions, pending work —
+  from the *untruncated* older transcript. If that call fails, it falls back to
+  the offline heuristic automatically and shows a warning. Run
+  `/compact heuristic` (or `:Advantage compact heuristic`) to skip the model
+  call and use the free heuristic instead for a single invocation, or set
+  `context.compact_mode = "heuristic"` to make that the default everywhere.
 
 **Sub-agents.** The model has a `sub_agent` tool for read-only fan-out: a worker
 gets its own short loop and can use read/search/list tools, then returns a
 concise report to the parent agent. It cannot edit files. When the model fires
 several `sub_agent` calls in one turn they run **concurrently**, overlapping
-their network latency instead of one at a time (`subagents.parallel`).
+their network latency instead of one at a time (`subagents.parallel`). Set
+`subagents.bash = true` to also give sub-agents a **read-only** bash — inspection
+commands and git read-only subcommands only; output redirection, command
+substitution and mutating flags are rejected. It is off by default because bash
+isn't path-contained (a sub-agent could read anything your user can, with no
+permission prompt), so enable it only in repos you trust.
 
 **Repo memory & skills (self-learning harness).** advantage keeps a lightweight,
 per-repo memory so the agent gets *better and cheaper* at your codebase over time.
@@ -219,9 +238,11 @@ is sent back to the model). Read-only tools never prompt.
 
 **Sandboxing.** All file tools — including the permission-card previews, which
 read the target before you approve anything — are confined to the project root:
-absolute paths and `..` traversal outside it are rejected. Set
-`tools = { allow_outside_root = true }` if you genuinely want the agent reading
-and writing anywhere your user can (bash remains permission-gated either way).
+absolute paths and `..` traversal outside it are rejected, and the resolved
+path is checked with `realpath` so a symlink can't smuggle the agent outside the
+root either. Set `tools = { allow_outside_root = true }` if you genuinely want
+the agent reading and writing anywhere your user can (bash remains
+permission-gated either way).
 
 **Planning & batch edits.** For multi-step work the model keeps a live checklist
 with `todo_write` (rendered in the transcript as ✓/▶/· items), and several
@@ -260,12 +281,16 @@ require("advantage").setup({
     auto_compact = true,
     compact_at_tokens = 120000,  -- rough chars/4 estimate
     keep_recent_messages = 16,
-    summary_max_chars = 12000,
+    summary_max_chars = 12000,   -- heuristic-mode summary cap
+    compact_mode = "llm",        -- manual /compact: "llm" | "heuristic" (auto-compact is always heuristic)
+    summarizer_model = "anthropic/claude-haiku-4-5",
   },
   subagents = {
     enabled = true,              -- exposes the read-only `sub_agent` tool
     max_turns = 6,
     parallel = true,             -- run a fan-out batch of sub_agents concurrently
+    bash = false,                -- give sub-agents a read-only bash (see below); or
+                                 -- { allow = { "cmd", ... } } to extend the allow-list
   },
   memory = {                     -- per-repo self-learning harness (remember/use_skill)
     enabled = true,
@@ -314,10 +339,13 @@ require("advantage").setup({
 
 ```sh
 nvim -l tests/smoke.lua   # parser, providers, tools, and a full fake-provider turn
+stylua --check .          # formatting (config in stylua.toml)
 ```
+
+CI (`.github/workflows/ci.yml`) runs the smoke suite on Neovim 0.10/stable/nightly
+and checks formatting on every push.
 
 ## Roadmap
 
-- richer compaction (model-written summaries / checkpoint restore)
+- compaction checkpoint restore (undo a compaction / inspect what was folded in)
 - relevance-filtered memory injection (per-turn fact subsetting by touched paths)
-- symlink-aware containment (realpath verification for repos that need it)

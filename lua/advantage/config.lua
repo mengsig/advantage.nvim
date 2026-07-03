@@ -71,6 +71,18 @@ M.defaults = {
     keep_recent_messages = 16,
     ---Maximum characters in the generated compaction summary.
     summary_max_chars = 12000,
+    ---Mode for manual/forced compaction (`/compact`, `:Advantage compact`):
+    ---"llm" spends one call on `summarizer_model` for a real, semantically
+    ---prioritized summary; "heuristic" stays free/offline (the old behavior).
+    ---Silent auto-compact (crossing compact_at_tokens mid-turn) always uses the
+    ---heuristic regardless of this setting, so a background threshold crossing
+    ---never adds a surprise network round-trip to a turn you didn't ask to pay
+    ---for. Override per-invocation with `/compact llm` or `/compact heuristic`.
+    compact_mode = "llm",
+    ---Model that performs the LLM summarization call, as "provider/model-id".
+    ---Kept separate from the active chat model so compaction stays cheap and
+    ---fast even mid-session on an expensive model.
+    summarizer_model = "anthropic/claude-haiku-4-5",
   },
 
   subagents = {
@@ -82,6 +94,13 @@ M.defaults = {
     ---network latency) instead of one-at-a-time. Only pure read-only sub_agent
     ---batches are parallelised; mutating/permissioned tools always run in order.
     parallel = true,
+    ---Give sub-agents a read-only `bash` tool (inspection commands + git
+    ---read-only subcommands only; redirection and mutating flags are rejected).
+    ---Off by default: bash is not path-contained, so a sub-agent could read
+    ---anything your user can, with no permission prompt. Enable only in repos you
+    ---trust. `true` uses the built-in allow-list; pass `{ allow = { "cmd", ... } }`
+    ---to extend it.
+    bash = false,
   },
 
   ---Per-repo self-learning harness: the agent records durable facts about a repo

@@ -16,51 +16,9 @@ local MAX_LINE_LEN = 500
 ---lexically and by resolving symlinks (realpath), so a symlink committed inside
 ---the repo that points outside cannot be used to escape the sandbox.
 ---@return string|nil abs_path, string|nil err
-local function under(root, abs)
-  return abs == root or abs:sub(1, #root + 1) == root .. "/"
-end
-
----Follow symlinks and verify the resolved path stays under `root`. Handles
----not-yet-existing paths (e.g. write_file to a new file) by resolving the
----deepest existing ancestor — the missing tail cannot itself be a symlink.
-local function realpath_contained(abs, root)
-  local real_root = uv.fs_realpath(root)
-  if not real_root then return true end -- root missing: nothing to escape
-  local rp = uv.fs_realpath(abs)
-  if rp then return under(real_root, rp) end
-  local dir = abs
-  while true do
-    dir = dir:match("^(.*)/[^/]+$") or ""
-    if dir == "" then dir = "/" end
-    local rdir = uv.fs_realpath(dir)
-    if rdir then return under(real_root, rdir) end
-    if dir == "/" then return false end
-  end
-end
-
 local function resolve(path, ctx)
-  if not path or path == "" then return nil, "empty path" end
-  path = vim.fs.normalize(path)
-  if path:sub(1, 1) ~= "/" then path = vim.fs.normalize(ctx.cwd .. "/" .. path) end
-  -- fold "." and ".." lexically (vim.fs.normalize does not resolve "..")
-  local parts = {}
-  for comp in path:gmatch("[^/]+") do
-    if comp == ".." then
-      if #parts == 0 then return nil, "path escapes the filesystem root" end
-      parts[#parts] = nil
-    elseif comp ~= "." then
-      parts[#parts + 1] = comp
-    end
-  end
-  local abs = "/" .. table.concat(parts, "/")
   local tcfg = require("advantage.config").options.tools or {}
-  if tcfg.allow_outside_root then return abs end
-  local root = vim.fs.normalize(ctx.cwd)
-  if not under(root, abs) then
-    return nil, "outside the project root (set tools.allow_outside_root to permit external paths)"
-  end
-  if not realpath_contained(abs, root) then return nil, "path resolves (via a symlink) outside the project root" end
-  return abs
+  return require("advantage.util").contain(path, ctx.cwd, tcfg.allow_outside_root)
 end
 
 local function read_all(path)
@@ -833,6 +791,40 @@ end
 
 function M.get(name)
   return by_name[name]
+end
+
+---Validate a decoded tool input against its schema's `required` list. Models
+---intermittently drop a required argument (classically `path` on edit_file when
+---the big `new_string` field dominates the call), and a truncated tool-call
+---stream decodes to an empty object. Both used to fail deep inside the tool with
+---a cryptic, tool-specific message ("Cannot edit nil: empty path"), which the
+---model tends to repeat rather than correct. Returning a precise, uniform error
+---up front turns that into a one-shot self-correction.
+---@return string|nil err  nil if valid, else a message naming the missing args
+function M.validate_input(name, input)
+  local def = by_name[name]
+  local req = def and def.input_schema and def.input_schema.required
+  if not req then return nil end
+  input = type(input) == "table" and input or {}
+  local missing = {}
+  for _, field in ipairs(req) do
+    -- Present-but-empty is the tool's own concern (e.g. edit_file new_string=""
+    -- deletes text); "required" only means the key must be supplied.
+    if input[field] == nil then missing[#missing + 1] = field end
+  end
+  if #missing == 0 then return nil end
+  local provided = {}
+  for k in pairs(input) do
+    provided[#provided + 1] = k
+  end
+  table.sort(provided)
+  return ("%s: missing required argument%s: %s. %s"):format(
+    name,
+    #missing == 1 and "" or "s",
+    table.concat(missing, ", "),
+    #provided > 0 and ("You provided: " .. table.concat(provided, ", ") .. ".")
+      or "You provided no arguments — re-issue the call with all required fields."
+  )
 end
 
 ---Resolve a tool path argument against the project root (for snapshots etc).

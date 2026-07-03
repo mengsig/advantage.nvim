@@ -136,10 +136,10 @@ function M.expand_mentions(text, cwd)
       seen[token] = true
       local rel, lo, hi = parse_token(token)
       -- Keep mentions inside the project root unless explicitly opted out, so
-      -- `@/etc/passwd` / `@../secret` don't get inlined into the prompt.
-      local escapes = rel:sub(1, 1) == "/" or rel:find("%.%.") ~= nil
-      local path = rel:sub(1, 1) == "/" and rel or (cwd .. "/" .. rel)
-      local stat = (allow_outside or not escapes) and uv.fs_stat(path) or nil
+      -- `@/etc/passwd`, `@../secret`, or an in-repo symlink pointing outside
+      -- don't get inlined into the prompt. Same containment as the file tools.
+      local path = require("advantage.util").contain(rel, cwd, allow_outside)
+      local stat = path and uv.fs_stat(path) or nil
       if stat and stat.type == "file" then
         files[#files + 1] = { name = token, rel = rel, path = path, size = stat.size, lo = lo, hi = hi }
       end

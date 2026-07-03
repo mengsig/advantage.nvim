@@ -11,6 +11,58 @@ function M.win_valid(win)
   return win and vim.api.nvim_win_is_valid(win)
 end
 
+local function under(root, abs)
+  return abs == root or abs:sub(1, #root + 1) == root .. "/"
+end
+
+---Follow symlinks and verify the resolved path stays under `root`. Handles
+---not-yet-existing paths by resolving the deepest existing ancestor — the
+---missing tail cannot itself be a symlink.
+local function realpath_contained(abs, root)
+  local real_root = uv.fs_realpath(root)
+  if not real_root then return true end -- root missing: nothing to escape
+  local rp = uv.fs_realpath(abs)
+  if rp then return under(real_root, rp) end
+  local dir = abs
+  while true do
+    dir = dir:match("^(.*)/[^/]+$") or ""
+    if dir == "" then dir = "/" end
+    local rdir = uv.fs_realpath(dir)
+    if rdir then return under(real_root, rdir) end
+    if dir == "/" then return false end
+  end
+end
+
+---Resolve `path` against `root` and enforce containment: reject absolute paths
+---and `..` traversal that leave the root, and reject paths that resolve outside
+---it via a symlink (realpath). `allow_outside` skips the containment checks but
+---still folds `.`/`..` sanely. Returns `abs_path` or `nil, err`. This is the one
+---containment primitive shared by the file tools, @mentions and @imports.
+---@return string|nil abs_path, string|nil err
+function M.contain(path, root, allow_outside)
+  if not path or path == "" then return nil, "empty path" end
+  path = vim.fs.normalize(path)
+  root = vim.fs.normalize(root)
+  if path:sub(1, 1) ~= "/" then path = vim.fs.normalize(root .. "/" .. path) end
+  -- fold "." and ".." lexically (vim.fs.normalize does not resolve "..")
+  local parts = {}
+  for comp in path:gmatch("[^/]+") do
+    if comp == ".." then
+      if #parts == 0 then return nil, "path escapes the filesystem root" end
+      parts[#parts] = nil
+    elseif comp ~= "." then
+      parts[#parts + 1] = comp
+    end
+  end
+  local abs = "/" .. table.concat(parts, "/")
+  if allow_outside then return abs end
+  if not under(root, abs) then
+    return nil, "outside the project root (set tools.allow_outside_root to permit external paths)"
+  end
+  if not realpath_contained(abs, root) then return nil, "path resolves (via a symlink) outside the project root" end
+  return abs
+end
+
 ---Format a token count like `12.4k`.
 function M.fmt_tokens(n)
   n = n or 0

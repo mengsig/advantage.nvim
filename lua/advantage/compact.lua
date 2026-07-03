@@ -1,12 +1,23 @@
----@brief Heuristic conversation compaction for long sessions.
+---@brief Conversation compaction for long sessions, in two modes.
 ---
 ---The harness keeps full canonical messages while a conversation is small. Once a
 ---rough token estimate crosses `context.compact_at_tokens`, older messages are
----collapsed into a text summary and the newest messages are kept verbatim. This is
----intentionally provider-agnostic and offline: it does not spend an extra model
----call to summarize, but it preserves the important durable facts (user asks,
----assistant answers, tool calls and tool results) well enough to keep the next
----turn grounded.
+---collapsed into a summary and the newest messages are kept verbatim.
+---
+---Two independent code paths produce that summary:
+---  * `M.compact` / `M.force` — a heuristic, offline, one-line-per-message
+---    truncation. No extra model call, so it is free and instant. Used for all
+---    silent, mid-turn auto-compaction (a background threshold crossing should
+---    never add a surprise network round-trip to a turn the user didn't ask to
+---    pay for), and as the default/fallback for manual compaction.
+---  * `M.summarize_with_llm` — spends one call on `context.summarizer_model` to
+---    have a model write a real, semantically-prioritized summary from the
+---    *untruncated* older transcript. Async (goes through a provider's
+---    `stream()`), used only for manual/forced compaction when
+---    `context.compact_mode == "llm"`.
+---Both paths share the same cut-point selection and role/tool-pairing safety
+---logic (`prepare_split`) and the same splice-back-in logic (`splice_summary`),
+---so the resulting message shape is identical regardless of which mode wrote it.
 local M = {}
 
 local SUMMARY_PREFIX = "Conversation context summary (auto-compacted by advantage.nvim)."
@@ -216,6 +227,51 @@ local function adjust_cut_for_tool_pairs(messages, cut)
   return cut
 end
 
+---Shared prep for both compaction paths: pick the cut point (respecting
+---tool_use/tool_result pairing), split into older/recent, and peel off a prior
+---carried-forward summary so repeat compaction extends it instead of nesting or
+---re-truncating it. Returns nil if there isn't enough history to bother with.
+---@return {older: table[], recent: table[], carry: string|nil}|nil
+local function prepare_split(messages, opts)
+  local keep = math.max(2, opts.keep_recent_messages or 16)
+  if #messages <= keep + 1 then return nil end
+
+  local cut = adjust_cut_for_tool_pairs(messages, #messages - keep)
+  if cut <= 0 then return nil end
+  local older = vim.deepcopy(vim.list_slice(messages, 1, cut))
+  local recent = strip_replay_only_blocks(vim.list_slice(messages, cut + 1, #messages))
+
+  local carry = nil
+  if is_summary_message(older[1]) then
+    carry = older[1].content[1].text
+    table.remove(older, 1)
+  end
+  return { older = older, recent = recent, carry = carry }
+end
+
+---Splice a finished summary text back in ahead of the retained `recent`
+---messages. The summary is emitted as a `user` message. Providers such as
+---Anthropic require strictly alternating user/assistant roles, so if the first
+---retained message is also a `user` turn the summary is folded into it rather
+---than prepended as a second consecutive `user` message (which triggers a 400).
+local function splice_summary(recent, summary_text)
+  local summary_block = { type = "text", text = summary_text }
+  if type(recent[1]) == "table" and recent[1].role == "user" then
+    local merged = { summary_block }
+    for _, b in ipairs(content_blocks(recent[1])) do
+      merged[#merged + 1] = b
+    end
+    local out = { { role = "user", content = merged } }
+    for i = 2, #recent do
+      out[#out + 1] = recent[i]
+    end
+    return out
+  end
+  local out = { { role = "user", content = { summary_block } } }
+  vim.list_extend(out, recent)
+  return out
+end
+
 ---@param messages table[] canonical messages
 ---@param opts table context config
 ---@return table[] new_messages, table|nil info
@@ -226,53 +282,176 @@ function M.compact(messages, opts)
   local before_tokens = M.estimate_tokens(messages)
   if before_tokens < threshold then return messages, nil end
 
-  local keep = math.max(2, opts.keep_recent_messages or 16)
-  if #messages <= keep + 1 then return messages, nil end
+  local split = prepare_split(messages, opts)
+  if not split then return messages, nil end
 
-  local cut = adjust_cut_for_tool_pairs(messages, #messages - keep)
-  if cut <= 0 then return messages, nil end
-  local older = vim.deepcopy(vim.list_slice(messages, 1, cut))
-  local recent = strip_replay_only_blocks(vim.list_slice(messages, cut + 1, #messages))
-
-  -- If we are compacting an already-compacted session, carry the previous summary
-  -- forward verbatim rather than re-summarizing (and truncating) it or nesting it.
-  local carry = nil
-  if is_summary_message(older[1]) then
-    carry = older[1].content[1].text
-    table.remove(older, 1)
-  end
-
-  local summary = summarize_messages(older, opts.summary_max_chars or 12000, carry)
-  local summary_block = { type = "text", text = summary }
-  local compacted
-  -- The summary is emitted as a `user` message. Providers such as Anthropic
-  -- require strictly alternating user/assistant roles, so if the first retained
-  -- message is also a `user` turn we must fold the summary into it rather than
-  -- prepend a second consecutive `user` message (which triggers a 400).
-  if type(recent[1]) == "table" and recent[1].role == "user" then
-    local first = recent[1]
-    local content = content_blocks(first)
-    local merged = { summary_block }
-    for _, b in ipairs(content) do
-      merged[#merged + 1] = b
-    end
-    recent[1] = { role = "user", content = merged }
-    compacted = recent
-  else
-    compacted = { { role = "user", content = { summary_block } } }
-    vim.list_extend(compacted, recent)
-  end
+  local summary = summarize_messages(split.older, opts.summary_max_chars or 12000, split.carry)
+  local compacted = splice_summary(split.recent, summary)
   return compacted,
     {
       before_tokens = before_tokens,
       after_tokens = M.estimate_tokens(compacted),
-      compacted_messages = #older,
+      compacted_messages = #split.older,
     }
 end
 
 function M.force(messages, opts)
   opts = vim.tbl_extend("force", opts or {}, { compact_at_tokens = 0 })
   return M.compact(messages, opts)
+end
+
+-- LLM-summarized compaction ---------------------------------------------------
+
+local SUMMARIZER_SYSTEM_PROMPT = table.concat({
+  "You are compacting an in-progress coding-agent conversation so it can continue with a smaller context window.",
+  "Write a dense, structured summary of the transcript below. It replaces the raw messages, so the agent must be able to resume work correctly from it alone (plus the verbatim recent messages that follow it in the real conversation).",
+  "",
+  "Use these sections, omitting any with nothing to report:",
+  "1. Primary Request and Intent — what the user actually asked for, in their own terms.",
+  "2. Key Technical Concepts — frameworks, patterns, constraints relevant to the task.",
+  "3. Files and Code Sections — every file read, created or edited, why it matters, and any code/diff worth preserving verbatim.",
+  "4. Errors and Fixes — problems hit and how they were resolved (or weren't).",
+  "5. Problem Solving — decisions made and their reasoning.",
+  "6. Pending Tasks — work started but not finished.",
+  "7. Current Work — exactly what was being done immediately before this summary was triggered.",
+  "8. Next Step — the next action to take, quoting the most recent unresolved user request verbatim.",
+  "",
+  "If the transcript begins with 'Previously compacted summary', that is an earlier summary of even-older history: update and tighten it in place using the newer messages rather than discarding it or bolting a second summary alongside it.",
+  "Be concrete: prefer exact file paths, function names, and command output over vague paraphrase. Do not invent information that isn't in the transcript.",
+  "Respond with ONLY the summary text — no preamble, no meta-commentary about being an AI.",
+}, "\n")
+
+-- Far more generous than the heuristic path's 900-char cap (that path *is* the
+-- compression; this cap just bounds the input to a model that does the actual
+-- compressing) but still bounded so one giant tool result can't blow out the
+-- summarizer's own context.
+local LLM_BLOCK_CHAR_CAP = 6000
+-- Hard ceiling on the whole serialized transcript handed to the summarizer.
+local LLM_TRANSCRIPT_CHAR_CAP = 400000
+-- Safety net on the model's own output so a misbehaving summarizer can't make
+-- "compacted" history bigger than the thing it replaced.
+local LLM_SUMMARY_CHAR_CEILING = 60000
+
+-- Unlike trim_one_line (used for the heuristic's display-only truncation),
+-- this preserves whitespace/newlines: the summarizer needs real code
+-- formatting and diff structure to read the transcript accurately.
+local function trim_block(s, max)
+  s = tostring(s or "")
+  if #s > max then return utf8_safe_sub(s, math.max(0, max - 1)) .. "…[truncated]" end
+  return s
+end
+
+local function serialize_transcript(messages, carry)
+  local lines = {}
+  if carry and carry ~= "" then
+    vim.list_extend(lines, {
+      "Previously compacted summary (update/tighten this, don't discard it):",
+      carry,
+      "",
+      "Older messages that aged out since that summary was written:",
+      "",
+    })
+  end
+  local total = #table.concat(lines, "\n")
+  for i, msg in ipairs(messages) do
+    msg = type(msg) == "table" and msg or { role = "?", content = { msg } }
+    local parts = {}
+    for _, block in ipairs(content_blocks(msg)) do
+      parts[#parts + 1] = trim_block(block_text(block), LLM_BLOCK_CHAR_CAP)
+    end
+    local line = ("%02d %s: %s"):format(i, msg.role or "?", table.concat(parts, " | "))
+    if total + #line + 1 > LLM_TRANSCRIPT_CHAR_CAP then
+      lines[#lines + 1] = "[remaining older history omitted to fit the summarizer's context]"
+      break
+    end
+    lines[#lines + 1] = line
+    total = total + #line + 1
+  end
+  return table.concat(lines, "\n")
+end
+
+local function frame_llm_summary(summary, model_label)
+  summary = vim.trim(summary or "")
+  if #summary > LLM_SUMMARY_CHAR_CEILING then
+    summary = utf8_safe_sub(summary, LLM_SUMMARY_CHAR_CEILING - 1) .. "…[summary truncated]"
+  end
+  return table.concat({
+    SUMMARY_PREFIX .. (" (model summary via %s)."):format(model_label or "llm"),
+    "The following is a model-written summary of earlier conversation history. Treat it as prior context; newer messages after this summary are verbatim.",
+    "",
+    summary,
+  }, "\n")
+end
+
+---Spend one model call to write a real semantic summary of the older half of
+---the transcript, then splice it in exactly like the heuristic path does. Used
+---only for manual/forced compaction (`context.compact_mode == "llm"`) — silent
+---mid-turn auto-compact always stays on the free heuristic in `M.compact`.
+---@param messages table[] canonical messages
+---@param opts table context config (keep_recent_messages, summarizer_model, …)
+---@param on_done fun(next_messages: table[]|nil, info: table|nil, err: string|nil)
+---@return table|nil job a `{stop = fun()}` handle for the in-flight request, or nil if nothing was sent
+function M.summarize_with_llm(messages, opts, on_done)
+  opts = type(opts) == "table" and opts or {}
+  messages = type(messages) == "table" and messages or {}
+  on_done = on_done or function() end
+  local before_tokens = M.estimate_tokens(messages)
+
+  local split = prepare_split(messages, opts)
+  if not split then
+    on_done(nil, nil, nil)
+    return nil
+  end
+
+  local config = require("advantage.config")
+  local providers = require("advantage.providers")
+  local resolved = config.resolve_model(opts.summarizer_model or "anthropic/claude-haiku-4-5")
+  local provider = resolved and providers.get(resolved.provider)
+  if not provider then
+    on_done(nil, nil, "unknown summarizer model: " .. tostring(opts.summarizer_model))
+    return nil
+  end
+
+  local transcript = serialize_transcript(split.older, split.carry)
+  local usage = { input = 0, output = 0, cached = 0 }
+
+  return provider.stream({
+    model = { id = resolved.id, thinking = false },
+    system = SUMMARIZER_SYSTEM_PROMPT,
+    messages = { { role = "user", content = { { type = "text", text = transcript } } } },
+    tools = nil,
+    on = {
+      text = function() end,
+      thinking = function() end,
+      tool_start = function() end,
+      usage = function(inp, out, cached)
+        usage.input, usage.output, usage.cached = inp or 0, out or 0, cached or 0
+      end,
+      complete = function(blocks, stop_reason)
+        local text = {}
+        for _, b in ipairs(blocks or {}) do
+          if type(b) == "table" and b.type == "text" and b.text then text[#text + 1] = b.text end
+        end
+        local summary = vim.trim(table.concat(text, "\n"))
+        if summary == "" then
+          on_done(nil, nil, "summarizer returned no text (stop_reason: " .. tostring(stop_reason) .. ")")
+          return
+        end
+        local compacted = splice_summary(split.recent, frame_llm_summary(summary, resolved.label))
+        on_done(compacted, {
+          before_tokens = before_tokens,
+          after_tokens = M.estimate_tokens(compacted),
+          compacted_messages = #split.older,
+          mode = "llm",
+          model = resolved,
+          usage = usage,
+        }, nil)
+      end,
+      error = function(msg)
+        on_done(nil, nil, msg)
+      end,
+    },
+  })
 end
 
 M._SUMMARY_PREFIX = SUMMARY_PREFIX

@@ -125,12 +125,34 @@ function Agent:busy()
   return self.status ~= "idle"
 end
 
-function Agent:compact()
+---@param opts? {mode?: "llm"|"heuristic"} one-off override of context.compact_mode
+---@param callback? fun(info: table|nil) info is nil when there was nothing to compact
+function Agent:compact(opts, callback)
+  opts = opts or {}
+  callback = callback or function() end
   if self:busy() then
     self:ui().notify("finish or cancel the running turn before compacting context", vim.log.levels.WARN)
-    return nil
+    return callback(nil)
   end
-  return self:_maybe_compact(true)
+  self.status = "compacting"
+  self:ui().set_status("tool", "compacting…")
+  self:_maybe_compact(true, opts, function(info)
+    self.status = "idle"
+    self:ui().set_status("idle")
+    callback(info)
+    -- A message sent while compaction was in flight was queued (there's no
+    -- "next tool call" to inject it before); dispatch it now, mirroring _finish.
+    if #self.queue > 0 then
+      local nxt = table.remove(self.queue, 1)
+      self:ui().set_queue(#self.queue)
+      vim.schedule(function()
+        if not self:busy() then
+          nxt.opts.mode = nil
+          self:send(nxt.text, nxt.opts)
+        end
+      end)
+    end
+  end)
 end
 
 local function user_content(text, opts, cwd)
@@ -180,7 +202,9 @@ end
 function Agent:send(text, opts)
   opts = opts or {}
   if self:busy() then
-    if opts.mode == "queued" then
+    -- Mid-compaction there is no "next tool call" to inject an interrupt
+    -- before, so always queue instead (dispatched once compaction finishes).
+    if opts.mode == "queued" or self.status == "compacting" then
       self.queue[#self.queue + 1] = { text = text, opts = opts }
       self:ui().queued(#self.queue, text)
       return
@@ -254,27 +278,75 @@ function Agent:_snapshot(call)
   return path
 end
 
-function Agent:_maybe_compact(force)
+---@param force boolean true for manual/forced compaction, false for the silent auto-compact check
+---@param opts? {mode?: "llm"|"heuristic"}
+---@param callback? fun(info: table|nil)
+function Agent:_maybe_compact(force, opts, callback)
+  opts = opts or {}
+  callback = callback or function() end
   local cfg = config.options.context or {}
-  if not force and cfg.auto_compact == false then return nil end
+  if not force and cfg.auto_compact == false then return callback(nil) end
   local compact = require("advantage.compact")
-  local next_messages, info
-  if force then
-    next_messages, info = compact.force(self.messages, cfg)
-  else
-    next_messages, info = compact.compact(self.messages, cfg)
+  local util = require("advantage.util")
+
+  local function finish_heuristic()
+    local next_messages, info
+    if force then
+      next_messages, info = compact.force(self.messages, cfg)
+    else
+      next_messages, info = compact.compact(self.messages, cfg)
+    end
+    if info then
+      self.messages = next_messages
+      self:ui().notice(
+        ("compacted %d old messages (~%s → ~%s tokens)"):format(
+          info.compacted_messages,
+          util.fmt_tokens(info.before_tokens),
+          util.fmt_tokens(info.after_tokens)
+        )
+      )
+    end
+    callback(info)
   end
-  if info then
+
+  -- Silent, mid-turn auto-compact always stays on the free heuristic so a
+  -- background threshold crossing never adds a surprise network round-trip to
+  -- a turn the user didn't ask to pay for. Manual /compact can opt into a real
+  -- LLM summary via context.compact_mode (or a one-off /compact llm|heuristic).
+  local mode = force and (opts.mode or cfg.compact_mode or "heuristic") or "heuristic"
+  if mode ~= "llm" then return finish_heuristic() end
+
+  self.job = compact.summarize_with_llm(self.messages, cfg, function(next_messages, info, err)
+    self.job = nil
+    if not next_messages then
+      if not err then return callback(nil) end
+      self
+        :ui()
+        .notify(
+          "LLM compaction failed (" .. tostring(err) .. ") — falling back to the offline heuristic",
+          vim.log.levels.WARN
+        )
+      return finish_heuristic()
+    end
     self.messages = next_messages
+    if info.usage and ((info.usage.input or 0) > 0 or (info.usage.output or 0) > 0) then
+      local u = info.usage
+      self.usage.input = self.usage.input + u.input
+      self.usage.output = self.usage.output + u.output
+      self.usage.cached = (self.usage.cached or 0) + (u.cached or 0)
+      self:ui().set_usage(self.usage)
+      require("advantage.usage").record(info.model, u.input, u.output, u.cached)
+    end
     self:ui().notice(
-      ("compacted %d old messages (~%s → ~%s tokens)"):format(
+      ("compacted %d old messages with %s (~%s → ~%s tokens)"):format(
         info.compacted_messages,
-        require("advantage.util").fmt_tokens(info.before_tokens),
-        require("advantage.util").fmt_tokens(info.after_tokens)
+        (info.model and info.model.label) or "llm",
+        util.fmt_tokens(info.before_tokens),
+        util.fmt_tokens(info.after_tokens)
       )
     )
-  end
-  return info
+    callback(info)
+  end)
 end
 
 function Agent:_turn()
@@ -428,8 +500,11 @@ function Agent:_run_tools_parallel(calls, seed)
       maybe_finish()
     end
 
+    local verr = tool and tools.validate_input(call.name, call.input)
     if not tool then
       settle("Unknown tool: " .. tostring(call.name), true)
+    elseif verr then
+      settle(verr, true)
     else
       local done = false
       local ok, handle = pcall(
@@ -530,6 +605,13 @@ function Agent:_run_tools(calls)
     if not tool then
       record(call, "Unknown tool: " .. tostring(call.name), true)
       ui.tool_update(call.id, { status = "error", detail = "unknown tool" })
+      return run_next()
+    end
+
+    local verr = tools.validate_input(call.name, call.input)
+    if verr then
+      record(call, verr, true)
+      ui.tool_update(call.id, { status = "error", detail = "missing argument" })
       return run_next()
     end
 

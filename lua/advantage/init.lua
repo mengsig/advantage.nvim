@@ -510,10 +510,17 @@ function M.usage()
 end
 
 ---Force context compaction for the current session.
-function M.compact()
+---@param mode? "llm"|"heuristic" one-off override of context.compact_mode
+function M.compact(mode)
   local agent = ensure_agent()
-  local info = agent:compact()
-  if not info then ui.notify("context is already compact enough") end
+  mode = mode and mode ~= "" and mode or nil
+  if mode and mode ~= "llm" and mode ~= "heuristic" then
+    ui.notify("unknown compact mode: " .. tostring(mode) .. " (expected llm or heuristic)", vim.log.levels.WARN)
+    return
+  end
+  agent:compact({ mode = mode }, function(info)
+    if not info then ui.notify("context is already compact enough") end
+  end)
 end
 
 ---View / manage the per-repo learned memory (also `/context`).
@@ -607,7 +614,7 @@ function M._command(opts)
   elseif sub == "usage" then
     M.usage()
   elseif sub == "compact" then
-    M.compact()
+    M.compact(args[2])
   elseif sub == "context" or sub == "memory" then
     M.context(table.concat(vim.list_slice(args, 2), " "))
   elseif sub == "help" or sub == "keys" then

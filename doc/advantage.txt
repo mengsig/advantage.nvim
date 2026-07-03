@@ -60,7 +60,11 @@ With lazy.nvim: >lua
 :Advantage resume       Resume a saved session for this project.
 :Advantage stop         Cancel the in-flight turn.
 :Advantage usage        Token usage dashboard.
-:Advantage compact      Force conversation compaction.
+:Advantage compact [llm|heuristic]
+                        Force conversation compaction. Defaults to
+                        `context.compact_mode`; "llm" spends one call on
+                        `context.summarizer_model` for a real summary,
+                        "heuristic" stays free/offline.
 :Advantage context      Show/manage per-repo memory (see |advantage-memory|).
 :Advantage review       Review the agent's file changes (diff).
 :Advantage yolo [on|off]
@@ -110,6 +114,8 @@ Full defaults live in `lua/advantage/config.lua`. Key options: >lua
         auto_compact = true,
         compact_at_tokens = 120000,
         keep_recent_messages = 16,
+        compact_mode = "llm",    -- manual /compact only; auto-compact is always heuristic
+        summarizer_model = "anthropic/claude-haiku-4-5",
       },
       subagents = { enabled = true, max_turns = 6, parallel = true },
       memory = { enabled = true, budget_tokens = 1200 },

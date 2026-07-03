@@ -296,6 +296,30 @@ do
   local _, err = run("edit_file", { path = "x/hello.txt", old_string = "nope", new_string = "x" })
   check(err == true, "edit_file errors on missing old_string")
 
+  -- validate_input: the classic "model dropped path" case gets a crisp,
+  -- self-correcting error naming the missing arg and what was provided.
+  local ve = tools.validate_input("edit_file", { old_string = "a", new_string = "b" })
+  check(
+    ve
+      and ve:find("missing required argument: path", 1, true)
+      and ve:find("You provided: new_string, old_string", 1, true),
+    "validate_input names the missing arg and provided args"
+  )
+  check(
+    tools.validate_input("edit_file", {}):find("no arguments", 1, true),
+    "validate_input flags a truncated/empty tool call"
+  )
+  check(
+    tools.validate_input("edit_file", { path = "p", old_string = "a", new_string = "b" }) == nil,
+    "validate_input passes a complete call"
+  )
+  -- present-but-empty required field is valid (edit_file new_string='' deletes)
+  check(
+    tools.validate_input("edit_file", { path = "p", old_string = "a", new_string = "" }) == nil,
+    "validate_input allows empty-string required field"
+  )
+  check(tools.validate_input("read_file", { path = "p" }) == nil, "validate_input passes read_file with path")
+
   r = run("bash", { command = "echo out; echo err >&2; exit 3" })
   check(r:find("out") and r:find("err") and r:find("exit code 3"), "bash merges output + exit code")
 
@@ -478,6 +502,158 @@ do
   check(pcall(vim.fn.json_encode, summary_text), "compact truncates the summary on a UTF-8 character boundary")
 end
 
+-- 4a2. LLM-summarized compaction ---------------------------------------------
+
+section("LLM-summarized compaction")
+do
+  local providers = require("advantage.providers")
+  local agent_mod = require("advantage.agent")
+  local config = require("advantage.config")
+  local compact = require("advantage.compact")
+
+  config.options.context.keep_recent_messages = 4
+  config.options.context.summarizer_model = "fakesummarizer/mini"
+  -- the queued-message sub-test below lets a real follow-up turn dispatch;
+  -- autosave would write it into the shared session storage the later
+  -- "agent e2e" section reads from, so keep it off for this whole section.
+  config.options.sessions.autosave = false
+
+  local function make_messages(n)
+    local out = {}
+    for i = 1, n do
+      out[#out + 1] = {
+        role = i % 2 == 1 and "user" or "assistant",
+        content = { { type = "text", text = ("turn %d content"):format(i) } },
+      }
+    end
+    return out
+  end
+
+  -- unit path: compact.summarize_with_llm directly
+  do
+    local seen_req
+    providers.register("fakesummarizer", {
+      stream = function(req)
+        seen_req = req
+        vim.defer_fn(function()
+          req.on.usage(500, 80, 0)
+          req.on.complete(
+            { { type = "text", text = "Primary Request and Intent: build a widget.\nNext Step: ship it." } },
+            "end_turn"
+          )
+        end, 5)
+        return { stop = function() end }
+      end,
+    })
+
+    local done, next_messages, info, err = false, nil, nil, nil
+    compact.summarize_with_llm(make_messages(10), config.options.context, function(nm, i, e)
+      next_messages, info, err = nm, i, e
+      done = true
+    end)
+    vim.wait(2000, function()
+      return done
+    end, 5)
+    check(done, "summarize_with_llm completed")
+    check(err == nil, "summarize_with_llm reported no error")
+    check(next_messages ~= nil, "summarize_with_llm produced compacted messages")
+    check(
+      next_messages and next_messages[1].content[1].text:find(compact._SUMMARY_PREFIX, 1, true) ~= nil,
+      "LLM summary still carries the shared SUMMARY_PREFIX (openai reasoning-drop detection depends on it)"
+    )
+    check(
+      next_messages and next_messages[1].content[1].text:find("build a widget", 1, true) ~= nil,
+      "model-written summary text is preserved"
+    )
+    check(
+      info and info.mode == "llm" and info.model and info.model.provider == "fakesummarizer",
+      "info reports llm mode and the resolved summarizer model"
+    )
+    check(info and info.usage and info.usage.input == 500, "info carries summarizer token usage")
+    check(seen_req and seen_req.model.thinking == false, "summarizer request disables thinking")
+    check(
+      seen_req and seen_req.messages[1].content[1].text:find("turn 1 content", 1, true) ~= nil,
+      "raw (untruncated) transcript is sent to the summarizer"
+    )
+  end
+
+  -- agent-level path: Agent:compact({mode="llm"}) end-to-end. A message sent
+  -- mid-compaction has no "next tool call" to inject before, so it must queue
+  -- and dispatch once compaction settles rather than get lost or 400 the API.
+  do
+    local ag = agent_mod.new({ model = { provider = "fakesummarizer", id = "mini", label = "mini" } })
+    ag.messages = make_messages(10)
+
+    local cb_info
+    ag:compact({ mode = "llm" }, function(info)
+      cb_info = info
+    end)
+    check(ag.status == "compacting", "agent status reflects an in-flight LLM compaction")
+    check(ag:busy() == true, "agent reports busy while compacting")
+
+    ag:send("during compaction")
+    check(#ag.queue == 1, "a message sent mid-compaction is queued rather than injected as an interrupt")
+
+    vim.wait(2000, function()
+      return ag.status == "idle"
+    end, 5)
+    check(cb_info ~= nil, "compact callback received info")
+    check(#ag.messages < 10, "agent messages array was replaced with the compacted result")
+    check(ag.usage.input >= 500, "summarizer usage was folded into session usage totals")
+
+    -- Let the queued message's own dispatched turn (scheduled once compaction
+    -- settled) fully finish before moving on, so it can't leak a pending
+    -- callback into a later, unrelated test section.
+    vim.wait(2000, function()
+      return ag.status == "idle" and #ag.messages > 4
+    end, 5)
+    check(#ag.messages == 6, "queued message dispatched its own follow-up turn once compaction settled")
+  end
+
+  -- failure path: the summarizer errors, so compaction must still succeed via
+  -- the offline heuristic — but the failure itself must not be silent.
+  do
+    providers.register("fakesummarizerfail", {
+      stream = function(req)
+        vim.defer_fn(function()
+          req.on.error("boom: simulated network failure")
+        end, 5)
+        return { stop = function() end }
+      end,
+    })
+    config.options.context.summarizer_model = "fakesummarizerfail/mini"
+
+    local ui = require("advantage.ui.chat")
+    local orig_notify = ui.notify
+    local warned = false
+    ui.notify = function(msg, level)
+      if level == vim.log.levels.WARN and tostring(msg):find("LLM compaction failed", 1, true) then warned = true end
+      return orig_notify(msg, level)
+    end
+
+    local ag2 = agent_mod.new({ model = { provider = "fakesummarizerfail", id = "mini", label = "mini" } })
+    ag2.messages = make_messages(10)
+    local cb_info2, done2 = nil, false
+    ag2:compact({ mode = "llm" }, function(info)
+      cb_info2 = info
+      done2 = true
+    end)
+    vim.wait(2000, function()
+      return done2
+    end, 5)
+    ui.notify = orig_notify
+
+    check(warned, "a failed LLM summarization surfaces a visible WARN notice")
+    check(cb_info2 ~= nil, "compaction still succeeds via the heuristic fallback")
+    check(#ag2.messages < 10, "heuristic fallback still compacted the conversation")
+    check(
+      ag2.messages[1].content[1].text:find(compact._SUMMARY_PREFIX, 1, true) ~= nil
+        and not ag2.messages[1].content[1].text:find("model summary via", 1, true),
+      "fallback summary is the plain heuristic one, not framed as an LLM summary"
+    )
+  end
+end
+
 -- 4b. sub-agent tool -------------------------------------------------------------
 
 section("sub-agent")
@@ -526,6 +702,41 @@ do
   end, 10)
   check(turn == 2 and saw_tool_result, "sub-agent can use read-only tools in its own loop")
   check(err == false and result:find("subagent evidence", 1, true), "sub-agent returns final report")
+end
+
+-- 4b. sub-agent read-only bash validator ---------------------------------------
+
+section("sub-agent read-only bash")
+do
+  local reject = require("advantage.subagent")._reject_bash
+  local allow = {
+    ls = true,
+    cat = true,
+    grep = true,
+    rg = true,
+    find = true,
+    wc = true,
+    git = true,
+    sed = true,
+    awk = true,
+    head = true,
+    tail = true,
+    echo = true,
+    sort = true,
+  }
+  local function ok(cmd)
+    return reject(cmd, allow) == nil
+  end
+  check(ok("grep -rn foo ."), "read-only bash allows grep")
+  check(ok("rg pat | head -20"), "read-only bash allows piped inspection")
+  check(ok("git log --oneline -5"), "read-only bash allows git log")
+  check(not ok("echo hi > out.txt"), "read-only bash rejects output redirection")
+  check(not ok("cat $(which sh)"), "read-only bash rejects command substitution")
+  check(not ok("git commit -m x"), "read-only bash rejects mutating git")
+  check(not ok("rm -rf ."), "read-only bash rejects non-allow-listed command")
+  check(not ok("find . -delete"), "read-only bash rejects find -delete")
+  check(not ok("sed -i s/a/b/ f"), "read-only bash rejects sed -i")
+  check(not ok("cat a | tee b"), "read-only bash rejects tee")
 end
 
 -- 4c. auth handles null-bearing credential files -------------------------------
@@ -837,6 +1048,17 @@ do
     "@mention traversal allowed under allow_outside_root"
   )
   config.options.tools.allow_outside_root = false
+
+  -- an in-repo symlink pointing outside must not exfiltrate via @mention
+  local slink_ok = pcall(function()
+    (vim.uv or vim.loop).fs_symlink(parent .. "/msecret.txt", tmp .. "/mlink.txt")
+  end)
+  if slink_ok then
+    local sesc, sfiles = attach.expand_mentions("read @mlink.txt", tmp)
+    check(#sfiles == 0 and not sesc:find("outside-mention-secret", 1, true), "@mention symlink escape is blocked")
+  else
+    check(true, "@mention symlink escape is blocked (skipped: no symlink support)")
+  end
 end
 
 -- 10. usage ledger + dashboard ------------------------------------------------------

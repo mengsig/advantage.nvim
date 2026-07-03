@@ -407,8 +407,8 @@ local SLASH = {
   usage = function()
     require("advantage").usage()
   end,
-  compact = function()
-    require("advantage").compact()
+  compact = function(arg)
+    require("advantage").compact(arg)
   end,
   context = function(arg)
     require("advantage").context(arg)
@@ -522,7 +522,7 @@ local function help_lines()
     "  c        deny with a comment for the agent",
     "",
     "slash commands",
-    "  /usage   token dashboard   /compact shrink old context",
+    "  /usage   token dashboard   /compact [llm|heuristic] shrink old context",
     "  /new     fresh session     /model   switch model",
     "  /resume  resume session    /review  diff agent edits",
     "  /context repo memory + skills (verify · forget <text>)",
@@ -535,7 +535,7 @@ local function help_lines()
     "  :Advantage model      switch model",
     "  :Advantage resume     resume a session",
     "  :Advantage usage      token dashboard",
-    "  :Advantage compact    shrink old conversation context",
+    "  :Advantage compact [llm|heuristic]  shrink old conversation context",
     "  :Advantage context    view/verify/forget repo memory",
     "  :Advantage help       keybind and command cheatsheet",
     "  :Advantage review     diff the agent's changes",

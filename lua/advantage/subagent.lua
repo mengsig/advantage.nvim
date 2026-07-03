@@ -10,6 +10,165 @@ local providers = require("advantage.providers")
 local tools = require("advantage.tools")
 local config = require("advantage.config")
 
+-- Read-only bash for sub-agents -------------------------------------------
+-- Sub-agents run autonomously with no permission prompt, so their optional
+-- bash is restricted to a vetted allow-list of inspection commands. This is
+-- best-effort (shell is not fully parseable): redirection and command
+-- substitution are rejected outright, and each pipeline segment's leading
+-- command must be allow-listed. It is NOT path-contained — like any bash it
+-- can read outside the root — which is why it is opt-in and off by default.
+local READONLY_CMDS = {
+  ls = true,
+  cat = true,
+  head = true,
+  tail = true,
+  wc = true,
+  nl = true,
+  tac = true,
+  rg = true,
+  grep = true,
+  egrep = true,
+  fgrep = true,
+  find = true,
+  fd = true,
+  tree = true,
+  stat = true,
+  file = true,
+  du = true,
+  df = true,
+  pwd = true,
+  echo = true,
+  printf = true,
+  dirname = true,
+  basename = true,
+  realpath = true,
+  readlink = true,
+  sort = true,
+  uniq = true,
+  cut = true,
+  tr = true,
+  comm = true,
+  column = true,
+  diff = true,
+  date = true,
+  env = true,
+  printenv = true,
+  which = true,
+  type = true,
+  whoami = true,
+  hostname = true,
+  uname = true,
+  jq = true,
+  yq = true,
+  sed = true,
+  awk = true,
+  git = true,
+  xxd = true,
+  od = true,
+  cksum = true,
+  sha256sum = true,
+  md5sum = true,
+  ["true"] = true,
+  ["false"] = true,
+  test = true,
+}
+local GIT_READONLY = {
+  status = true,
+  log = true,
+  diff = true,
+  show = true,
+  branch = true,
+  tag = true,
+  ["rev-parse"] = true,
+  ["ls-files"] = true,
+  ["ls-tree"] = true,
+  blame = true,
+  describe = true,
+  remote = true,
+  shortlog = true,
+  ["cat-file"] = true,
+  grep = true,
+  whatchanged = true,
+  reflog = true,
+  ["rev-list"] = true,
+  ["name-rev"] = true,
+  ["symbolic-ref"] = true,
+  ["for-each-ref"] = true,
+  ["count-objects"] = true,
+  config = true,
+  show_ref = true,
+}
+
+local function bash_allowlist()
+  local cfg = (config.options.subagents or {}).bash
+  if type(cfg) == "table" and type(cfg.allow) == "table" then
+    local allow = vim.deepcopy(READONLY_CMDS)
+    for _, c in ipairs(cfg.allow) do
+      allow[c] = true
+    end
+    return allow
+  end
+  return READONLY_CMDS
+end
+
+---Return an error string if `cmd` is not a safe read-only command, else nil.
+local function reject_bash(cmd, allow)
+  cmd = vim.trim(cmd or "")
+  if cmd == "" then return "empty command" end
+  if cmd:find("[>`]") or cmd:find("%$%(") then
+    return "read-only bash cannot use output redirection or command substitution"
+  end
+  for seg in (cmd .. "\n"):gmatch("([^|&;\n]+)") do
+    seg = vim.trim(seg):gsub("^%s*([%w_]+=%S*%s+)+", "") -- strip leading VAR=val
+    if seg ~= "" then
+      local first = (seg:match("^%S+") or ""):gsub(".*/", "") -- basename
+      if not allow[first] then return ("command '%s' is not in the read-only allow-list"):format(first) end
+      if first == "git" then
+        local subc = seg:match("^git%s+(%S+)")
+        if not (subc and GIT_READONLY[subc]) then
+          return ("git subcommand '%s' is not read-only"):format(tostring(subc))
+        end
+      elseif first == "find" and (seg:find("%-delete") or seg:find("%-exec")) then
+        return "find -delete / -exec is not allowed"
+      elseif first == "sed" then
+        for tok in seg:gmatch("%S+") do
+          if tok:match("^%-i") or tok:match("^%-%-in%-place") then return "sed -i (in-place edit) is not allowed" end
+        end
+      end
+    end
+  end
+end
+
+local sub_bash = {
+  name = "bash",
+  description = "Run a READ-ONLY bash command (inspection only: ls, cat, grep, rg, find, git status/log/diff, wc, etc.). Redirection and mutating commands are rejected.",
+  input_schema = {
+    type = "object",
+    properties = {
+      command = { type = "string", description = "The read-only command to run" },
+      timeout_ms = { type = "integer", description = "Timeout in ms (default 60000)" },
+    },
+    required = { "command" },
+  },
+  run = function(input, ctx, cb)
+    local why = reject_bash(input.command, bash_allowlist())
+    if why then return cb("Rejected: " .. why, true) end
+    local timeout = tonumber(input.timeout_ms) or 60000
+    vim.system(
+      { "bash", "-c", input.command },
+      { cwd = ctx.cwd, text = true, timeout = timeout },
+      vim.schedule_wrap(function(res)
+        local out = (res.stdout or "") .. (res.stderr or "")
+        if res.code == 124 or res.signal ~= 0 then out = out .. "\n(timed out)" end
+        if vim.trim(out) == "" then out = "(no output)" end
+        if #out > 30000 then out = out:sub(1, 30000) .. "\n… (truncated)" end
+        cb(out, res.code ~= 0 and res.signal == 0 and false or (res.code ~= 0))
+      end)
+    )
+  end,
+}
+M._reject_bash = reject_bash
+
 local function readonly_tools()
   local out = {}
   for _, def in ipairs(tools.list) do
@@ -20,6 +179,9 @@ local function readonly_tools()
         input_schema = def.input_schema,
       }
     end
+  end
+  if (config.options.subagents or {}).bash then
+    out[#out + 1] = { name = sub_bash.name, description = sub_bash.description, input_schema = sub_bash.input_schema }
   end
   return out
 end
@@ -42,6 +204,23 @@ local function system_prompt(parent_system)
 end
 
 local function run_tool_call(call, ctx, cb)
+  if call.name == "bash" and (config.options.subagents or {}).bash then
+    local done = false
+    local ok, err = pcall(sub_bash.run, call.input or {}, ctx, function(output, is_error)
+      if done then return end
+      done = true
+      cb({ type = "tool_result", tool_use_id = call.id, content = output or "", is_error = is_error or nil })
+    end)
+    if not ok then
+      cb({
+        type = "tool_result",
+        tool_use_id = call.id,
+        content = "Sub-agent bash crashed: " .. tostring(err),
+        is_error = true,
+      })
+    end
+    return
+  end
   local def = tools.get(call.name)
   if not def or not def.safe or call.name == "sub_agent" then
     return cb({
@@ -51,6 +230,8 @@ local function run_tool_call(call, ctx, cb)
       is_error = true,
     })
   end
+  local verr = tools.validate_input(call.name, call.input)
+  if verr then return cb({ type = "tool_result", tool_use_id = call.id, content = verr, is_error = true }) end
   local done = false
   local ok, err = pcall(def.run, call.input or {}, ctx, function(output, is_error, meta)
     if done or (meta and meta.stream) then return end
