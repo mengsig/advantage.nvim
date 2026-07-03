@@ -53,7 +53,9 @@ function M.new(opts)
   self.turn_open = false
   self.ctx = { cwd = uv.cwd() }
   self.allowed = {} -- per-session "always allow" tool names
-  self.queue = {} -- messages submitted while a turn was running
+  self.queue = {} -- Ctrl-S messages submitted while a turn was running
+  self.interrupts = {} -- Enter messages to inject before the next tool call
+  self.pending_permission = nil -- callable that resolves the active permission card
   self.snapshots = {} -- abs path -> content before the agent's first touch (false = new file)
   self.turn_changed = {} -- abs paths changed during the current turn
   return self
@@ -67,22 +69,10 @@ function Agent:busy()
   return self.status ~= "idle"
 end
 
----Entry point: user sends a prompt. While a turn is running, messages are
----queued and dispatched one by one as turns finish.
----@param opts? {images?: {name:string, media_type:string, data:string}[]}
-function Agent:send(text, opts)
+local function user_content(text, opts, cwd)
   opts = opts or {}
-  if self:busy() then
-    self.queue[#self.queue + 1] = { text = text, opts = opts }
-    self:ui().queued(#self.queue, text)
-    return
-  end
-  if not self.title then
-    self.title = text:gsub("%s+", " "):sub(1, 56)
-  end
-
   -- inline @file mentions; the transcript shows the original text
-  local send_text = require("advantage.attach").expand_mentions(text, self.ctx.cwd)
+  local send_text = require("advantage.attach").expand_mentions(text, cwd)
   local content = {}
   for _, img in ipairs(opts.images or {}) do
     content[#content + 1] = {
@@ -91,15 +81,78 @@ function Agent:send(text, opts)
     }
   end
   content[#content + 1] = { type = "text", text = send_text }
+  return content
+end
 
+function Agent:_push_user_message(text, opts, show)
+  local content = user_content(text, opts, self.ctx.cwd)
   table.insert(self.messages, { role = "user", content = content })
-  self:ui().user_message(text, opts.images)
+  if show ~= false then
+    self:ui().user_message(text, opts and opts.images)
+  end
+end
+
+---Entry point: user sends a prompt. While a turn is running, `mode = "queued"`
+---queues behind the whole agent flow; the default `mode = "instant"` injects the
+---message before the next tool call without cancelling the current response.
+---@param opts? {images?: {name:string, media_type:string, data:string}[], mode?: "instant"|"queued"}
+function Agent:send(text, opts)
+  opts = opts or {}
+  if self:busy() then
+    if opts.mode == "queued" then
+      self.queue[#self.queue + 1] = { text = text, opts = opts }
+      self:ui().queued(#self.queue, text)
+      return
+    end
+    local item = { text = text, opts = opts, content = user_content(text, opts, self.ctx.cwd) }
+    self.interrupts[#self.interrupts + 1] = item
+    self:ui().user_message(text, opts.images)
+    self:ui().notice("will send before the next tool call")
+    if self.pending_permission then
+      self.pending_permission("interrupt")
+    end
+    return
+  end
+  if not self.title then
+    self.title = text:gsub("%s+", " "):sub(1, 56)
+  end
+
+  self:_push_user_message(text, opts)
   self.cancelled = false
   self.turn_started = uv.hrtime()
   self.turn_usage = { input = 0, output = 0 }
   self.turn_open = false
   self.turn_changed = {}
   self:_turn()
+end
+
+function Agent:_drain_interrupts(results, remaining_calls)
+  if #self.interrupts == 0 then return false end
+  results = results or {}
+  for _, call in ipairs(remaining_calls or {}) do
+    results[#results + 1] = {
+      type = "tool_result",
+      tool_use_id = call.id,
+      content = "Tool skipped because the user sent a new message before it ran.",
+      is_error = true,
+    }
+    self:ui().tool_update(call.id, { status = "denied", detail = "interrupted" })
+  end
+  for _, item in ipairs(self.interrupts) do
+    vim.list_extend(results, item.content)
+  end
+  self.interrupts = {}
+  table.insert(self.messages, { role = "user", content = results })
+  return true
+end
+
+function Agent:_drain_interrupts_as_user_messages()
+  if #self.interrupts == 0 then return false end
+  for _, item in ipairs(self.interrupts) do
+    table.insert(self.messages, { role = "user", content = item.content })
+  end
+  self.interrupts = {}
+  return true
 end
 
 local MUTATING = { write_file = true, edit_file = true }
@@ -172,8 +225,21 @@ function Agent:_turn()
             if b.type == "tool_use" then calls[#calls + 1] = b end
           end
           if #calls > 0 then
+            if self:_drain_interrupts(nil, calls) then
+              self.turn_started = uv.hrtime()
+              self.turn_usage = { input = 0, output = 0 }
+              self.turn_open = false
+              return self:_turn()
+            end
             return self:_run_tools(calls)
           end
+        end
+
+        if self:_drain_interrupts_as_user_messages() then
+          self.turn_started = uv.hrtime()
+          self.turn_usage = { input = 0, output = 0 }
+          self.turn_open = false
+          return self:_turn()
         end
 
         if stop_reason == "refusal" then
@@ -218,6 +284,17 @@ function Agent:_run_tools(calls)
   local i = 0
   run_next = function()
     if self.cancelled then return end
+    if #self.interrupts > 0 then
+      local remaining = {}
+      for j = i + 1, #calls do
+        remaining[#remaining + 1] = calls[j]
+      end
+      self:_drain_interrupts(results, remaining)
+      self.turn_started = uv.hrtime()
+      self.turn_usage = { input = 0, output = 0 }
+      self.turn_open = false
+      return self:_turn()
+    end
     i = i + 1
     local call = calls[i]
     if not call then
@@ -262,13 +339,18 @@ function Agent:_run_tools(calls)
       or { title = call.name, lines = vim.split(vim.inspect(call.input), "\n"), filetype = "lua" }
     ui.tool_update(call.id, { status = "waiting" })
     ui.set_status("waiting", call.name)
-    ui.confirm(preview, function(decision, comment)
+    self.pending_permission = ui.confirm(preview, function(decision, comment)
+      self.pending_permission = nil
       if self.cancelled then return end
       if decision == "always" then
         self.allowed[call.name] = true
         return execute()
       elseif decision == "allow" then
         return execute()
+      elseif decision == "interrupt" then
+        record(call, "Tool skipped because the user sent a new message before it ran.", true)
+        ui.tool_update(call.id, { status = "denied", detail = "interrupted" })
+        run_next()
       else
         local msg = "The user denied this action."
         if comment and comment ~= "" then
@@ -282,6 +364,9 @@ function Agent:_run_tools(calls)
         run_next()
       end
     end)
+    if #self.interrupts > 0 and self.pending_permission then
+      self.pending_permission("interrupt")
+    end
   end
 
   run_next()
@@ -306,6 +391,7 @@ function Agent:_finish(errored)
     ui.set_queue(#self.queue)
     vim.schedule(function()
       if not self:busy() then
+        nxt.opts.mode = nil
         self:send(nxt.text, nxt.opts)
       end
     end)
@@ -314,12 +400,23 @@ function Agent:_finish(errored)
   end
 end
 
-function Agent:cancel()
+function Agent:cancel(opts)
+  opts = opts or {}
   if not self:busy() then return end
   self.cancelled = true
-  if #self.queue > 0 then
+  if not opts.keep_queue and #self.queue > 0 then
     self:ui().notice(("dropped %d queued message%s"):format(#self.queue, #self.queue == 1 and "" or "s"))
     self.queue = {}
+    self:ui().set_queue(0)
+  end
+  if not opts.keep_queue and #self.interrupts > 0 then
+    self:ui().notice(("dropped %d pending message%s"):format(#self.interrupts, #self.interrupts == 1 and "" or "s"))
+    self.interrupts = {}
+  end
+  if self.pending_permission then
+    local pending = self.pending_permission
+    self.pending_permission = nil
+    pending("deny")
   end
   if self.job then
     self.job.stop()

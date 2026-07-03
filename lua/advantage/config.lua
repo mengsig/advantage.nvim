@@ -11,7 +11,6 @@ M.defaults = {
     { ref = "anthropic/claude-sonnet-5", label = "sonnet 5" },
     { ref = "anthropic/claude-fable-5", label = "fable 5" },
     { ref = "anthropic/claude-haiku-4-5", label = "haiku 4.5", thinking = false },
-    { ref = "openai/gpt-5.5-codex", label = "codex 5.5" },
     { ref = "openai/gpt-5.5", label = "gpt-5.5" },
     { ref = "openai/gpt-5.1-codex", label = "codex 5.1" },
     { ref = "openai/gpt-5.1-codex-mini", label = "codex mini" },
@@ -53,19 +52,19 @@ M.defaults = {
   },
 
   keymaps = {
-    toggle = "<leader>aa",
-    new_session = "<leader>an",
-    models = "<leader>am",
-    resume = "<leader>ar",
+    toggle = "<leader>cc",
+    new_session = "<leader>cn",
+    models = "<leader>cm",
+    resume = "<leader>cr",
     add_selection = "<leader>cs", -- visual mode: @file:L10-20 mention
     add_file = "<leader>cf", -- send current file to the chat prompt
     add_location = "<leader>cl", -- send @file:L{cursor line}
     pick_files = "<leader>cp", -- pick a project file to send
-    usage = "<leader>au", -- token usage dashboard
-    review = "<leader>ad", -- review the agent's file changes (diff)
-    yolo = "<leader>ay", -- toggle skip-all-permissions mode
-    effort = "<leader>ae", -- tune reasoning effort / thinking
-    help = "<leader>a?", -- keybind & command cheatsheet
+    usage = "<leader>cu", -- token usage dashboard
+    review = "<leader>cd", -- review the agent's file changes (diff)
+    yolo = "<leader>cy", -- toggle skip-all-permissions mode
+    effort = "<leader>ce", -- tune reasoning effort / thinking
+    help = "<leader>c?", -- keybind & command cheatsheet
   },
 
   usage = {

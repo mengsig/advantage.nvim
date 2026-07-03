@@ -284,7 +284,7 @@ do
   local adv = require("advantage")
   local ui = require("advantage.ui.chat")
   adv.ask("first queued test")
-  adv.ask("second queued test") -- agent is busy → must queue, not error
+  adv.ask("second queued test", { mode = "queued" }) -- explicit queue mode queues behind a running turn
   check(ui.state.queue_count == 1, "second message queued while turn runs")
 
   vim.wait(8000, function()
@@ -300,7 +300,82 @@ do
   check(ui.state.queue_count == 0, "queue drained")
 end
 
--- 7. ui regressions ---------------------------------------------------------------
+-- 7. enter interrupt --------------------------------------------------------------
+
+section("enter interrupt")
+do
+  local providers = require("advantage.providers")
+  local agent_mod = require("advantage.agent")
+  local ui = require("advantage.ui.chat")
+  local turn, stopped, seen = 0, false, nil
+  providers.register("fakeinterrupt", {
+    stream = function(req)
+      turn = turn + 1
+      if turn == 2 then seen = req.messages end
+      local on = req.on
+      vim.defer_fn(function()
+        if turn == 1 then
+          on.text("I may need a command.")
+          on.tool_start("tu_interrupt", "bash")
+          on.complete({
+            { type = "text", text = "I may need a command." },
+            { type = "tool_use", id = "tu_interrupt", name = "bash", input = { command = "echo should-not-run" } },
+          }, "tool_use")
+        else
+          on.text("Adjusted before running the tool.")
+          on.complete({ { type = "text", text = "Adjusted before running the tool." } }, "end_turn")
+        end
+      end, turn == 1 and 30 or 10)
+      return { stop = function() stopped = true end }
+    end,
+  })
+
+  local ag = agent_mod.new({ model = { provider = "fakeinterrupt", id = "m", label = "m" } })
+  ag:send("first")
+  vim.defer_fn(function() ag:send("second before tool") end, 5)
+  vim.wait(8000, function() return turn >= 2 and ui.state.status == "idle" end, 25)
+
+  check(stopped == false, "enter while running does not cancel the stream")
+  check(turn == 2, "interrupt triggered a follow-up model turn")
+  check(seen and seen[3] and seen[3].role == "user", "interrupt inserted before tool execution")
+  check(seen and seen[3] and seen[3].content[1].type == "tool_result" and seen[3].content[1].is_error == true,
+    "pending tool was skipped with a tool_result")
+  check(seen and seen[3] and seen[3].content[2].type == "text" and seen[3].content[2].text:find("second before tool", 1, true),
+    "interrupt text sent with skipped tool result")
+
+  require("advantage.config").options.tools.auto_approve = {}
+  local wait_turn, wait_seen = 0, nil
+  providers.register("fakewaitinterrupt", {
+    stream = function(req)
+      wait_turn = wait_turn + 1
+      if wait_turn == 2 then wait_seen = req.messages end
+      local on = req.on
+      vim.defer_fn(function()
+        if wait_turn == 1 then
+          on.tool_start("tu_wait_interrupt", "bash")
+          on.complete({
+            { type = "tool_use", id = "tu_wait_interrupt", name = "bash", input = { command = "echo should-not-run" } },
+          }, "tool_use")
+        else
+          on.text("Continued after permission interrupt.")
+          on.complete({ { type = "text", text = "Continued after permission interrupt." } }, "end_turn")
+        end
+      end, 10)
+      return { stop = function() end }
+    end,
+  })
+  local ag_wait = agent_mod.new({ model = { provider = "fakewaitinterrupt", id = "m", label = "m" } })
+  ag_wait:send("needs permission")
+  vim.wait(8000, function() return ui.state.status == "waiting" end, 25)
+  ag_wait:send("interrupt permission")
+  vim.wait(8000, function() return wait_turn >= 2 and ui.state.status == "idle" end, 25)
+  check(wait_turn == 2, "enter while permission is waiting skips the pending tool")
+  check(wait_seen and wait_seen[3] and wait_seen[3].content[1].type == "tool_result"
+      and wait_seen[3].content[1].content:find("Tool skipped", 1, true),
+    "permission interrupt sends skipped tool_result")
+end
+
+-- 8. ui regressions ---------------------------------------------------------------
 
 section("ui regressions")
 do
@@ -319,7 +394,7 @@ do
   check(vim.bo[ui.state.buf].modifiable == false, "transcript buffer is read-only")
 end
 
--- 8. attachments / @mentions -------------------------------------------------------
+-- 9. attachments / @mentions -------------------------------------------------------
 
 section("attachments / mentions")
 do
@@ -359,7 +434,7 @@ do
   check(type(listed) == "table" and #listed > 0, "project files listed for @completion")
 end
 
--- 9. usage ledger + dashboard -------------------------------------------------------
+-- 10. usage ledger + dashboard ------------------------------------------------------
 
 section("usage")
 do
@@ -377,7 +452,7 @@ do
   check(ok and joined:find("today", 1, true) and joined:find("pace", 1, true), "dashboard renders")
 end
 
--- 10. yolo / deny with comment / review ---------------------------------------------
+-- 11. yolo / deny with comment / review ---------------------------------------------
 
 section("yolo · deny+comment · review")
 do

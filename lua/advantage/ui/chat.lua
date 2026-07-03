@@ -37,7 +37,7 @@ local S = {
   on_submit = nil,
   attachments = {}, -- pending prompt images: {name=, path=, media_type=, data=}
   follow = true, -- stick to the bottom of the transcript
-  queue_count = 0, -- messages waiting for the running turn to finish
+  queue_count = 0, -- messages waiting for the current agent flow to finish
 }
 M.state = S
 
@@ -411,7 +411,8 @@ local SLASH = {
   keys = function() M.show_help() end,
 }
 
-local function submit()
+local function submit(mode)
+  mode = mode or "instant"
   local lines = api.nvim_buf_get_lines(S.input_buf, 0, -1, false)
   local text = vim.trim(table.concat(lines, "\n"))
   if text == "" then return end
@@ -446,7 +447,7 @@ local function submit()
   end
   S.attachments = {}
   clear_input()
-  if S.on_submit then S.on_submit(text, images) end
+  if S.on_submit then S.on_submit(text, images, mode) end
 end
 
 local function help_lines()
@@ -457,7 +458,8 @@ local function help_lines()
     "  ]]  [[   next/prev turn    g?   this help",
     "",
     "prompt window",
-    "  ⏎        send (queues if a turn is running)",
+    "  ⏎        send now (before next tool call if running)",
+    "  ⌃s       queue until the agent is completely done",
     "  ⇧⏎ ⌃j    newline           ⇥    jump to chat",
     "  @        complete a project file mention",
     "  ⌃v       paste — attaches clipboard images",
@@ -484,6 +486,7 @@ local function help_lines()
     "  :Advantage model      switch model",
     "  :Advantage resume     resume a session",
     "  :Advantage usage      token dashboard",
+    "  :Advantage help       keybind and command cheatsheet",
     "  :Advantage review     diff the agent's changes",
     "  :Advantage yolo       toggle skip-all-permissions",
     "  :Advantage effort [mode] tune thinking/reasoning level",
@@ -563,9 +566,10 @@ local function ensure_bufs()
       api.nvim_feedkeys(api.nvim_replace_termcodes("<C-y>", true, false, true), "n", false)
       return
     end
-    submit()
-  end, "send")
-  map(S.input_buf, "n", "<CR>", function() submit() end, "send")
+    submit("instant")
+  end, "send now")
+  map(S.input_buf, "n", "<CR>", function() submit("instant") end, "send now")
+  map(S.input_buf, { "n", "i" }, "<C-s>", function() submit("queued") end, "queue message")
   map(S.input_buf, "i", "<S-CR>", "<CR>", "newline")
   map(S.input_buf, "i", "<C-j>", "<CR>", "newline")
   map(S.input_buf, "n", "<Tab>", focus_chat, "focus chat")
@@ -739,13 +743,13 @@ function M.user_message(text, images)
   autoscroll()
 end
 
----Queue indicator: `n` messages waiting for the running turn to finish.
+---Queue indicator: `n` messages waiting for the current agent flow to finish.
 function M.set_queue(n)
   S.queue_count = n or 0
   update_winbar()
 end
 
----Announce a message that was queued behind the running turn.
+---Announce a message queued until the current agent flow is idle.
 function M.queued(n, text)
   M.set_queue(n)
   local head = text:gsub("%s+", " ")
@@ -945,12 +949,14 @@ end
 ---Permission card. cb("allow"|"always"|"deny", comment?), exactly once.
 function M.confirm(preview, cb)
   local done = false
+  local win
   local function decide(what, comment)
     if done then return end
     done = true
     cb(what, comment)
   end
-  local win, buf = M.float({
+  local buf
+  win, buf = M.float({
     title = preview.title or "allow?",
     lines = preview.lines or {},
     filetype = preview.filetype,
@@ -987,6 +993,10 @@ function M.confirm(preview, cb)
       vim.schedule(function() decide("deny") end)
     end,
   })
+  return function(decision, comment)
+    if util.win_valid(win) then api.nvim_win_close(win, true) end
+    decide(decision, comment)
+  end
 end
 
 -- resume ----------------------------------------------------------------------

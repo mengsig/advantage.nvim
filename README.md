@@ -7,8 +7,8 @@ your editor, feeds results back, and repeats until the task is done.
 - **Runs on your subscription.** Uses your **Claude Code login** (Pro/Max) or your
   **Codex / ChatGPT login** — no API key needed. Env API keys work as a fallback.
 - **Model agnostic.** Anthropic (Opus 4.8, Sonnet 5, Fable 5, Haiku 4.5) and
-  OpenAI Codex (gpt-5.1-codex family) out of the box; the provider interface is
-  ~100 lines if you want to add more.
+  OpenAI GPT/Codex (gpt-5.5 and gpt-5.1-codex family) out of the box; the
+  provider interface is ~100 lines if you want to add more.
 - **Editor-native tools.** `read_file`, `edit_file`, `write_file`, `bash`, `grep`,
   `find_files`, `list_dir` — executed inside Neovim, so edited buffers reload
   live and every mutation is gated behind a permission card with a real diff.
@@ -47,18 +47,19 @@ Added the flag and threaded it through the formatter…
   "mengsig/advantage.nvim",
   cmd = "Advantage",
   keys = {
-    { "<leader>aa", function() require("advantage").toggle() end, desc = "advantage: toggle" },
-    { "<leader>cs", function() require("advantage").add_selection() end, mode = "x", desc = "advantage: add selection" },
-    { "<leader>cl", function() require("advantage").add_location() end, desc = "advantage: add cursor location" },
-    { "<leader>an", function() require("advantage").new_session() end, desc = "advantage: new session" },
-    { "<leader>am", function() require("advantage").pick_model() end, desc = "advantage: model" },
-    { "<leader>ar", function() require("advantage").resume() end, desc = "advantage: resume" },
+    { "<leader>cc", function() require("advantage").toggle() end, desc = "advantage: toggle" },
+    { "<leader>cn", function() require("advantage").new_session() end, desc = "advantage: new session" },
+    { "<leader>cm", function() require("advantage").pick_model() end, desc = "advantage: model" },
+    { "<leader>cr", function() require("advantage").resume() end, desc = "advantage: resume" },
     { "<leader>cf", function() require("advantage").add_file() end, desc = "advantage: add current file" },
     { "<leader>cp", function() require("advantage").pick_files() end, desc = "advantage: pick file" },
-    { "<leader>au", function() require("advantage").usage() end, desc = "advantage: usage" },
-    { "<leader>ad", function() require("advantage").review() end, desc = "advantage: review changes" },
-    { "<leader>ay", function() require("advantage").toggle_yolo() end, desc = "advantage: toggle yolo" },
-    { "<leader>ae", function() require("advantage").pick_effort() end, desc = "advantage: tune effort" },
+    { "<leader>cl", function() require("advantage").add_location() end, desc = "advantage: add cursor location" },
+    { "<leader>cs", function() require("advantage").add_selection() end, mode = "x", desc = "advantage: add selection" },
+    { "<leader>cu", function() require("advantage").usage() end, desc = "advantage: usage" },
+    { "<leader>cd", function() require("advantage").review() end, desc = "advantage: review changes" },
+    { "<leader>cy", function() require("advantage").toggle_yolo() end, desc = "advantage: toggle yolo" },
+    { "<leader>ce", function() require("advantage").pick_effort() end, desc = "advantage: tune effort" },
+    { "<leader>c?", function() require("advantage").help() end, desc = "advantage: help" },
   },
   opts = {},
 }
@@ -82,14 +83,17 @@ and `codex` keep working. The winbar shows which credential is in use
 
 ## Usage
 
-`:Advantage` opens the panel. Type in the prompt, `⏎` sends. Sending while a
-turn is running **queues** the message; queued messages dispatch one by one as
-turns finish (`⌃c` cancels the turn *and* drops the queue). The prompt grows
-with your message as you type.
+`:Advantage` opens the panel. Type in the prompt, `⏎` sends immediately. If a
+turn is already running, Enter does **not** cancel it: the message is injected
+before the next tool call, like Claude Code. Use `⌃s` to queue a message until
+the agent is completely done with its current flow; queued messages dispatch one
+by one after the flow finishes (`⌃c` cancels the turn *and* drops the queue). The
+prompt grows with your message as you type.
 
 | where  | key            | action                                    |
 | ------ | -------------- | ----------------------------------------- |
-| prompt | `⏎`            | send (queues if a turn is running)        |
+| prompt | `⏎`            | send now (before next tool call if running) |
+| prompt | `⌃s`           | queue until the agent is completely done  |
 | prompt | `⇧⏎` / `⌃j`    | newline                                   |
 | prompt | `@`            | complete a project file to mention        |
 | prompt | `⌃v`           | paste — clipboard images become attachments |
@@ -104,9 +108,10 @@ with your message as you type.
 (fenced, with the filename). `@file:L10-20` (or `:L10`) inlines **exactly those
 lines** with their location, so the agent edits precisely what you point at.
 `<leader>cf` sends the current file (from netrw it sends all files marked
-with `mf`), `<leader>cl` the exact cursor line,
-`<leader>cp` picks a file from the project. Visual `<leader>cs` references the
-selection as `@file:L10-20` — the lines are read fresh from disk on send.
+with `mf`; ranged `:Advantage add` in netrw sends selected listing lines),
+`<leader>cl` adds the exact cursor line, and `<leader>cp` picks a file from the
+project. Visual `<leader>cs` references the selection as `@file:L10-20` — the
+lines are read fresh from disk on send.
 
 **Images.** `⌃v` in the prompt attaches a clipboard image (Wayland `wl-paste`,
 X11 `xclip`, macOS `pngpaste`) and drops a `[image: …]` chip into the text —
@@ -117,12 +122,12 @@ delete the chip to detach. `:Advantage attach shot.png` attaches a file.
 
 **Review mode.** The agent snapshots every file before its first edit. After a
 turn that changed files you'll see *"n files changed — /review to inspect"*:
-`/review` (or `:Advantage review`, `<leader>ad`) lists the changes with `+/−`
+`/review` (or `:Advantage review`, `<leader>cd`) lists the changes with `+/−`
 counts, and opens either one unified diff of everything or a real side-by-side
 vimdiff tab per file — before on the left (read-only), the live file on the
 right (editable), `q` closes. With no agent changes it falls back to `git diff`.
 
-**YOLO mode.** `/yolo` (or `:Advantage yolo [on|off]`, `<leader>ay`, or
+**YOLO mode.** `/yolo` (or `:Advantage yolo [on|off]`, `<leader>cy`, or
 `tools = { yolo = true }` / `dangerously_skip_permissions = true` in setup)
 skips *all* permission cards. A red `⚡ yolo` badge stays in the winbar while
 it's on. Use at your own risk.
@@ -132,14 +137,14 @@ active model before the next turn. OpenAI/Codex models get `minimal`/`low`/`medi
 `reasoning.effort`; Anthropic models get `adaptive`/`off`/`low`/`medium`/`high`
 (`low`=`1k`, `medium`=`4k`, `high`=`8k` thinking budget).
 
-**Usage dashboard.** `/usage` (or `:Advantage usage`, `<leader>au`) shows
+**Usage dashboard.** `/usage` (or `:Advantage usage`, `<leader>cu`) shows
 session/today/7-day token totals, a sparkline, your current pace, a projection
 to midnight, and — if you set `usage.daily_budget` — the time you'll run out
 at the current pace.
 
 Commands: `:Advantage` (toggle) · `new` · `model` · `resume` · `stop` · `usage` ·
-`review` · `yolo [on|off]` · `effort` · `add` · `files` · `attach {path}` ·
-`ask {prompt}` (works with a visual range: `:'<,'>Advantage ask why is this slow?`).
+`help` · `review` · `yolo [on|off]` · `effort` · `add` · `files` ·
+`attach {path}` · `ask {prompt}` (works with a visual range: `:'<,'>Advantage ask why is this slow?`).
 
 When the model wants to **edit a file or run a command**, a floating card shows
 exactly what will happen — a unified diff for edits, the command for bash —
@@ -157,7 +162,6 @@ require("advantage").setup({
     { ref = "anthropic/claude-sonnet-5", label = "sonnet 5" },
     { ref = "anthropic/claude-fable-5", label = "fable 5" },
     { ref = "anthropic/claude-haiku-4-5", label = "haiku 4.5", thinking = false },
-    { ref = "openai/gpt-5.5-codex", label = "codex 5.5" },
     { ref = "openai/gpt-5.5", label = "gpt-5.5" },
     { ref = "openai/gpt-5.1-codex", label = "codex 5.1" },
     { ref = "openai/gpt-5.1-codex-mini", label = "codex mini" },
@@ -175,18 +179,19 @@ require("advantage").setup({
     bash_timeout_ms = 120000,
   },
   keymaps = {                    -- set to "" to disable any of these
-    toggle = "<leader>aa",
-    new_session = "<leader>an",
-    models = "<leader>am",
-    resume = "<leader>ar",
+    toggle = "<leader>cc",
+    new_session = "<leader>cn",
+    models = "<leader>cm",
+    resume = "<leader>cr",
     add_selection = "<leader>cs", -- visual mode: @file:L10-20
     add_file = "<leader>cf",      -- send current file to the prompt
     add_location = "<leader>cl",  -- send @file:L{cursor line}
     pick_files = "<leader>cp",    -- pick a project file to send
-    usage = "<leader>au",         -- token usage dashboard
-    review = "<leader>ad",        -- review agent changes (diff)
-    yolo = "<leader>ay",          -- toggle skip-all-permissions
-    effort = "<leader>ae",        -- tune reasoning effort / thinking
+    usage = "<leader>cu",         -- token usage dashboard
+    review = "<leader>cd",        -- review agent changes (diff)
+    yolo = "<leader>cy",          -- toggle skip-all-permissions
+    effort = "<leader>ce",        -- tune reasoning effort / thinking
+    help = "<leader>c?",          -- keybind & command cheatsheet
   },
   usage = {
     daily_budget = nil,          -- tokens/day; enables run-out projections in /usage

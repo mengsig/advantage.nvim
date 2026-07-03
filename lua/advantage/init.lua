@@ -17,8 +17,8 @@ local function ensure_init()
   require("advantage.ui.highlights").setup()
   agent_mod = require("advantage.agent")
   ui = require("advantage.ui.chat")
-  ui.state.on_submit = function(text, images)
-    M.ask(text, { images = images })
+  ui.state.on_submit = function(text, images, mode)
+    M.ask(text, { images = images, mode = mode })
   end
 end
 
@@ -63,6 +63,7 @@ function M.setup(opts)
   map("n", maps.review, M.review, "review agent changes")
   map("n", maps.yolo, M.toggle_yolo, "toggle yolo mode")
   map("n", maps.effort, M.pick_effort, "tune model effort")
+  map("n", maps.help, M.help, "help")
   map("x", maps.add_selection, function()
     M.add_selection()
   end, "add selection to prompt")
@@ -78,8 +79,10 @@ function M.open()
   ui.open()
 end
 
----Send a prompt (opens the panel if hidden). Queues while a turn is running.
----@param opts? {images?: table[]}
+---Send a prompt (opens the panel if hidden). While a turn is running, the
+---default `mode = "instant"` injects it before the next tool call; `mode = "queued"`
+---waits until the whole agent flow is idle.
+---@param opts? {images?: table[], mode?: "instant"|"queued"}
 function M.ask(text, opts)
   local agent = ensure_agent()
   if not ui.is_open() then
@@ -159,6 +162,37 @@ function M.resume()
   end)
 end
 
+local function buf_var(buf, name)
+  local ok, value = pcall(vim.api.nvim_buf_get_var, buf, name)
+  if ok then return value end
+  return nil
+end
+
+local function is_netrw_buffer(buf)
+  return vim.bo[buf].filetype == "netrw" or buf_var(buf, "netrw_curdir") ~= nil
+end
+
+local function netrw_curdir(buf)
+  return buf_var(buf, "netrw_curdir") or vim.fn.fnamemodify(vim.api.nvim_buf_get_name(buf), ":p:h")
+end
+
+local function add_unique_file(files, seen, skipped, path)
+  path = tostring(path or ""):gsub("[/%|@]$", "")
+  if path == "" then return skipped end
+  path = vim.fn.fnamemodify(path, ":p")
+  local stat = (vim.uv or vim.loop).fs_stat(path)
+  if stat and stat.type == "file" then
+    local rel = vim.fn.fnamemodify(path, ":.")
+    if not seen[rel] then
+      seen[rel] = true
+      files[#files + 1] = rel
+    end
+  else
+    skipped = skipped + 1
+  end
+  return skipped
+end
+
 ---Return netrw's currently marked files (from `mf`) as project-relative
 ---paths where possible. Falls back to the buffer-local mark list for older
 ---netrw state where the global mark list is unavailable.
@@ -166,19 +200,20 @@ end
 local function netrw_marked_files()
   local raw = {}
 
-  local expose = vim.fn["netrw#Expose"]
-  if expose then
+  local ok_fn, expose = pcall(function() return vim.fn["netrw#Expose"] end)
+  if ok_fn and expose then
     local ok, global = pcall(expose, "netrwmarkfilelist")
     if ok and type(global) == "table" then
       raw = global
     end
 
-    if #raw == 0 and vim.b.netrw_curdir then
+    local curdir = netrw_curdir(0)
+    if #raw == 0 and curdir then
       local ok_local, local_list = pcall(expose, "netrwmarkfilelist_" .. vim.api.nvim_get_current_buf())
       if ok_local and type(local_list) == "table" then
         for _, name in ipairs(local_list) do
           local cleaned = tostring(name):gsub("[/%|@]$", "")
-          raw[#raw + 1] = cleaned:sub(1, 1) == "/" and cleaned or (vim.b.netrw_curdir .. "/" .. cleaned)
+          raw[#raw + 1] = cleaned:sub(1, 1) == "/" and cleaned or (curdir .. "/" .. cleaned)
         end
       end
     end
@@ -186,18 +221,21 @@ local function netrw_marked_files()
 
   local files, seen, skipped = {}, {}, 0
   for _, item in ipairs(raw) do
-    local path = tostring(item):gsub("[/%|@]$", "")
-    if path ~= "" then
-      path = vim.fn.fnamemodify(path, ":p")
-      local stat = (vim.uv or vim.loop).fs_stat(path)
-      if stat and stat.type == "file" then
-        local rel = vim.fn.fnamemodify(path, ":.")
-        if not seen[rel] then
-          seen[rel] = true
-          files[#files + 1] = rel
-        end
-      else
-        skipped = skipped + 1
+    skipped = add_unique_file(files, seen, skipped, item)
+  end
+  return files, skipped
+end
+
+local function netrw_line_files(line1, line2)
+  local curdir = netrw_curdir(0)
+  local files, seen, skipped = {}, {}, 0
+  for lnum = line1, line2 do
+    local line = vim.fn.getline(lnum)
+    for entry in line:gmatch("%S+") do
+      entry = entry:gsub("^%s+", ""):gsub("%s+$", "")
+      if entry ~= "" and not entry:match('^"') and entry ~= "." and entry ~= ".." and not entry:match("^[-=]+$") then
+        local path = entry:sub(1, 1) == "/" and entry or (curdir .. "/" .. entry)
+        skipped = add_unique_file(files, seen, skipped, path)
       end
     end
   end
@@ -267,7 +305,7 @@ end
 ---the current marked file set instead.
 function M.add_file()
   ensure_agent()
-  if vim.bo.filetype == "netrw" or vim.b.netrw_curdir then
+  if is_netrw_buffer(0) then
     return M.add_netrw_marked_files()
   end
   local name = vim.api.nvim_buf_get_name(0)
@@ -476,6 +514,12 @@ function M.usage()
   })
 end
 
+---Show the keybind and command cheatsheet.
+function M.help()
+  ensure_init()
+  ui.show_help()
+end
+
 ---@private for :Advantage
 function M._command(opts)
   ensure_init()
@@ -493,6 +537,8 @@ function M._command(opts)
     M.stop()
   elseif sub == "usage" then
     M.usage()
+  elseif sub == "help" or sub == "keys" then
+    M.help()
   elseif sub == "review" or sub == "diff" then
     M.review()
   elseif sub == "yolo" then
@@ -510,14 +556,28 @@ function M._command(opts)
     end
   elseif sub == "add" then
     if opts.range and opts.range > 0 then
-      -- ranged form: :'<,'>Advantage add → @file:L10-20
-      local name = vim.fn.fnamemodify(vim.api.nvim_buf_get_name(0), ":.")
-      if name == "" then
-        ui.notify("current buffer has no file on disk", vim.log.levels.WARN)
-        return
+      if is_netrw_buffer(0) then
+        local files, skipped = netrw_line_files(opts.line1, opts.line2)
+        if #files == 0 then
+          local msg = skipped > 0 and "no regular files in selected netrw lines" or "no netrw files selected"
+          ui.notify(msg, vim.log.levels.WARN)
+          return
+        end
+        for _, file in ipairs(files) do
+          M.attach(file)
+        end
+        local extra = skipped > 0 and ("; skipped " .. skipped .. " non-file item" .. (skipped == 1 and "" or "s")) or ""
+        ui.notify("added " .. #files .. " netrw file" .. (#files == 1 and "" or "s") .. extra)
+      else
+        -- ranged form: :'<,'>Advantage add → @file:L10-20
+        local name = vim.fn.fnamemodify(vim.api.nvim_buf_get_name(0), ":.")
+        if name == "" then
+          ui.notify("current buffer has no file on disk", vim.log.levels.WARN)
+          return
+        end
+        ui.add_mention(opts.line1 == opts.line2 and ("%s:L%d"):format(name, opts.line1)
+          or ("%s:L%d-%d"):format(name, opts.line1, opts.line2))
       end
-      ui.add_mention(opts.line1 == opts.line2 and ("%s:L%d"):format(name, opts.line1)
-        or ("%s:L%d-%d"):format(name, opts.line1, opts.line2))
     else
       M.add_file()
     end
@@ -544,7 +604,7 @@ function M._command(opts)
   end
 end
 
-M._subcommands = { "toggle", "new", "model", "resume", "stop", "usage", "review", "yolo", "effort", "add", "files", "attach", "ask" }
+M._subcommands = { "toggle", "new", "model", "resume", "stop", "usage", "help", "review", "yolo", "effort", "add", "files", "attach", "ask" }
 M._effort_modes = { "minimal", "low", "medium", "high", "adaptive", "off", "1k", "4k", "8k" }
 
 function M._complete(arglead, cmdline)
