@@ -1,0 +1,22 @@
+if vim.g.loaded_advantage then
+  return
+end
+vim.g.loaded_advantage = true
+
+if vim.fn.has("nvim-0.10") ~= 1 then
+  vim.notify("advantage.nvim requires Neovim 0.10+", vim.log.levels.ERROR)
+  return
+end
+
+vim.api.nvim_create_user_command("Advantage", function(opts)
+  require("advantage")._command(opts)
+end, {
+  nargs = "*",
+  range = true,
+  desc = "advantage.nvim — coding agent harness",
+  complete = function(arglead)
+    return vim.tbl_filter(function(s)
+      return vim.startswith(s, arglead)
+    end, require("advantage")._subcommands)
+  end,
+})
