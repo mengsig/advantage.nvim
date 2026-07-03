@@ -888,7 +888,11 @@ function M.message_meta(usage, elapsed_ns)
   if not pos or #pos == 0 then return end
   local parts = {}
   if usage and (usage.input > 0 or usage.output > 0) then
-    parts[#parts + 1] = ("↑%s ↓%s"):format(util.fmt_tokens(usage.input), util.fmt_tokens(usage.output))
+    local up = ("↑%s ↓%s"):format(util.fmt_tokens(usage.input), util.fmt_tokens(usage.output))
+    if usage.cached and usage.cached > 0 then
+      up = up .. (" (%s cached)"):format(util.fmt_tokens(usage.cached))
+    end
+    parts[#parts + 1] = up
   end
   if elapsed_ns then
     parts[#parts + 1] = util.fmt_elapsed(elapsed_ns)

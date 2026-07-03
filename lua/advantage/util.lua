@@ -92,72 +92,109 @@ function M.request_sse(opts)
   f:write(table.concat(cfg, "\n"))
   f:close()
 
-  local stray, stderr, finished = {}, {}, false
-  local parser = M.sse_parser(function(name, data)
-    if not finished then
-      opts.on_event(name, data)
-    end
-  end, function(line)
-    if line ~= "" then stray[#stray + 1] = line end
-  end)
+  -- Transient curl exit codes worth retrying: connection/recv/send failures,
+  -- empty replies (52), timeouts (28), TLS handshake resets (35). These happen
+  -- under provider load and are safe to retry *only before any SSE event has
+  -- been dispatched* — otherwise a retry would duplicate streamed content.
+  local RETRIABLE = {
+    [6] = true, [7] = true, [16] = true, [28] = true,
+    [35] = true, [52] = true, [55] = true, [56] = true, [92] = true,
+  }
+  local max_attempts = opts.max_attempts or 3
 
-  local pending = ""
-  local job = vim.fn.jobstart({ "curl", "--config", cfg_file }, {
-    on_stdout = function(_, data)
-      if not data then return end
-      data[1] = pending .. data[1]
-      pending = table.remove(data)
-      for _, line in ipairs(data) do
-        parser.feed_line(line)
-      end
-    end,
-    on_stderr = function(_, data)
-      if not data then return end
-      for _, line in ipairs(data) do
-        if line ~= "" then stderr[#stderr + 1] = line end
-      end
-    end,
-    on_exit = function(_, code)
-      if pending ~= "" then
-        parser.feed_line(pending)
-        parser.feed_line("")
-        pending = ""
-      end
-      os.remove(body_file)
-      os.remove(cfg_file)
-      uv.fs_rmdir(tmp)
-      if finished then return end
-      finished = true
-      if #stray > 0 then
-        -- Non-SSE body: usually a JSON error envelope from the API.
-        local ok, err = pcall(vim.json.decode, table.concat(stray, "\n"))
-        local msg
-        if ok and type(err) == "table" then
-          msg = (err.error and err.error.message) or vim.inspect(err)
-        else
-          msg = table.concat(stray, " ")
-        end
-        opts.on_error(msg)
-      elseif code ~= 0 then
-        opts.on_error(#stderr > 0 and table.concat(stderr, " ") or ("curl exited with code " .. code))
-      else
-        opts.on_done()
-      end
-    end,
-  })
+  local finished, dispatched, stopped = false, 0, false
+  local current_job = nil
 
-  if job <= 0 then
-    vim.schedule(function()
-      opts.on_error("failed to start curl — is it installed?")
-    end)
-    return { stop = function() end }
+  local function cleanup()
+    os.remove(body_file)
+    os.remove(cfg_file)
+    uv.fs_rmdir(tmp)
   end
+
+  local run_attempt
+  run_attempt = function(attempt_no)
+    local stray, stderr, pending = {}, {}, ""
+    local parser = M.sse_parser(function(name, data)
+      if not finished then
+        dispatched = dispatched + 1
+        opts.on_event(name, data)
+      end
+    end, function(line)
+      if line ~= "" then stray[#stray + 1] = line end
+    end)
+
+    current_job = vim.fn.jobstart({ "curl", "--config", cfg_file }, {
+      on_stdout = function(_, data)
+        if not data then return end
+        data[1] = pending .. data[1]
+        pending = table.remove(data)
+        for _, line in ipairs(data) do
+          parser.feed_line(line)
+        end
+      end,
+      on_stderr = function(_, data)
+        if not data then return end
+        for _, line in ipairs(data) do
+          if line ~= "" then stderr[#stderr + 1] = line end
+        end
+      end,
+      on_exit = function(_, code)
+        if pending ~= "" then
+          parser.feed_line(pending)
+          parser.feed_line("")
+          pending = ""
+        end
+        if finished then return end
+
+        -- Retry a transient network failure iff nothing has streamed yet.
+        if code ~= 0 and #stray == 0 and dispatched == 0 and not stopped
+          and RETRIABLE[code] and attempt_no < max_attempts then
+          if opts.on_retry then
+            pcall(opts.on_retry, attempt_no, code)
+          end
+          vim.defer_fn(function()
+            if not finished and not stopped then run_attempt(attempt_no + 1) end
+          end, 400 * attempt_no)
+          return
+        end
+
+        finished = true
+        cleanup()
+        if #stray > 0 then
+          -- Non-SSE body: usually a JSON error envelope from the API.
+          local ok, err = pcall(vim.json.decode, table.concat(stray, "\n"))
+          local msg
+          if ok and type(err) == "table" then
+            msg = (err.error and err.error.message) or vim.inspect(err)
+          else
+            msg = table.concat(stray, " ")
+          end
+          opts.on_error(msg)
+        elseif code ~= 0 then
+          opts.on_error(#stderr > 0 and table.concat(stderr, " ") or ("curl exited with code " .. code))
+        else
+          opts.on_done()
+        end
+      end,
+    })
+
+    if current_job <= 0 then
+      finished = true
+      cleanup()
+      vim.schedule(function()
+        opts.on_error("failed to start curl — is it installed?")
+      end)
+    end
+  end
+
+  run_attempt(1)
 
   return {
     stop = function()
+      stopped = true
       if not finished then
         finished = true
-        pcall(vim.fn.jobstop, job)
+        pcall(vim.fn.jobstop, current_job)
       end
     end,
   }

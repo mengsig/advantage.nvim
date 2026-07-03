@@ -88,6 +88,18 @@ do
   check(final.blocks[2].type == "text" and final.blocks[2].text == "let me check", "text block accumulated")
   check(final.blocks[3].type == "tool_use" and final.blocks[3].input.command == "ls", "tool_use input json assembled")
   check(got.usage[1] == 15 and got.usage[2] == 55, "usage reported")
+
+  -- prompt caching: rolling breakpoints on the two most recent messages so the
+  -- static prefix + prior conversation are read from cache instead of re-billed.
+  local msgs = {
+    { role = "user", content = { { type = "text", text = "one" } } },
+    { role = "assistant", content = { { type = "text", text = "two" } } },
+    { role = "user", content = { { type = "text", text = "three" } } },
+  }
+  anthropic._apply_message_cache(msgs)
+  check(msgs[3].content[#msgs[3].content].cache_control ~= nil, "cache breakpoint on last message")
+  check(msgs[2].content[#msgs[2].content].cache_control ~= nil, "cache breakpoint on second-to-last message")
+  check(msgs[1].content[1].cache_control == nil, "older messages carry no breakpoint")
 end
 
 -- 3. openai handler -----------------------------------------------------------
@@ -249,6 +261,42 @@ do
   h.stop()
   vim.wait(5000, function() return done end, 10)
   check(is_err == true and result:find("cancelled", 1, true), "bash cancellation stops the command")
+end
+
+-- 4-net. transient network retry -------------------------------------------------
+
+section("request_sse retry")
+do
+  local util = require("advantage.util")
+  -- fake curl on PATH: exits 52 (empty reply) twice, then streams a done event.
+  local dir = vim.fn.tempname()
+  vim.fn.mkdir(dir, "p")
+  local counter = dir .. "/n"
+  vim.fn.writefile({
+    "#!/usr/bin/env bash",
+    ('n=$(cat %q 2>/dev/null || echo 0)'):format(counter),
+    ('echo $((n+1)) > %q'):format(counter),
+    "if [ \"$n\" -lt 2 ]; then echo 'curl: (52) Empty reply from server' >&2; exit 52; fi",
+    "exit 0",
+  }, dir .. "/curl")
+  vim.fn.system({ "chmod", "+x", dir .. "/curl" })
+  local old_path = vim.env.PATH
+  vim.env.PATH = dir .. ":" .. old_path
+
+  local retries, done, errored = 0, false, false
+  util.request_sse({
+    url = "http://example.invalid",
+    headers = {},
+    body = "{}",
+    max_attempts = 3,
+    on_retry = function() retries = retries + 1 end,
+    on_event = function() end,
+    on_error = function() errored = true; done = true end,
+    on_done = function() done = true end,
+  })
+  vim.wait(5000, function() return done end, 10)
+  vim.env.PATH = old_path
+  check(retries == 2 and not errored, "transient curl failures retried until success")
 end
 
 -- 4a. context compaction ---------------------------------------------------------

@@ -105,7 +105,7 @@ end
 
 local function make_handler(on)
   local blocks = {}
-  local usage = { input = 0, output = 0 }
+  local usage = { input = 0, output = 0, cached = 0 }
   local completed = false
   local has_tool_call = false
 
@@ -151,7 +151,8 @@ local function make_handler(on)
         local u = (d.response and d.response.usage) or {}
         usage.input = u.input_tokens or 0
         usage.output = u.output_tokens or 0
-        on.usage(usage.input, usage.output)
+        usage.cached = (u.input_tokens_details and u.input_tokens_details.cached_tokens) or 0
+        on.usage(usage.input, usage.output, usage.cached)
         on.complete(blocks, has_tool_call and "tool_use" or "end_turn", usage)
       end
     elseif t == "response.failed" or t == "response.incomplete" then
@@ -186,12 +187,15 @@ function M.stream(req)
     if req.on.auth then req.on.auth(cred.badge) end
 
     local url, headers
+    local otools = to_tools(req.tools)
     local body = {
       model = req.model.id,
       input = to_input_items(req.messages),
       instructions = req.system,
-      tools = to_tools(req.tools),
-      tool_choice = "auto",
+      -- omit when empty: Lua can't distinguish {} array from {} object, so an
+      -- empty table would serialize as a JSON object and the Responses API 400s.
+      tools = #otools > 0 and otools or nil,
+      tool_choice = #otools > 0 and "auto" or nil,
       stream = true,
       store = false,
       include = { "reasoning.encrypted_content" },

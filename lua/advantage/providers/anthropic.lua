@@ -39,12 +39,34 @@ local function sanitize_messages(messages)
   return out
 end
 
+---Place rolling prompt-cache breakpoints on the last content block of the two
+---most recent messages. Anthropic caches the whole prefix up to each breakpoint,
+---so the static system+tools prefix and the entire prior conversation are read
+---from cache on every follow-up turn instead of being re-billed at full price.
+---We annotate shallow copies so the stored transcript is never mutated (the
+---sanitized wrappers already own fresh content arrays, so replacing an element
+---does not touch the original messages).
+local CACHE_CONTROL = { type = "ephemeral" }
+local function apply_message_cache(messages)
+  local marks = 0
+  for idx = #messages, 1, -1 do
+    if marks >= 2 then break end
+    local content = messages[idx].content
+    local ci = #content
+    if ci > 0 then
+      content[ci] = vim.tbl_extend("force", {}, content[ci], { cache_control = CACHE_CONTROL })
+      marks = marks + 1
+    end
+  end
+end
+M._apply_message_cache = apply_message_cache
+
 ---Build the streaming event handler. Exposed for tests via M._make_handler.
 local function make_handler(on)
   local blocks = {}
   local current = nil
   local stop_reason = nil
-  local usage = { input = 0, output = 0 }
+  local usage = { input = 0, output = 0, cached = 0 }
   local completed = false
 
   local function on_event(_, d)
@@ -53,6 +75,7 @@ local function make_handler(on)
     if t == "message_start" then
       local u = d.message and d.message.usage or {}
       usage.input = (u.input_tokens or 0) + (u.cache_read_input_tokens or 0) + (u.cache_creation_input_tokens or 0)
+      usage.cached = u.cache_read_input_tokens or 0
     elseif t == "content_block_start" then
       local cb = d.content_block or {}
       if cb.type == "text" then
@@ -96,7 +119,7 @@ local function make_handler(on)
     elseif t == "message_stop" then
       if not completed then
         completed = true
-        on.usage(usage.input, usage.output)
+        on.usage(usage.input, usage.output, usage.cached)
         on.complete(blocks, stop_reason or "end_turn", usage)
       end
     elseif t == "error" then
@@ -127,25 +150,31 @@ function M.stream(req)
       "content-type: application/json",
       "anthropic-version: " .. pcfg.version,
     }
+    -- A cache breakpoint on the last system block caches the whole static
+    -- prefix (tools, then system, in Anthropic's cache ordering) so it is read
+    -- from cache on every turn instead of re-billed.
     local system
     if cred.mode == "oauth" then
       headers[#headers + 1] = "authorization: Bearer " .. cred.token
       headers[#headers + 1] = "anthropic-beta: oauth-2025-04-20"
       system = {
         { type = "text", text = OAUTH_IDENTITY },
-        { type = "text", text = req.system },
+        { type = "text", text = req.system, cache_control = CACHE_CONTROL },
       }
     else
       headers[#headers + 1] = "x-api-key: " .. cred.key
-      system = req.system
+      system = { { type = "text", text = req.system, cache_control = CACHE_CONTROL } }
     end
+
+    local messages = sanitize_messages(req.messages)
+    apply_message_cache(messages)
 
     local body = {
       model = req.model.id,
       max_tokens = pcfg.max_tokens,
       stream = true,
       system = system,
-      messages = sanitize_messages(req.messages),
+      messages = messages,
       tools = req.tools,
     }
     if req.model.thinking ~= false then

@@ -44,12 +44,12 @@ function M.new(opts)
   self.model = opts.model
   self.messages = opts.messages or {}
   self.title = opts.title
-  self.usage = opts.usage or { input = 0, output = 0 }
+  self.usage = opts.usage or { input = 0, output = 0, cached = 0 }
   self.status = "idle" -- idle | streaming | tools
   self.job = nil
   self.cancelled = false
   self.turn_started = nil
-  self.turn_usage = { input = 0, output = 0 }
+  self.turn_usage = { input = 0, output = 0, cached = 0 }
   self.turn_open = false
   self.ctx = { cwd = uv.cwd(), model = self.model }
   self.allowed = {} -- per-session "always allow" tool names
@@ -129,7 +129,7 @@ function Agent:send(text, opts)
   self:_push_user_message(text, opts)
   self.cancelled = false
   self.turn_started = uv.hrtime()
-  self.turn_usage = { input = 0, output = 0 }
+  self.turn_usage = { input = 0, output = 0, cached = 0 }
   self.turn_open = false
   self.turn_changed = {}
   self:_turn()
@@ -210,12 +210,22 @@ function Agent:_maybe_compact(force)
 end
 
 function Agent:_turn()
+  local ok, err = pcall(function() self:_turn_impl() end)
+  if not ok then
+    self.job = nil
+    self:ui().notice("error starting turn: " .. tostring(err))
+    self:_finish(true)
+  end
+end
+
+function Agent:_turn_impl()
   self.ctx.model = self.model
   self:_maybe_compact(false)
 
   local provider = providers.get(self.model.provider)
   if not provider then
     self:ui().notify("unknown provider: " .. tostring(self.model.provider), vim.log.levels.ERROR)
+    self:_finish(true)
     return
   end
 
@@ -246,11 +256,14 @@ function Agent:_turn()
       auth = function(badge)
         ui.set_auth(badge)
       end,
-      usage = function(inp, out)
+      usage = function(inp, out, cached)
+        cached = cached or 0
         self.usage.input = self.usage.input + inp
         self.usage.output = self.usage.output + out
+        self.usage.cached = (self.usage.cached or 0) + cached
         self.turn_usage.input = self.turn_usage.input + inp
         self.turn_usage.output = self.turn_usage.output + out
+        self.turn_usage.cached = (self.turn_usage.cached or 0) + cached
         ui.set_usage(self.usage)
         require("advantage.usage").record(self.model, inp, out)
       end,
@@ -270,7 +283,7 @@ function Agent:_turn()
           if #calls > 0 then
             if self:_drain_interrupts(nil, calls) then
               self.turn_started = uv.hrtime()
-              self.turn_usage = { input = 0, output = 0 }
+              self.turn_usage = { input = 0, output = 0, cached = 0 }
               self.turn_open = false
               return self:_turn()
             end
@@ -280,7 +293,7 @@ function Agent:_turn()
 
         if self:_drain_interrupts_as_user_messages() then
           self.turn_started = uv.hrtime()
-          self.turn_usage = { input = 0, output = 0 }
+          self.turn_usage = { input = 0, output = 0, cached = 0 }
           self.turn_open = false
           return self:_turn()
         end
@@ -334,7 +347,7 @@ function Agent:_run_tools(calls)
       end
       self:_drain_interrupts(results, remaining)
       self.turn_started = uv.hrtime()
-      self.turn_usage = { input = 0, output = 0 }
+      self.turn_usage = { input = 0, output = 0, cached = 0 }
       self.turn_open = false
       return self:_turn()
     end
@@ -358,12 +371,15 @@ function Agent:_run_tools(calls)
       ui.set_status("tool", call.name)
       ui.tool_update(call.id, { status = "running" })
       local touched = self:_snapshot(call)
+      local settled = false
       local ok, handle_or_err = pcall(tool.run, call.input, self.ctx, vim.schedule_wrap(function(output, is_error, meta)
         if self.cancelled then return end
         if meta and meta.stream then
           if ui.tool_output then ui.tool_output(call.id, output or "") end
           return
         end
+        if settled then return end
+        settled = true
         self.active_tools[call.id] = nil
         record(call, output, is_error)
         ui.tool_update(call.id, { status = is_error and "error" or "ok" })
@@ -376,6 +392,7 @@ function Agent:_run_tools(calls)
         self.active_tools[call.id] = handle_or_err
       end
       if not ok then
+        settled = true
         self.active_tools[call.id] = nil
         record(call, "Tool crashed: " .. tostring(handle_or_err), true)
         ui.tool_update(call.id, { status = "error" })

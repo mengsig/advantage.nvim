@@ -96,7 +96,12 @@ local function refresh_anthropic(oauth, cb)
     local path = claude_creds_path()
     local file = read_json(path) or {}
     file.claudeAiOauth = vim.tbl_extend("force", file.claudeAiOauth or {}, updated)
-    write_json(path, file)
+    if not write_json(path, file) then
+      vim.schedule(function()
+        vim.notify("advantage: could not write refreshed Claude credentials to " .. path
+          .. " — the `claude` CLI may need a re-login later.", vim.log.levels.WARN)
+      end)
+    end
     cb(updated)
   end)
 end
@@ -156,7 +161,12 @@ local function refresh_codex(auth_file, cb)
     auth_file.tokens.id_token = res.id_token or tokens.id_token
     auth_file.tokens.refresh_token = res.refresh_token or tokens.refresh_token
     auth_file.last_refresh = os.date("!%Y-%m-%dT%H:%M:%S.000Z")
-    write_json(codex_auth_path(), auth_file)
+    if not write_json(codex_auth_path(), auth_file) then
+      vim.schedule(function()
+        vim.notify("advantage: could not write refreshed Codex credentials to " .. codex_auth_path()
+          .. " — the `codex` CLI may need a re-login later.", vim.log.levels.WARN)
+      end)
+    end
     cb(auth_file.tokens)
   end)
 end

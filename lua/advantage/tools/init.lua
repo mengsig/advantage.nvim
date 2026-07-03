@@ -258,19 +258,16 @@ tool({
     local chunks, finished, timed_out, stopped = {}, false, false, false
     local job
 
+    -- Reconstruct the raw byte stream from Neovim's channel-lines protocol:
+    -- within a callback, list elements join with "\n"; across callbacks the
+    -- last element of one continues (concatenates directly with) the first of
+    -- the next, so appending each callback's `concat(data, "\n")` verbatim
+    -- rebuilds the exact output — preserving internal blank lines and partial
+    -- lines without inserting spurious newlines.
     local function add_chunk(data)
-      if not data then return end
-      local text
-      if type(data) == "table" then
-        local lines = {}
-        for _, line in ipairs(data) do
-          if line ~= "" then lines[#lines + 1] = line end
-        end
-        if #lines == 0 then return end
-        text = table.concat(lines, "\n") .. "\n"
-      else
-        text = tostring(data)
-      end
+      if not data or type(data) ~= "table" then return end
+      local text = table.concat(data, "\n")
+      if text == "" then return end
       chunks[#chunks + 1] = text
       if stream then cb(text, false, { stream = true }) end
     end
@@ -385,15 +382,29 @@ tool({
   },
   summary = function(input) return input.pattern or "" end,
   run = function(input, ctx, cb)
-    local cmd
+    local cmd, filter_re
     if vim.fn.executable("rg") == 1 then
       cmd = { "rg", "--files", "--glob", input.pattern }
     else
       cmd = { "sh", "-c", "find . -path './.git' -prune -o -type f -print" }
+      -- rg is absent: filter the full file list against the glob ourselves so
+      -- the pattern is still honoured instead of dumping the whole tree.
+      if input.pattern and input.pattern ~= "" then
+        local ok, re = pcall(vim.fn.glob2regpat, input.pattern)
+        if ok then filter_re = re end
+      end
     end
     vim.system(cmd, { cwd = ctx.cwd, text = true }, function(res)
       vim.schedule(function()
         local lines = vim.split(vim.trim(res.stdout or ""), "\n", { plain = true, trimempty = true })
+        if filter_re then
+          local matched = {}
+          for _, line in ipairs(lines) do
+            local rel = line:gsub("^%./", "")
+            if vim.fn.match(rel, filter_re) >= 0 then matched[#matched + 1] = rel end
+          end
+          lines = matched
+        end
         if #lines > 300 then
           local total = #lines
           lines = vim.list_slice(lines, 1, 300)
