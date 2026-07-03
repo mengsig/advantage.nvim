@@ -65,9 +65,28 @@ function M.estimate_tokens(messages)
   return math.ceil(chars / 4)
 end
 
+-- Truncate to at most `n` bytes without splitting a multi-byte UTF-8 character.
+-- Byte-index string.sub can otherwise leave a dangling continuation byte, which
+-- produces invalid UTF-8 and makes providers reject the request body.
+local function utf8_safe_sub(s, n)
+  if n <= 0 then return "" end
+  if n >= #s then return s end
+  -- If the byte immediately after the cut is a UTF-8 continuation byte
+  -- (0x80-0xBF), the cut landed mid-character; back off until it isn't.
+  while n > 0 do
+    local b = s:byte(n + 1)
+    if b and b >= 0x80 and b < 0xC0 then
+      n = n - 1
+    else
+      break
+    end
+  end
+  return s:sub(1, n)
+end
+
 local function trim_one_line(s, max)
   s = tostring(s or ""):gsub("%s+", " ")
-  if #s > max then s = s:sub(1, math.max(0, max - 1)) .. "…" end
+  if #s > max then s = utf8_safe_sub(s, math.max(0, max - 1)) .. "…" end
   return s
 end
 
@@ -82,7 +101,7 @@ local function summarize_messages(messages, max_chars)
   local function add(line)
     if total >= max_chars then return false end
     if total + #line + 1 > max_chars then
-      line = line:sub(1, math.max(0, max_chars - total - 2)) .. "…"
+      line = utf8_safe_sub(line, math.max(0, max_chars - total - 2)) .. "…"
     end
     lines[#lines + 1] = line
     total = total + #line + 1

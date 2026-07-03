@@ -304,6 +304,21 @@ do
     return compact.force(odd, { keep_recent_messages = 4, summary_max_chars = 2000 })
   end)
   check(ok_odd and odd_out and odd_out[1].content[1].text:find("legacy raw message", 1, true), "compact tolerates legacy/malformed message shapes")
+
+  -- Truncating the summary must not split a multi-byte UTF-8 character, or the
+  -- provider rejects the request body ("str is not valid UTF-8").
+  local emoji = {}
+  for i = 1, 12 do
+    -- Each 4-byte emoji block exceeds the 900-byte per-line trim, forcing a cut
+    -- at byte 899 which lands in the middle of a multi-byte character.
+    emoji[#emoji + 1] = { role = i % 2 == 0 and "assistant" or "user", content = { { type = "text", text = string.rep("🎉", 300) } } }
+  end
+  local emoji_out = select(1, compact.force(emoji, { keep_recent_messages = 4, summary_max_chars = 20000 }))
+  local summary_text = emoji_out[1].content[1].text
+  -- json_encode rejects invalid UTF-8 exactly like the provider request does, so
+  -- a clean encode proves the summary was truncated on a character boundary.
+  check(pcall(vim.fn.json_encode, summary_text),
+    "compact truncates the summary on a UTF-8 character boundary")
 end
 
 -- 4b. sub-agent tool -------------------------------------------------------------
