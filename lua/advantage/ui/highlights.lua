@@ -66,6 +66,7 @@ function M.setup()
     AdvToolDenied = { fg = ghost, strikethrough = true },
     AdvToolName = { fg = hex(fg), bold = true },
     AdvToolDetail = { fg = faint },
+    AdvToolOutput = { fg = faint },
     AdvWelcome = { fg = accent_hex, bold = true },
     AdvWelcomeDim = { fg = ghost },
     AdvBarIcon = { fg = accent_hex, bold = true },

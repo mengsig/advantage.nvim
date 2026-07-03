@@ -51,11 +51,12 @@ function M.new(opts)
   self.turn_started = nil
   self.turn_usage = { input = 0, output = 0 }
   self.turn_open = false
-  self.ctx = { cwd = uv.cwd() }
+  self.ctx = { cwd = uv.cwd(), model = self.model }
   self.allowed = {} -- per-session "always allow" tool names
   self.queue = {} -- Ctrl-S messages submitted while a turn was running
   self.interrupts = {} -- Enter messages to inject before the next tool call
   self.pending_permission = nil -- callable that resolves the active permission card
+  self.active_tools = {} -- tool_use_id -> cancellable handle returned by a running tool
   self.snapshots = {} -- abs path -> content before the agent's first touch (false = new file)
   self.turn_changed = {} -- abs paths changed during the current turn
   return self
@@ -67,6 +68,14 @@ end
 
 function Agent:busy()
   return self.status ~= "idle"
+end
+
+function Agent:compact()
+  if self:busy() then
+    self:ui().notify("finish or cancel the running turn before compacting context", vim.log.levels.WARN)
+    return nil
+  end
+  return self:_maybe_compact(true)
 end
 
 local function user_content(text, opts, cwd)
@@ -138,11 +147,20 @@ function Agent:_drain_interrupts(results, remaining_calls)
     }
     self:ui().tool_update(call.id, { status = "denied", detail = "interrupted" })
   end
+
+  -- Keep synthetic tool results and the user's new message as distinct turns.
+  -- Anthropic permits tool_result blocks in user messages, while OpenAI's
+  -- Responses API is much stricter about function_call_output sequencing; a
+  -- mixed "tool_result + text" content array can produce 400s after an
+  -- interrupt.  The canonical history therefore becomes:
+  --   assistant(tool_use), user(tool_result...), user(actual interruption)
+  if #results > 0 then
+    table.insert(self.messages, { role = "user", content = results })
+  end
   for _, item in ipairs(self.interrupts) do
-    vim.list_extend(results, item.content)
+    table.insert(self.messages, { role = "user", content = item.content })
   end
   self.interrupts = {}
-  table.insert(self.messages, { role = "user", content = results })
   return true
 end
 
@@ -170,7 +188,31 @@ function Agent:_snapshot(call)
   return path
 end
 
+function Agent:_maybe_compact(force)
+  local cfg = config.options.context or {}
+  if not force and cfg.auto_compact == false then return nil end
+  local compact = require("advantage.compact")
+  local next_messages, info
+  if force then
+    next_messages, info = compact.force(self.messages, cfg)
+  else
+    next_messages, info = compact.compact(self.messages, cfg)
+  end
+  if info then
+    self.messages = next_messages
+    self:ui().notice(("compacted %d old messages (~%s → ~%s tokens)"):format(
+      info.compacted_messages,
+      require("advantage.util").fmt_tokens(info.before_tokens),
+      require("advantage.util").fmt_tokens(info.after_tokens)
+    ))
+  end
+  return info
+end
+
 function Agent:_turn()
+  self.ctx.model = self.model
+  self:_maybe_compact(false)
+
   local provider = providers.get(self.model.provider)
   if not provider then
     self:ui().notify("unknown provider: " .. tostring(self.model.provider), vim.log.levels.ERROR)
@@ -178,6 +220,7 @@ function Agent:_turn()
   end
 
   self.status = "streaming"
+  self.ctx.system = M.system_prompt()
   local ui = self:ui()
   if not self.turn_open then
     ui.begin_assistant(self.model.label)
@@ -187,7 +230,7 @@ function Agent:_turn()
 
   self.job = provider.stream({
     model = self.model,
-    system = M.system_prompt(),
+    system = self.ctx.system,
     messages = self.messages,
     tools = tools.schemas(),
     on = {
@@ -315,8 +358,13 @@ function Agent:_run_tools(calls)
       ui.set_status("tool", call.name)
       ui.tool_update(call.id, { status = "running" })
       local touched = self:_snapshot(call)
-      local ok, err = pcall(tool.run, call.input, self.ctx, vim.schedule_wrap(function(output, is_error)
+      local ok, handle_or_err = pcall(tool.run, call.input, self.ctx, vim.schedule_wrap(function(output, is_error, meta)
         if self.cancelled then return end
+        if meta and meta.stream then
+          if ui.tool_output then ui.tool_output(call.id, output or "") end
+          return
+        end
+        self.active_tools[call.id] = nil
         record(call, output, is_error)
         ui.tool_update(call.id, { status = is_error and "error" or "ok" })
         if touched and not is_error then
@@ -324,8 +372,12 @@ function Agent:_run_tools(calls)
         end
         run_next()
       end))
+      if ok and type(handle_or_err) == "table" and (handle_or_err.stop or handle_or_err.kill) then
+        self.active_tools[call.id] = handle_or_err
+      end
       if not ok then
-        record(call, "Tool crashed: " .. tostring(err), true)
+        self.active_tools[call.id] = nil
+        record(call, "Tool crashed: " .. tostring(handle_or_err), true)
         ui.tool_update(call.id, { status = "error" })
         run_next()
       end
@@ -418,6 +470,15 @@ function Agent:cancel(opts)
     self.pending_permission = nil
     pending("deny")
   end
+  for id, handle in pairs(self.active_tools or {}) do
+    local ok = false
+    if type(handle) == "table" then
+      if handle.stop then ok = pcall(handle.stop) end
+      if not ok and handle.kill then pcall(handle.kill) end
+    end
+    self:ui().tool_update(id, { status = "denied", detail = "cancelled" })
+  end
+  self.active_tools = {}
   if self.job then
     self.job.stop()
     self.job = nil

@@ -81,6 +81,7 @@ function M.request_sse(opts)
     "silent",
     "show-error",
     "no-buffer",
+    "http1.1",
     "connect-timeout = 15",
     "data-binary = " .. q("@" .. body_file),
   }

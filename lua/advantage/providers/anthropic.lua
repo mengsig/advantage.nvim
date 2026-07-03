@@ -12,6 +12,9 @@ local M = {}
 local OAUTH_IDENTITY = "You are Claude Code, Anthropic's official CLI for Claude."
 
 ---Strip canonical blocks other providers may have added (e.g. openai reasoning items).
+---Also coalesce consecutive same-role messages: the Messages API requires roles to
+---strictly alternate, so back-to-back user turns (e.g. a compaction summary followed
+---by a retained user message, or interrupt-injected messages) would otherwise 400.
 local function sanitize_messages(messages)
   local out = {}
   for _, msg in ipairs(messages) do
@@ -23,7 +26,14 @@ local function sanitize_messages(messages)
       end
     end
     if #content > 0 then
-      out[#out + 1] = { role = msg.role, content = content }
+      local prev = out[#out]
+      if prev and prev.role == msg.role then
+        for _, block in ipairs(content) do
+          prev.content[#prev.content + 1] = block
+        end
+      else
+        out[#out + 1] = { role = msg.role, content = content }
+      end
     end
   end
   return out

@@ -514,6 +514,15 @@ function M.usage()
   })
 end
 
+---Force context compaction for the current session.
+function M.compact()
+  local agent = ensure_agent()
+  local info = agent:compact()
+  if not info then
+    ui.notify("context is already compact enough")
+  end
+end
+
 ---Show the keybind and command cheatsheet.
 function M.help()
   ensure_init()
@@ -537,6 +546,8 @@ function M._command(opts)
     M.stop()
   elseif sub == "usage" then
     M.usage()
+  elseif sub == "compact" then
+    M.compact()
   elseif sub == "help" or sub == "keys" then
     M.help()
   elseif sub == "review" or sub == "diff" then
@@ -604,7 +615,7 @@ function M._command(opts)
   end
 end
 
-M._subcommands = { "toggle", "new", "model", "resume", "stop", "usage", "help", "review", "yolo", "effort", "add", "files", "attach", "ask" }
+M._subcommands = { "toggle", "new", "model", "resume", "stop", "usage", "compact", "help", "review", "yolo", "effort", "add", "files", "attach", "ask" }
 M._effort_modes = { "minimal", "low", "medium", "high", "adaptive", "off", "1k", "4k", "8k" }
 
 function M._complete(arglead, cmdline)

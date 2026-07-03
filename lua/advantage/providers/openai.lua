@@ -15,11 +15,28 @@ local function uuid()
   end)
 end
 
+local function content_blocks(msg)
+  if type(msg) ~= "table" then return { msg } end
+  return type(msg.content) == "table" and msg.content or { msg.content }
+end
+
+local function is_compaction_summary(block)
+  return type(block) == "table"
+    and block.type == "text"
+    and type(block.text) == "string"
+    and vim.startswith(block.text, "Conversation context summary (auto-compacted by advantage.nvim).")
+end
+
 ---Convert canonical (Anthropic-shaped) messages into Responses API input items.
 local function to_input_items(messages)
   local items = {}
-  for _, msg in ipairs(messages) do
-    for _, block in ipairs(msg.content) do
+  local seen_tool_calls = {}
+  local compacted = false
+  for _, msg in ipairs(type(messages) == "table" and messages or {}) do
+    msg = type(msg) == "table" and msg or { role = "user", content = { msg } }
+    for _, block in ipairs(content_blocks(msg)) do
+      block = type(block) == "table" and block or { type = "text", text = tostring(block or "") }
+      if is_compaction_summary(block) then compacted = true end
       if block.type == "text" then
         if msg.role == "assistant" then
           items[#items + 1] = { role = "assistant", content = { { type = "output_text", text = block.text } } }
@@ -36,23 +53,35 @@ local function to_input_items(messages)
             },
           },
         }
-      elseif block.type == "tool_use" then
-        items[#items + 1] = {
+      elseif block.type == "tool_use" and block.id then
+        seen_tool_calls[block.id] = true
+        local item = {
           type = "function_call",
           call_id = block.id,
           name = block.name,
           arguments = vim.json.encode(block.input or vim.empty_dict()),
+          status = block.status or "completed",
         }
+        -- Once context has been compacted the paired encrypted reasoning item is
+        -- gone, so a function_call carrying its server-side id (fc_…) would be
+        -- rejected for lacking its required preceding reasoning item. Replay it as
+        -- a fresh client-provided call instead.
+        if block.openai_item_id and not compacted then item.id = block.openai_item_id end
+        items[#items + 1] = item
       elseif block.type == "tool_result" then
-        local content = block.content
-        if type(content) == "table" then content = vim.json.encode(content) end
-        items[#items + 1] = {
-          type = "function_call_output",
-          call_id = block.tool_use_id,
-          output = content or "",
-        }
-      elseif block.type == "openai_reasoning" and block.item then
+        if seen_tool_calls[block.tool_use_id] then
+          local content = block.content
+          if type(content) == "table" then content = vim.json.encode(content) end
+          items[#items + 1] = {
+            type = "function_call_output",
+            call_id = block.tool_use_id,
+            output = content or "",
+          }
+        end
+      elseif block.type == "openai_reasoning" and block.item and not compacted then
         -- Replay reasoning items so codex models keep their chain across tool calls.
+        -- Once context has been compacted the encrypted item no longer matches the
+        -- exact prior transcript, and the Responses API may reject the request.
         items[#items + 1] = block.item
       end
       -- anthropic thinking blocks are dropped for this provider
@@ -100,6 +129,8 @@ local function make_handler(on)
         blocks[#blocks + 1] = {
           type = "tool_use",
           id = item.call_id or item.id,
+          openai_item_id = item.id,
+          status = item.status or "completed",
           name = item.name,
           input = ok and input or vim.empty_dict(),
         }
@@ -140,6 +171,7 @@ local function make_handler(on)
   return on_event, function() return completed end
 end
 
+M._to_input_items = to_input_items
 M._make_handler = make_handler
 
 function M.stream(req)

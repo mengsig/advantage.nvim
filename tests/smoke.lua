@@ -123,6 +123,59 @@ do
   check(final.blocks[2].type == "tool_use" and final.blocks[2].input.path == "a.lua", "function_call → tool_use")
   check(final.blocks[3].type == "text" and final.blocks[3].text == "on it", "message → text block")
   check(got.usage[1] == 9 and got.usage[2] == 21, "usage reported")
+
+  local items = openai._to_input_items({
+    { role = "user", content = { { type = "tool_result", tool_use_id = "missing", content = "orphan" } } },
+    { role = "assistant", content = { { type = "tool_use", id = "call_ok", name = "bash", input = { command = "true" } } } },
+    { role = "user", content = { { type = "tool_result", tool_use_id = "call_ok", content = "ok" } } },
+  })
+  local outputs = 0
+  for _, item in ipairs(items) do
+    if item.type == "function_call_output" then
+      outputs = outputs + 1
+      check(item.call_id == "call_ok", "openai input skips orphan function_call_output")
+    elseif item.type == "function_call" then
+      check(item.status == "completed", "openai replays function calls as completed")
+    end
+  end
+  check(outputs == 1, "openai input only replays matched tool outputs")
+
+  items = openai._to_input_items({
+    { role = "user", content = { { type = "text", text = require("advantage.compact")._SUMMARY_PREFIX .. "\nold context" } } },
+    { role = "assistant", content = {
+      { type = "openai_reasoning", item = { type = "reasoning", encrypted_content = "stale" } },
+      { type = "tool_use", id = "call_after", openai_item_id = "fc_stale", name = "read_file", input = { path = "a" } },
+    } },
+    { role = "user", content = { { type = "tool_result", tool_use_id = "call_after", content = "ok" } } },
+  })
+  local reasoning, id_leaks = 0, 0
+  for _, item in ipairs(items) do
+    if item.type == "reasoning" then reasoning = reasoning + 1 end
+    if item.type == "function_call" and item.id then id_leaks = id_leaks + 1 end
+  end
+  check(reasoning == 0, "openai drops encrypted reasoning after compaction")
+  check(id_leaks == 0, "openai detaches stored function_call ids after compaction")
+
+  -- compaction itself must strip the item id from retained tool calls so the
+  -- Responses API doesn't demand the reasoning item we removed.
+  local compact = require("advantage.compact")
+  local reasoned = {
+    { role = "user", content = { { type = "text", text = "look" } } },
+    { role = "assistant", content = {
+      { type = "openai_reasoning", item = { type = "reasoning", encrypted_content = "x" } },
+      { type = "tool_use", id = "call_keep2", openai_item_id = "fc_keep", name = "read_file", input = { path = "a" } },
+    } },
+    { role = "user", content = { { type = "tool_result", tool_use_id = "call_keep2", content = string.rep("r ", 100) } } },
+    { role = "assistant", content = { { type = "text", text = string.rep("done ", 100) } } },
+  }
+  local reasoned_out = select(1, compact.force(reasoned, { keep_recent_messages = 2, summary_max_chars = 1000 }))
+  local kept_id
+  for _, m in ipairs(reasoned_out) do
+    for _, b in ipairs(m.content) do
+      if b.type == "tool_use" then kept_id = b.openai_item_id end
+    end
+  end
+  check(kept_id == nil, "compact detaches openai item ids from retained tool calls")
 end
 
 -- 4. tools ---------------------------------------------------------------------
@@ -174,9 +227,134 @@ do
   check(err == true, "edit_file rejects empty old_string (no freeze)")
   local p2 = tools.get("edit_file").preview({ path = "x/hello.txt", old_string = "", new_string = "x", replace_all = true }, ctx)
   check(p2.lines[1]:find("invalid edit") ~= nil, "edit preview rejects empty old_string (no freeze)")
+  -- optional streaming bash output reports partial chunks before the final result
+  local streams = {}
+  done, result, is_err = false, nil, nil
+  local h = tools.get("bash").run({ command = "printf one; sleep 0.05; printf two", stream = true }, ctx, function(out, err, meta)
+    if meta and meta.stream then
+      streams[#streams + 1] = out
+    else
+      result, is_err, done = out, err, true
+    end
+  end)
+  check(type(h) == "table" and h.stop ~= nil, "bash returns a cancellable handle")
+  vim.wait(5000, function() return done end, 10)
+  check(#streams >= 1 and result:find("one") and result:find("two") and not is_err, "bash can stream partial output")
+
+  -- cancellation stops a running command and reports an error final result
+  done, result, is_err = false, nil, nil
+  h = tools.get("bash").run({ command = "sleep 5; echo too-late", timeout_ms = 10000 }, ctx, function(out, err)
+    result, is_err, done = out, err, true
+  end)
+  h.stop()
+  vim.wait(5000, function() return done end, 10)
+  check(is_err == true and result:find("cancelled", 1, true), "bash cancellation stops the command")
 end
 
--- 4b. auth handles null-bearing credential files -------------------------------
+-- 4a. context compaction ---------------------------------------------------------
+
+section("context compaction")
+do
+  local compact = require("advantage.compact")
+  local messages = {}
+  for i = 1, 24 do
+    messages[#messages + 1] = { role = i % 2 == 0 and "assistant" or "user", content = { { type = "text", text = ("message %02d "):format(i) .. string.rep("x", 120) } } }
+  end
+  local out, info = compact.compact(messages, { compact_at_tokens = 100, keep_recent_messages = 6, summary_max_chars = 2000 })
+  check(info and info.compacted_messages == 18, "compacts old messages when threshold is crossed")
+  check(out[1].content[1].text:find(compact._SUMMARY_PREFIX, 1, true), "summary prepended")
+  check(out[#out].content[1].text:find("message 24", 1, true), "recent messages kept verbatim")
+  -- Roles must strictly alternate; the summary must never sit directly before
+  -- another user turn (Anthropic 400s on consecutive same-role messages).
+  local prev_role
+  local alternates = true
+  for _, m in ipairs(out) do
+    if m.role == prev_role then alternates = false end
+    prev_role = m.role
+  end
+  check(alternates, "compacted messages keep alternating roles")
+
+  local ok_empty = pcall(function()
+    compact.force(nil, { keep_recent_messages = 6 })
+  end)
+  check(ok_empty, "manual compact tolerates an empty conversation")
+
+  local odd = {
+    "legacy raw message",
+    { role = "user", content = "legacy string content" },
+  }
+  for i = 1, 8 do
+    odd[#odd + 1] = { role = i % 2 == 0 and "assistant" or "user", content = { { type = "text", text = "recent " .. i } } }
+  end
+  local paired = {
+    { role = "user", content = { { type = "text", text = "please inspect" } } },
+    { role = "assistant", content = { { type = "tool_use", id = "call_keep", name = "read_file", input = { path = "a" } } } },
+    { role = "user", content = { { type = "tool_result", tool_use_id = "call_keep", content = string.rep("result ", 100) } } },
+    { role = "assistant", content = {
+      { type = "openai_reasoning", item = { type = "reasoning", encrypted_content = "stale" } },
+      { type = "text", text = string.rep("final ", 100) },
+    } },
+  }
+  local paired_out = select(1, compact.force(paired, { keep_recent_messages = 2, summary_max_chars = 1000 }))
+  check(#paired_out == 4 and paired_out[2].content[1].type == "tool_use",
+    "compact does not orphan a recent tool_result from its tool_use")
+  check(paired_out[4].content[1].type == "text", "compact strips stale OpenAI reasoning from retained messages")
+
+  local ok_odd, odd_out = pcall(function()
+    return compact.force(odd, { keep_recent_messages = 4, summary_max_chars = 2000 })
+  end)
+  check(ok_odd and odd_out and odd_out[1].content[1].text:find("legacy raw message", 1, true), "compact tolerates legacy/malformed message shapes")
+end
+
+-- 4b. sub-agent tool -------------------------------------------------------------
+
+section("sub-agent")
+do
+  local providers = require("advantage.providers")
+  local tools = require("advantage.tools")
+  local tmp = vim.fn.tempname()
+  vim.fn.mkdir(tmp, "p")
+  vim.fn.writefile({ "subagent evidence" }, tmp .. "/note.txt")
+  local turn, saw_tool_result = 0, false
+  providers.register("fakesub", {
+    stream = function(req)
+      turn = turn + 1
+      if turn == 2 then
+        for _, msg in ipairs(req.messages) do
+          for _, b in ipairs(msg.content or {}) do
+            if b.type == "tool_result" and tostring(b.content):find("subagent evidence", 1, true) then
+              saw_tool_result = true
+            end
+          end
+        end
+      end
+      vim.defer_fn(function()
+        if turn == 1 then
+          req.on.tool_start("r1", "read_file")
+          req.on.complete({
+            { type = "tool_use", id = "r1", name = "read_file", input = { path = "note.txt" } },
+          }, "tool_use")
+        else
+          req.on.text("report: found subagent evidence in note.txt")
+          req.on.complete({ { type = "text", text = "report: found subagent evidence in note.txt" } }, "end_turn")
+        end
+      end, 10)
+      return { stop = function() end }
+    end,
+  })
+  local done, result, err = false, nil, nil
+  tools.get("sub_agent").run({ prompt = "inspect note", model = "fakesub/model", max_turns = 4 }, {
+    cwd = tmp,
+    model = { provider = "fakesub", id = "model", label = "fake sub" },
+  }, function(out, is_err)
+    result, err, done = out, is_err, true
+  end)
+  vim.wait(5000, function() return done end, 10)
+  check(turn == 2 and saw_tool_result, "sub-agent can use read-only tools in its own loop")
+  check(err == false and result:find("subagent evidence", 1, true), "sub-agent returns final report")
+end
+
+-- 4c. auth handles null-bearing credential files -------------------------------
 
 section("auth null handling")
 do
@@ -275,6 +453,8 @@ do
   check(msgs[2].content[2].type == "tool_use", "assistant tool_use recorded")
   check(msgs[3].content[1].type == "tool_result" and msgs[3].content[1].content:find("agent%-was%-here") ~= nil,
     "tool_result captured bash output")
+  local public_ok = pcall(function() adv.compact() end)
+  check(public_ok, "public /compact command does not error on a small idle conversation")
 end
 
 -- 6. message queue ---------------------------------------------------------------
@@ -337,11 +517,11 @@ do
 
   check(stopped == false, "enter while running does not cancel the stream")
   check(turn == 2, "interrupt triggered a follow-up model turn")
-  check(seen and seen[3] and seen[3].role == "user", "interrupt inserted before tool execution")
+  check(seen and seen[3] and seen[3].role == "user", "interrupt inserted tool-result turn before follow-up")
   check(seen and seen[3] and seen[3].content[1].type == "tool_result" and seen[3].content[1].is_error == true,
     "pending tool was skipped with a tool_result")
-  check(seen and seen[3] and seen[3].content[2].type == "text" and seen[3].content[2].text:find("second before tool", 1, true),
-    "interrupt text sent with skipped tool result")
+  check(seen and seen[4] and seen[4].role == "user" and seen[4].content[1].type == "text" and seen[4].content[1].text:find("second before tool", 1, true),
+    "interrupt text sent as its own user turn")
 
   require("advantage.config").options.tools.auto_approve = {}
   local wait_turn, wait_seen = 0, nil
@@ -392,6 +572,9 @@ do
   end
   check(banners == 1, "welcome banner rendered exactly once after reopens")
   check(vim.bo[ui.state.buf].modifiable == false, "transcript buffer is read-only")
+  local ok = pcall(ui.notice, "error: first line\nsecond line")
+  local text = table.concat(vim.api.nvim_buf_get_lines(ui.state.buf, 0, -1, false), "\n")
+  check(ok and text:find("second line", 1, true) ~= nil, "multiline notices render without crashing")
 end
 
 -- 9. attachments / @mentions -------------------------------------------------------

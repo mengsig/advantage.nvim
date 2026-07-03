@@ -10,8 +10,9 @@ your editor, feeds results back, and repeats until the task is done.
   OpenAI GPT/Codex (gpt-5.5 and gpt-5.1-codex family) out of the box; the
   provider interface is ~100 lines if you want to add more.
 - **Editor-native tools.** `read_file`, `edit_file`, `write_file`, `bash`, `grep`,
-  `find_files`, `list_dir` — executed inside Neovim, so edited buffers reload
-  live and every mutation is gated behind a permission card with a real diff.
+  `find_files`, `list_dir`, `sub_agent` — executed inside Neovim, so edited
+  buffers reload live and every mutation is gated behind a permission card with
+  a real diff.
 - **A UI that respects your colorscheme.** No hardcoded palette: the accent,
   washes and dim tones are derived from *your* theme at runtime. Quiet lowercase
   headers, animated tool cards, dimmed streaming reasoning, token/cost meta per
@@ -117,8 +118,8 @@ lines are read fresh from disk on send.
 X11 `xclip`, macOS `pngpaste`) and drops a `[image: …]` chip into the text —
 delete the chip to detach. `:Advantage attach shot.png` attaches a file.
 
-**Slash commands** in the prompt: `/usage` · `/review` · `/yolo` · `/effort` ·
-`/new` · `/model` · `/resume` · `/help`.
+**Slash commands** in the prompt: `/usage` · `/compact` · `/review` · `/yolo` ·
+`/effort` · `/new` · `/model` · `/resume` · `/help`.
 
 **Review mode.** The agent snapshots every file before its first edit. After a
 turn that changed files you'll see *"n files changed — /review to inspect"*:
@@ -142,8 +143,17 @@ session/today/7-day token totals, a sparkline, your current pace, a projection
 to midnight, and — if you set `usage.daily_budget` — the time you'll run out
 at the current pace.
 
+**Context compaction.** Old transcript history is automatically compacted when
+it crosses `context.compact_at_tokens` (roughly chars/4). The newest messages stay
+verbatim; older user asks, assistant text, tool calls and results become one
+summary message. Run `/compact` or `:Advantage compact` to force it manually.
+
+**Sub-agents.** The model has a `sub_agent` tool for read-only fan-out: a worker
+gets its own short loop and can use read/search/list tools, then returns a
+concise report to the parent agent. It cannot edit files.
+
 Commands: `:Advantage` (toggle) · `new` · `model` · `resume` · `stop` · `usage` ·
-`help` · `review` · `yolo [on|off]` · `effort` · `add` · `files` ·
+`compact` · `help` · `review` · `yolo [on|off]` · `effort` · `add` · `files` ·
 `attach {path}` · `ask {prompt}` (works with a visual range: `:'<,'>Advantage ask why is this slow?`).
 
 When the model wants to **edit a file or run a command**, a floating card shows
@@ -177,6 +187,17 @@ require("advantage").setup({
     auto_approve = {},           -- e.g. { bash = true } — at your own risk
     yolo = false,                -- skip ALL permission prompts (/yolo toggles)
     bash_timeout_ms = 120000,
+    stream_bash_output = false,  -- or per-call: bash { stream = true }
+  },
+  context = {
+    auto_compact = true,
+    compact_at_tokens = 120000,  -- rough chars/4 estimate
+    keep_recent_messages = 16,
+    summary_max_chars = 12000,
+  },
+  subagents = {
+    enabled = true,              -- exposes the read-only `sub_agent` tool
+    max_turns = 6,
   },
   keymaps = {                    -- set to "" to disable any of these
     toggle = "<leader>cc",
@@ -219,6 +240,6 @@ nvim -l tests/smoke.lua   # parser, providers, tools, and a full fake-provider t
 
 ## Roadmap
 
-- parallel tool execution
-- prompt-cache breakpoints for long sessions
-- sub-agent fan-out
+- parallel tool execution (including parallel sub-agent fan-out)
+- provider-native prompt-cache breakpoints for long sessions
+- richer compaction (model-written summaries / checkpoint restore)

@@ -240,6 +240,7 @@ tool({
     properties = {
       command = { type = "string", description = "The command to run" },
       timeout_ms = { type = "integer", description = "Timeout in milliseconds (default 120000)" },
+      stream = { type = "boolean", description = "Stream stdout/stderr into the transcript while the command runs" },
     },
     required = { "command" },
   },
@@ -252,26 +253,81 @@ tool({
   end,
   run = function(input, ctx, cb)
     local cfg = require("advantage.config").options
-    local ok, proc = pcall(vim.system, { "bash", "-c", input.command }, {
-      cwd = ctx.cwd,
-      text = true,
-      timeout = input.timeout_ms or cfg.tools.bash_timeout_ms,
-    }, function(res)
-      vim.schedule(function()
-        local out = (res.stdout or "")
-        if res.stderr and res.stderr ~= "" then
-          out = out .. (out ~= "" and "\n" or "") .. res.stderr
+    local timeout = input.timeout_ms or cfg.tools.bash_timeout_ms
+    local stream = input.stream == true or cfg.tools.stream_bash_output == true
+    local chunks, finished, timed_out, stopped = {}, false, false, false
+    local job
+
+    local function add_chunk(data)
+      if not data then return end
+      local text
+      if type(data) == "table" then
+        local lines = {}
+        for _, line in ipairs(data) do
+          if line ~= "" then lines[#lines + 1] = line end
         end
-        if res.code ~= 0 then
-          out = out .. (out ~= "" and "\n" or "") .. ("(exit code %d)"):format(res.code)
-        end
-        if vim.trim(out) == "" then out = "(no output)" end
-        cb(truncate(out), res.code ~= 0)
-      end)
-    end)
-    if not ok then
-      cb("Failed to spawn bash: " .. tostring(proc), true)
+        if #lines == 0 then return end
+        text = table.concat(lines, "\n") .. "\n"
+      else
+        text = tostring(data)
+      end
+      chunks[#chunks + 1] = text
+      if stream then cb(text, false, { stream = true }) end
     end
+
+    local timer
+    local function close_timer()
+      if timer then
+        timer:stop()
+        timer:close()
+        timer = nil
+      end
+    end
+
+    job = vim.fn.jobstart({ "bash", "-c", input.command or "" }, {
+      cwd = ctx.cwd,
+      stdout_buffered = not stream,
+      stderr_buffered = not stream,
+      on_stdout = function(_, data) add_chunk(data) end,
+      on_stderr = function(_, data) add_chunk(data) end,
+      on_exit = function(_, code)
+        vim.schedule(function()
+          if finished then return end
+          finished = true
+          close_timer()
+          local out = table.concat(chunks)
+          if timed_out then
+            out = out .. (out ~= "" and "\n" or "") .. ("(timed out after %d ms)"):format(timeout)
+          elseif stopped then
+            out = out .. (out ~= "" and "\n" or "") .. "(cancelled)"
+          elseif code ~= 0 then
+            out = out .. (out ~= "" and "\n" or "") .. ("(exit code %d)"):format(code)
+          end
+          if vim.trim(out) == "" then out = "(no output)" end
+          cb(truncate(out), timed_out or stopped or code ~= 0)
+        end)
+      end,
+    })
+    if job <= 0 then
+      close_timer()
+      cb("Failed to spawn bash — is it installed?", true)
+      return nil
+    end
+
+    timer = uv.new_timer()
+    timer:start(timeout, 0, vim.schedule_wrap(function()
+      if finished then return end
+      timed_out = true
+      pcall(vim.fn.jobstop, job)
+    end))
+
+    return {
+      stop = function()
+        if finished then return end
+        stopped = true
+        pcall(vim.fn.jobstop, job)
+      end,
+    }
   end,
 })
 
@@ -363,7 +419,7 @@ tool({
   },
   summary = function(input) return input.path or "." end,
   run = function(input, ctx, cb)
-    local path = resolve(input.path or ".", ctx)
+    local path = resolve((input.path and input.path ~= "") and input.path or ".", ctx)
     local handle = path and uv.fs_scandir(path)
     if not handle then
       return cb("Not a directory: " .. tostring(input.path), true)
@@ -383,6 +439,30 @@ tool({
     table.sort(files)
     vim.list_extend(dirs, files)
     cb(#dirs == 0 and "(empty)" or table.concat(dirs, "\n"), false)
+  end,
+})
+
+-- sub_agent -------------------------------------------------------------
+
+tool({
+  name = "sub_agent",
+  safe = true,
+  description = "Spawn a read-only sub-agent for independent investigation. The sub-agent can read/search/list files and returns a concise report; it cannot edit files.",
+  input_schema = {
+    type = "object",
+    properties = {
+      prompt = { type = "string", description = "Investigation task for the sub-agent" },
+      model = { type = "string", description = "Optional model ref provider/model-id; defaults to the current model" },
+      max_turns = { type = "integer", description = "Maximum sub-agent turns including tool loops (default from config, capped at 12)" },
+    },
+    required = { "prompt" },
+  },
+  summary = function(input)
+    local p = (input.prompt or ""):gsub("%s+", " ")
+    return #p > 60 and (p:sub(1, 57) .. "…") or p
+  end,
+  run = function(input, ctx, cb)
+    return require("advantage.subagent").run(input, ctx, cb)
   end,
 })
 

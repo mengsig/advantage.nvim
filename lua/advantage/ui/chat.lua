@@ -48,7 +48,25 @@ local function opt(name, value, win)
 end
 
 local function esc_bar(s)
-  return (s or ""):gsub("%%", "%%%%")
+  return tostring(s or ""):gsub("[\r\n]+", " "):gsub("%%", "%%%%")
+end
+
+local function split_lines(text)
+  text = tostring(text or ""):gsub("\r\n", "\n"):gsub("\r", "\n")
+  return vim.split(text, "\n", { plain = true })
+end
+
+local function normalize_lines(lines)
+  if type(lines) ~= "table" then lines = { lines } end
+  local out = {}
+  for _, line in ipairs(lines or {}) do
+    vim.list_extend(out, split_lines(line))
+  end
+  return out
+end
+
+local function one_line(text)
+  return tostring(text or ""):gsub("[\r\n]+", " ")
 end
 
 ---The transcript is read-only for the user; all internal writes go through here.
@@ -69,6 +87,7 @@ end
 
 local function append(lines)
   if not util.buf_valid(S.buf) then return end
+  lines = normalize_lines(lines)
   clear_welcome()
   buf_write(function()
     local lc = api.nvim_buf_line_count(S.buf)
@@ -176,9 +195,9 @@ local function tool_line(t)
     denied = { "◌", "AdvToolDenied" },
   }
   local icon = icons[t.status or "pending"] or icons.pending
-  local text = ("  %s %s"):format(icon[1], t.name or "?")
+  local text = ("  %s %s"):format(icon[1], one_line(t.name or "?"))
   if t.detail and t.detail ~= "" then
-    text = text .. "  " .. t.detail
+    text = text .. "  " .. one_line(t.detail)
   end
   return text, icon[2]
 end
@@ -398,6 +417,7 @@ end
 ---Slash commands typed into the prompt (`/usage`, `/new`, …).
 local SLASH = {
   usage = function() require("advantage").usage() end,
+  compact = function() require("advantage").compact() end,
   new = function() require("advantage").new_session() end,
   clear = function() require("advantage").new_session() end,
   model = function() require("advantage").pick_model() end,
@@ -433,7 +453,7 @@ local function submit(mode)
       vim.cmd.stopinsert()
       fn(cmd_arg)
     else
-      M.notify("unknown command: /" .. cmd .. "  (try /usage, /review, /yolo, /effort, /new, /model, /resume, /help)", vim.log.levels.WARN)
+      M.notify("unknown command: /" .. cmd .. "  (try /usage, /compact, /review, /yolo, /effort, /new, /model, /resume, /help)", vim.log.levels.WARN)
     end
     return
   end
@@ -475,9 +495,10 @@ local function help_lines()
     "  c        deny with a comment for the agent",
     "",
     "slash commands",
-    "  /usage   token dashboard   /new     fresh session",
-    "  /model   switch model      /resume  resume session",
-    "  /review  diff agent edits  /yolo    skip permissions",
+    "  /usage   token dashboard   /compact shrink old context",
+    "  /new     fresh session     /model   switch model",
+    "  /resume  resume session    /review  diff agent edits",
+    "  /yolo    skip permissions",
     "  /effort [mode]  tune thinking/reasoning (OpenAI: minimal/low/medium/high; Claude: adaptive/off/low/medium/high)",
     "",
     "commands",
@@ -486,6 +507,7 @@ local function help_lines()
     "  :Advantage model      switch model",
     "  :Advantage resume     resume a session",
     "  :Advantage usage      token dashboard",
+    "  :Advantage compact    shrink old conversation context",
     "  :Advantage help       keybind and command cheatsheet",
     "  :Advantage review     diff the agent's changes",
     "  :Advantage yolo       toggle skip-all-permissions",
@@ -829,6 +851,35 @@ function M.tool_update(id, patch)
   autoscroll()
 end
 
+---Append streamed tool output under the current tool card. This is intentionally
+---plain transcript text (not part of model-visible history); the final tool
+---result is still recorded by the agent when the tool exits.
+function M.tool_output(id, chunk)
+  if not util.buf_valid(S.buf) or not chunk or chunk == "" then return end
+  local max = 6000
+  if #chunk > max then chunk = chunk:sub(1, max) .. "\n… [stream chunk truncated]" end
+  local lines = vim.split(chunk:gsub("\r", ""), "\n", { plain = true })
+  if lines[#lines] == "" then table.remove(lines) end
+  if #lines == 0 then return end
+  local out = {}
+  for _, line in ipairs(lines) do
+    out[#out + 1] = "    " .. line
+  end
+  append(out)
+  S.last_kind = "tool"
+  local start = last_row() - #out + 1
+  for row = start, last_row() do
+    local line = api.nvim_buf_get_lines(S.buf, row, row + 1, false)[1] or ""
+    api.nvim_buf_set_extmark(S.buf, ns, row, 0, {
+      end_row = row,
+      end_col = #line,
+      hl_group = "AdvToolOutput",
+      priority = 110,
+    })
+  end
+  autoscroll()
+end
+
 ---Right-aligned meta on the current turn's header; overwritten as the turn
 ---progresses so it always shows the cumulative turn cost.
 function M.message_meta(usage, elapsed_ns)
@@ -853,14 +904,23 @@ end
 function M.notice(text)
   ensure_bufs()
   S.mode = nil
-  append({ "", "  ▸ " .. text })
+  local parts = split_lines(text)
+  local lines = { "" }
+  for i, part in ipairs(parts) do
+    lines[#lines + 1] = (i == 1 and "  ▸ " or "    ") .. part
+  end
+  append(lines)
   S.last_kind = "text"
-  local row = last_row()
-  api.nvim_buf_set_extmark(S.buf, ns, row, 0, {
-    end_row = row,
-    end_col = #("  ▸ " .. text),
-    hl_group = "AdvNotice",
-  })
+  local end_row = last_row()
+  local start_row = math.max(0, end_row - #parts + 1)
+  for row = start_row, end_row do
+    local line = api.nvim_buf_get_lines(S.buf, row, row + 1, false)[1] or ""
+    api.nvim_buf_set_extmark(S.buf, ns, row, 0, {
+      end_row = row,
+      end_col = #line,
+      hl_group = "AdvNotice",
+    })
+  end
   autoscroll()
 end
 
@@ -911,6 +971,7 @@ end
 ---Generic informational float (help, previews).
 function M.float(opts)
   local buf = api.nvim_create_buf(false, true)
+  opts.lines = normalize_lines(opts.lines)
   api.nvim_buf_set_lines(buf, 0, -1, false, opts.lines)
   vim.bo[buf].modifiable = false
   vim.bo[buf].bufhidden = "wipe"

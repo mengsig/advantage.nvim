@@ -49,6 +49,27 @@ M.defaults = {
     ---Also toggleable at runtime with `/yolo` or `:Advantage yolo`.
     yolo = false,
     bash_timeout_ms = 120000,
+    ---If true, bash stdout/stderr is streamed into the transcript as it arrives.
+    ---Individual calls may also pass `{ stream = true }`.
+    stream_bash_output = false,
+  },
+
+  context = {
+    ---Automatically compact old conversation history before it grows too large.
+    auto_compact = true,
+    ---Rough token estimate threshold (chars / 4) that triggers compaction.
+    compact_at_tokens = 120000,
+    ---Keep this many newest messages verbatim; older messages become a summary.
+    keep_recent_messages = 16,
+    ---Maximum characters in the generated compaction summary.
+    summary_max_chars = 12000,
+  },
+
+  subagents = {
+    ---Expose the read-only `sub_agent` tool for delegation / fan-out.
+    enabled = true,
+    ---Maximum provider turns a sub-agent may take, including tool loops.
+    max_turns = 6,
   },
 
   keymaps = {
