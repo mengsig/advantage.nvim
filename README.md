@@ -118,8 +118,8 @@ lines are read fresh from disk on send.
 X11 `xclip`, macOS `pngpaste`) and drops a `[image: …]` chip into the text —
 delete the chip to detach. `:Advantage attach shot.png` attaches a file.
 
-**Slash commands** in the prompt: `/usage` · `/compact` · `/review` · `/yolo` ·
-`/effort` · `/new` · `/model` · `/resume` · `/help`.
+**Slash commands** in the prompt: `/usage` · `/compact` · `/context` · `/review` ·
+`/yolo` · `/effort` · `/new` · `/model` · `/resume` · `/help`.
 
 **Review mode.** The agent snapshots every file before its first edit. After a
 turn that changed files you'll see *"n files changed — /review to inspect"*:
@@ -139,9 +139,13 @@ active model before the next turn. OpenAI/Codex models get `minimal`/`low`/`medi
 (`low`=`1k`, `medium`=`4k`, `high`=`8k` thinking budget).
 
 **Usage dashboard.** `/usage` (or `:Advantage usage`, `<leader>cu`) shows
-session/today/7-day token totals, a sparkline, your current pace, a projection
-to midnight, and — if you set `usage.daily_budget` — the time you'll run out
-at the current pace.
+session/today/7-day token totals, cache savings (cached input bills at ~10%, and
+the dashboard shows how much that saved you), a sparkline, your current pace, a
+projection to midnight, and — if you set `usage.daily_budget` — the time you'll
+run out at the current pace. A `harness` line reports what the repo memory
+injects per turn and how many tokens the on-demand skill design saved versus
+inlining every skill body into every request — so the harness's token thesis is
+measured, not asserted.
 
 **Context compaction.** Old transcript history is automatically compacted when
 it crosses `context.compact_at_tokens` (roughly chars/4). The newest messages stay
@@ -150,17 +154,70 @@ summary message. Run `/compact` or `:Advantage compact` to force it manually.
 
 **Sub-agents.** The model has a `sub_agent` tool for read-only fan-out: a worker
 gets its own short loop and can use read/search/list tools, then returns a
-concise report to the parent agent. It cannot edit files.
+concise report to the parent agent. It cannot edit files. When the model fires
+several `sub_agent` calls in one turn they run **concurrently**, overlapping
+their network latency instead of one at a time (`subagents.parallel`).
+
+**Repo memory & skills (self-learning harness).** advantage keeps a lightweight,
+per-repo memory so the agent gets *better and cheaper* at your codebase over time.
+
+- As it works, the agent calls a `remember` tool to save durable, non-obvious
+  facts — architecture invariants, conventions, build/test commands, gotchas, or
+  a preference you state ("always run the linter before committing"). You can also
+  just tell it to remember something. Facts are deduplicated and kept under a token
+  budget so the file never bloats.
+- Memory is rendered into the **cached** system prefix, so after the first turn it
+  costs ~10% — and it *saves* tokens by sparing the model repeated read/grep loops
+  to re-derive what it already learned.
+- **Skills** are reusable named procedures. Only a one-line index (name +
+  description) is always in context; the full steps load on demand when the agent
+  calls `use_skill`, keeping context lean. The agent codifies new ones with
+  `save_skill`. Skills interoperate with `.claude/skills/`.
+- Skills are also **auto-surfaced**: a deterministic keyword match against your
+  prompt appends a one-line hint to the outgoing message when a skill looks
+  relevant ("the deploy-docs skill may apply — load it with use_skill"), at most
+  once per skill per session. The hint rides the message, never the system
+  prompt, so the cached prefix stays byte-identical.
+- Your committed `AGENTS.md` / `CLAUDE.md` is ingested too (parity with the real
+  CLIs), with `@file` imports resolved.
+- Everything is deterministic and offline — no embeddings, no second model
+  validating anything. Files live in `<repo>/.advantage/` (a plain, editable
+  Markdown `context.md` plus `skills/`).
+- The memory file is **bootstrapped on first use**: opening a session in a fresh
+  repo seeds `context.md` with the managed skeleton so it's visible, editable and
+  committable from day one, and an empty memory nudges the model in-prompt to
+  start recording — the flywheel starts on session one, not never.
+- **`/context init`** (the `claude /init` equivalent) has the agent explore the
+  repo — README, manifests, layout, tests, CI — and populate the memory in one
+  pass: verified build/test commands, architecture facts, conventions, gotchas,
+  plus a skill for any 3+-step flow. Run it once in a new repo and session one
+  starts with an analyzed repo map instead of a cold start.
+
+`/context` (or `:Advantage context`) shows the current memory; `/context init`
+teaches the agent the repo in one pass; `/context verify` flags facts whose
+referenced files have since moved or vanished; `/context forget <text>` drops
+matching facts. Turn it off with `memory = { enabled = false }`.
 
 Commands: `:Advantage` (toggle) · `new` · `model` · `resume` · `stop` · `usage` ·
-`compact` · `help` · `review` · `yolo [on|off]` · `effort` · `add` · `files` ·
-`attach {path}` · `ask {prompt}` (works with a visual range: `:'<,'>Advantage ask why is this slow?`).
+`compact` · `context` · `help` · `review` · `yolo [on|off]` · `effort` · `add` ·
+`files` · `attach {path}` · `ask {prompt}` (works with a visual range: `:'<,'>Advantage ask why is this slow?`).
 
 When the model wants to **edit a file or run a command**, a floating card shows
 exactly what will happen — a unified diff for edits, the command for bash —
 and waits for `a` (allow), `A` (always allow this tool this session), `d` (deny),
 or `c` (**deny with a comment**: tell the agent what to do instead; your feedback
 is sent back to the model). Read-only tools never prompt.
+
+**Sandboxing.** All file tools — including the permission-card previews, which
+read the target before you approve anything — are confined to the project root:
+absolute paths and `..` traversal outside it are rejected. Set
+`tools = { allow_outside_root = true }` if you genuinely want the agent reading
+and writing anywhere your user can (bash remains permission-gated either way).
+
+**Planning & batch edits.** For multi-step work the model keeps a live checklist
+with `todo_write` (rendered in the transcript as ✓/▶/· items), and several
+changes to one file arrive as a single atomic `multi_edit` — one diff card, one
+approval; if any edit in the batch fails to match, nothing is written.
 
 ## Configuration (defaults)
 
@@ -185,6 +242,7 @@ require("advantage").setup({
   },
   tools = {
     auto_approve = {},           -- e.g. { bash = true } — at your own risk
+    allow_outside_root = false,  -- file tools confined to the project root
     yolo = false,                -- skip ALL permission prompts (/yolo toggles)
     bash_timeout_ms = 120000,
     stream_bash_output = false,  -- or per-call: bash { stream = true }
@@ -198,6 +256,13 @@ require("advantage").setup({
   subagents = {
     enabled = true,              -- exposes the read-only `sub_agent` tool
     max_turns = 6,
+    parallel = true,             -- run a fan-out batch of sub_agents concurrently
+  },
+  memory = {                     -- per-repo self-learning harness (remember/use_skill)
+    enabled = true,
+    budget_tokens = 1200,        -- cap on the learned-facts block; oldest evicted past it
+    project_budget_tokens = 2000,-- cap on ingested AGENTS.md / CLAUDE.md
+    dedupe_threshold = 0.8,      -- word-overlap ratio above which a fact is a duplicate
   },
   keymaps = {                    -- set to "" to disable any of these
     toggle = "<leader>cc",
@@ -226,7 +291,11 @@ require("advantage").setup({
 - Sessions are stored under `stdpath("data")/advantage/sessions`, scoped per
   project directory.
 - Anthropic requests use adaptive thinking with summarized reasoning — the
-  model's thought process streams into the transcript, dimmed.
+  model's thought process streams into the transcript, dimmed. The
+  interleaved-thinking beta is sent (like the real CLI) so reasoning persists
+  across tool calls within a turn; disable with
+  `providers = { anthropic = { interleaved_thinking = false } }` if your account
+  rejects it.
 - Codex subscription access goes through the same backend the codex CLI uses
   and should be considered experimental; the API-key path is stable.
 - Request bodies and credentials are passed to curl via files/stdin, never
@@ -240,6 +309,6 @@ nvim -l tests/smoke.lua   # parser, providers, tools, and a full fake-provider t
 
 ## Roadmap
 
-- parallel tool execution (including parallel sub-agent fan-out)
-- provider-native prompt-cache breakpoints for long sessions
 - richer compaction (model-written summaries / checkpoint restore)
+- relevance-filtered memory injection (per-turn fact subsetting by touched paths)
+- symlink-aware containment (realpath verification for repos that need it)

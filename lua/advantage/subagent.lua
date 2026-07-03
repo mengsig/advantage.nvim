@@ -13,7 +13,7 @@ local config = require("advantage.config")
 local function readonly_tools()
   local out = {}
   for _, def in ipairs(tools.list) do
-    if def.safe and def.name ~= "sub_agent" then
+    if def.safe and def.name ~= "sub_agent" and not def.memory and not def.parent_only then
       out[#out + 1] = {
         name = def.name,
         description = def.description,
@@ -140,10 +140,10 @@ function M.run(input, ctx, cb)
         thinking = function() end,
         tool_start = function() end,
         auth = function() end,
-        usage = function(i, o)
+        usage = function(i, o, cached)
           usage.input = usage.input + (i or 0)
           usage.output = usage.output + (o or 0)
-          require("advantage.usage").record(model, i or 0, o or 0)
+          require("advantage.usage").record(model, i or 0, o or 0, cached)
         end,
         complete = function(blocks, stop_reason)
           job = nil

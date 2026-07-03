@@ -523,6 +523,58 @@ function M.compact()
   end
 end
 
+---View / manage the per-repo learned memory (also `/context`).
+---`context` shows it; `context verify` flags facts whose paths vanished;
+---`context forget <text>` drops matching facts.
+function M.context(arg)
+  ensure_init()
+  local memory = require("advantage.memory")
+  local args = vim.split(vim.trim(tostring(arg or "")), "%s+", { trimempty = true })
+  local action = args[1] or "show"
+
+  if action == "init" then
+    -- claude /init parity: one agent pass that explores the repo and fills
+    -- the memory via remember/save_skill, instead of waiting for organic learning
+    if not memory.enabled() then
+      ui.notify("memory is disabled (config.memory.enabled = false)", vim.log.levels.WARN)
+      return
+    end
+    memory.bootstrap()
+    M.ask(memory.init_prompt())
+  elseif action == "verify" then
+    local stale = memory.verify()
+    if #stale == 0 then
+      ui.notify("repo memory: every referenced path still resolves ✓")
+      return
+    end
+    local lines = { "# stale facts — referenced paths no longer exist", "" }
+    for _, s in ipairs(stale) do
+      lines[#lines + 1] = ("- [%s] %s"):format(s.section, s.bullet)
+      lines[#lines + 1] = ("    ↳ missing: %s"):format(s.missing)
+    end
+    ui.float({ title = "advantage · memory verify", lines = lines, filetype = "markdown", footer = "q close" })
+  elseif action == "forget" then
+    local pattern = table.concat(vim.list_slice(args, 2), " ")
+    if pattern == "" then
+      ui.notify("usage: /context forget <text to match>", vim.log.levels.WARN)
+      return
+    end
+    local n = memory.forget(pattern)
+    ui.notify(n > 0 and ("forgot %d fact%s matching %q"):format(n, n == 1 and "" or "s", pattern)
+      or ("no facts matched %q"):format(pattern))
+  else
+    local block = memory.render()
+    local lines = (block ~= "" and vim.split(block, "\n", { plain = true }))
+      or { "Repo memory is empty.", "", "Run /context init to have the agent learn this repo now,", "or let it fill in as you work. Stored under " .. memory.root() .. "/.advantage/" }
+    ui.float({
+      title = "advantage · memory",
+      lines = lines,
+      filetype = "markdown",
+      footer = "q close · /context init · /context verify · /context forget <text>",
+    })
+  end
+end
+
 ---Show the keybind and command cheatsheet.
 function M.help()
   ensure_init()
@@ -548,6 +600,8 @@ function M._command(opts)
     M.usage()
   elseif sub == "compact" then
     M.compact()
+  elseif sub == "context" or sub == "memory" then
+    M.context(table.concat(vim.list_slice(args, 2), " "))
   elseif sub == "help" or sub == "keys" then
     M.help()
   elseif sub == "review" or sub == "diff" then
@@ -615,7 +669,7 @@ function M._command(opts)
   end
 end
 
-M._subcommands = { "toggle", "new", "model", "resume", "stop", "usage", "compact", "help", "review", "yolo", "effort", "add", "files", "attach", "ask" }
+M._subcommands = { "toggle", "new", "model", "resume", "stop", "usage", "compact", "context", "help", "review", "yolo", "effort", "add", "files", "attach", "ask" }
 M._effort_modes = { "minimal", "low", "medium", "high", "adaptive", "off", "1k", "4k", "8k" }
 
 function M._complete(arglead, cmdline)
@@ -627,6 +681,8 @@ function M._complete(arglead, cmdline)
       pool = M._effort_modes
     elseif args[1] == "yolo" then
       pool = { "on", "off" }
+    elseif args[1] == "context" or args[1] == "memory" then
+      pool = { "init", "verify", "forget" }
     else
       pool = {}
     end

@@ -90,22 +90,35 @@ local function trim_one_line(s, max)
   return s
 end
 
-local function summarize_messages(messages, max_chars)
+---@param carry? string a prior summary to preserve verbatim at the head, so that
+---  compacting an already-compacted session never shaves the oldest history down
+---  to a single 900-char line (that regression silently discarded early context).
+local function summarize_messages(messages, max_chars, carry)
   max_chars = max_chars or 12000
-  local lines = {
-    SUMMARY_PREFIX,
-    "The following is a compressed record of earlier conversation history. Treat it as prior context; newer messages after this summary are verbatim.",
-    "",
-  }
+  local lines
+  if carry and carry ~= "" then
+    -- carry already opens with SUMMARY_PREFIX; keep it whole and append the
+    -- newly-aged-out messages after it.
+    lines = { carry, "", "[earlier history summarized above; more recent — but still old — messages follow]", "" }
+  else
+    lines = {
+      SUMMARY_PREFIX,
+      "The following is a compressed record of earlier conversation history. Treat it as prior context; newer messages after this summary are verbatim.",
+      "",
+    }
+  end
+  -- Give newly-compacted messages their own budget on top of a preserved carry,
+  -- but hold the whole summary under a hard ceiling so repeated compaction is bounded.
+  local ceiling = math.min((carry and carry ~= "") and (#carry + max_chars) or max_chars, 4 * max_chars)
   local total = #table.concat(lines, "\n")
   local function add(line)
-    if total >= max_chars then return false end
-    if total + #line + 1 > max_chars then
-      line = utf8_safe_sub(line, math.max(0, max_chars - total - 2)) .. "…"
+    if total >= ceiling then return false end
+    if total + #line + 1 > ceiling then
+      line = utf8_safe_sub(line, math.max(0, ceiling - total - 2)) .. "…"
     end
     lines[#lines + 1] = line
     total = total + #line + 1
-    return total < max_chars
+    return total < ceiling
   end
 
   for i, msg in ipairs(messages) do
@@ -119,7 +132,7 @@ local function summarize_messages(messages, max_chars)
     end
     if not add(prefix .. table.concat(parts, " | ")) then break end
   end
-  if total >= max_chars then
+  if total >= ceiling then
     lines[#lines + 1] = "[summary truncated]"
   end
   return table.concat(lines, "\n")
@@ -225,13 +238,15 @@ function M.compact(messages, opts)
   local older = vim.deepcopy(vim.list_slice(messages, 1, cut))
   local recent = strip_replay_only_blocks(vim.list_slice(messages, cut + 1, #messages))
 
-  -- If we are compacting an already-compacted session, fold the previous summary
-  -- into the new one rather than keeping nested summary messages around.
+  -- If we are compacting an already-compacted session, carry the previous summary
+  -- forward verbatim rather than re-summarizing (and truncating) it or nesting it.
+  local carry = nil
   if is_summary_message(older[1]) then
-    older[1].content[1].text = older[1].content[1].text .. "\n\n[additional older messages followed before this compaction]"
+    carry = older[1].content[1].text
+    table.remove(older, 1)
   end
 
-  local summary = summarize_messages(older, opts.summary_max_chars or 12000)
+  local summary = summarize_messages(older, opts.summary_max_chars or 12000, carry)
   local summary_block = { type = "text", text = summary }
   local compacted
   -- The summary is emitted as a `user` message. Providers such as Anthropic

@@ -9,13 +9,37 @@ local MAX_OUTPUT = 30000
 local MAX_LINES = 1500
 local MAX_LINE_LEN = 500
 
+---Resolve a tool path against the project root and enforce containment: file
+---tools (including their permission-card previews, which read the target before
+---approval) must not reach outside ctx.cwd via absolute paths or `..` traversal.
+---`tools.allow_outside_root = true` opts out. Lexical containment: a symlink
+---already inside the repo can still point out, but planting one requires write
+---access the attacker wouldn't need this hole for.
+---@return string|nil abs_path, string|nil err
 local function resolve(path, ctx)
-  if not path or path == "" then return nil end
+  if not path or path == "" then return nil, "empty path" end
   path = vim.fs.normalize(path)
   if path:sub(1, 1) ~= "/" then
     path = vim.fs.normalize(ctx.cwd .. "/" .. path)
   end
-  return path
+  -- fold "." and ".." lexically (vim.fs.normalize does not resolve "..")
+  local parts = {}
+  for comp in path:gmatch("[^/]+") do
+    if comp == ".." then
+      if #parts == 0 then return nil, "path escapes the filesystem root" end
+      parts[#parts] = nil
+    elseif comp ~= "." then
+      parts[#parts + 1] = comp
+    end
+  end
+  local abs = "/" .. table.concat(parts, "/")
+  local tcfg = require("advantage.config").options.tools or {}
+  if tcfg.allow_outside_root then return abs end
+  local root = vim.fs.normalize(ctx.cwd)
+  if abs ~= root and abs:sub(1, #root + 1) ~= root .. "/" then
+    return nil, "outside the project root (set tools.allow_outside_root to permit external paths)"
+  end
+  return abs
 end
 
 local function read_all(path)
@@ -115,8 +139,11 @@ tool({
   },
   summary = function(input) return input.path or "" end,
   run = function(input, ctx, cb)
-    local path = resolve(input.path, ctx)
-    local content = path and read_all(path)
+    local path, perr = resolve(input.path, ctx)
+    if not path then
+      return cb(("Cannot read %s: %s"):format(tostring(input.path), perr), true)
+    end
+    local content = read_all(path)
     if not content then
       return cb("File not found: " .. tostring(input.path), true)
     end
@@ -156,8 +183,11 @@ tool({
   },
   summary = function(input) return input.path or "" end,
   preview = function(input, ctx)
-    local path = resolve(input.path, ctx)
-    local old = path and read_all(path)
+    local path, perr = resolve(input.path, ctx)
+    if not path then
+      return { title = "write · " .. tostring(input.path), lines = { "⛔ blocked: " .. perr }, filetype = "" }
+    end
+    local old = read_all(path)
     if old then
       return { title = "write · " .. input.path, lines = unified_diff(old, input.content, input.path), filetype = "diff" }
     end
@@ -166,8 +196,8 @@ tool({
     return { title = "write · " .. input.path, lines = lines, filetype = vim.filetype.match({ filename = input.path }) or "" }
   end,
   run = function(input, ctx, cb)
-    local path = resolve(input.path, ctx)
-    if not path then return cb("Invalid path", true) end
+    local path, perr = resolve(input.path, ctx)
+    if not path then return cb(("Cannot write %s: %s"):format(tostring(input.path), perr), true) end
     local ok, err = write_all(path, input.content)
     if not ok then return cb("Write failed: " .. tostring(err), true) end
     refresh_buffers(path)
@@ -197,8 +227,11 @@ tool({
     if not input.old_string or input.old_string == "" then
       return { title = "edit · " .. tostring(input.path), lines = { "invalid edit: empty old_string" }, filetype = "" }
     end
-    local path = resolve(input.path, ctx)
-    local old = path and read_all(path)
+    local path, perr = resolve(input.path, ctx)
+    if not path then
+      return { title = "edit · " .. tostring(input.path), lines = { "⛔ blocked: " .. perr }, filetype = "" }
+    end
+    local old = read_all(path)
     if not old then
       return { title = "edit · " .. tostring(input.path), lines = { "file not found" }, filetype = "" }
     end
@@ -209,8 +242,11 @@ tool({
     if not input.old_string or input.old_string == "" then
       return cb("old_string must be a non-empty exact match. Use write_file to create or fully rewrite a file.", true)
     end
-    local path = resolve(input.path, ctx)
-    local content = path and read_all(path)
+    local path, perr = resolve(input.path, ctx)
+    if not path then
+      return cb(("Cannot edit %s: %s"):format(tostring(input.path), perr), true)
+    end
+    local content = read_all(path)
     if not content then
       return cb("File not found: " .. tostring(input.path), true)
     end
@@ -226,6 +262,100 @@ tool({
     if not ok then return cb("Write failed: " .. tostring(err), true) end
     refresh_buffers(path)
     cb(("Applied %d replacement%s in %s"):format(count, count == 1 and "" or "s", input.path), false)
+  end,
+})
+
+-- multi_edit ------------------------------------------------------------
+
+---Apply one exact-string edit with edit_file's uniqueness rules.
+---@return string|nil new_content, string|nil err
+local function apply_edit(content, e)
+  if not e.old_string or e.old_string == "" then
+    return nil, "empty old_string"
+  end
+  local n = count_plain(content, e.old_string)
+  if n == 0 then
+    return nil, "old_string not found"
+  end
+  if n > 1 and not e.replace_all then
+    return nil, ("old_string appears %d times; add surrounding context or set replace_all"):format(n)
+  end
+  return (replace_plain(content, e.old_string, e.new_string or "", e.replace_all))
+end
+
+tool({
+  name = "multi_edit",
+  safe = false,
+  description = "Apply several exact string replacements to one file in a single atomic operation. Edits apply in order, each to the result of the previous; if any edit fails to match, nothing is written. Prefer this over repeated edit_file calls on the same file.",
+  input_schema = {
+    type = "object",
+    properties = {
+      path = { type = "string", description = "File path, relative to the project root" },
+      edits = {
+        type = "array",
+        description = "Edits applied in order",
+        items = {
+          type = "object",
+          properties = {
+            old_string = { type = "string", description = "Exact text to replace" },
+            new_string = { type = "string", description = "Replacement text" },
+            replace_all = { type = "boolean", description = "Replace every occurrence (default false)" },
+          },
+          required = { "old_string", "new_string" },
+        },
+      },
+    },
+    required = { "path", "edits" },
+  },
+  summary = function(input)
+    local n = type(input.edits) == "table" and #input.edits or 0
+    return ("%s (%d edit%s)"):format(input.path or "", n, n == 1 and "" or "s")
+  end,
+  preview = function(input, ctx)
+    local title = "multi-edit · " .. tostring(input.path)
+    local path, perr = resolve(input.path, ctx)
+    if not path then
+      return { title = title, lines = { "⛔ blocked: " .. perr }, filetype = "" }
+    end
+    local old = read_all(path)
+    if not old then
+      return { title = title, lines = { "file not found" }, filetype = "" }
+    end
+    local new = old
+    for i, e in ipairs(type(input.edits) == "table" and input.edits or {}) do
+      local applied, aerr = apply_edit(new, e)
+      if not applied then
+        return { title = title, lines = { ("edit %d failed: %s — nothing will be written"):format(i, aerr) }, filetype = "" }
+      end
+      new = applied
+    end
+    return { title = title, lines = unified_diff(old, new, input.path), filetype = "diff" }
+  end,
+  run = function(input, ctx, cb)
+    local path, perr = resolve(input.path, ctx)
+    if not path then
+      return cb(("Cannot edit %s: %s"):format(tostring(input.path), perr), true)
+    end
+    local content = read_all(path)
+    if not content then
+      return cb("File not found: " .. tostring(input.path), true)
+    end
+    local edits = input.edits
+    if type(edits) ~= "table" or #edits == 0 then
+      return cb("edits must be a non-empty array of {old_string, new_string}", true)
+    end
+    local new_content = content
+    for i, e in ipairs(edits) do
+      local applied, aerr = apply_edit(new_content, e)
+      if not applied then
+        return cb(("Edit %d/%d failed: %s. No changes were written."):format(i, #edits, aerr), true)
+      end
+      new_content = applied
+    end
+    local ok, err = write_all(path, new_content)
+    if not ok then return cb("Write failed: " .. tostring(err), true) end
+    refresh_buffers(path)
+    cb(("Applied %d edit%s to %s"):format(#edits, #edits == 1 and "" or "s", input.path), false)
   end,
 })
 
@@ -345,15 +475,23 @@ tool({
   },
   summary = function(input) return input.pattern or "" end,
   run = function(input, ctx, cb)
+    local search_path = "."
+    if input.path and input.path ~= "" and input.path ~= "." then
+      local p, perr = resolve(input.path, ctx)
+      if not p then
+        return cb(("Cannot search %s: %s"):format(tostring(input.path), perr), true)
+      end
+      search_path = p
+    end
     local cmd
     if vim.fn.executable("rg") == 1 then
       cmd = { "rg", "--line-number", "--no-heading", "--color=never", "--max-count=100", "-e", input.pattern }
       if input.glob then
         vim.list_extend(cmd, { "--glob", input.glob })
       end
-      cmd[#cmd + 1] = input.path or "."
+      cmd[#cmd + 1] = search_path
     else
-      cmd = { "grep", "-rn", "-E", input.pattern, input.path or "." }
+      cmd = { "grep", "-rn", "-E", input.pattern, search_path }
     end
     vim.system(cmd, { cwd = ctx.cwd, text = true }, function(res)
       vim.schedule(function()
@@ -430,8 +568,11 @@ tool({
   },
   summary = function(input) return input.path or "." end,
   run = function(input, ctx, cb)
-    local path = resolve((input.path and input.path ~= "") and input.path or ".", ctx)
-    local handle = path and uv.fs_scandir(path)
+    local path, perr = resolve((input.path and input.path ~= "") and input.path or ".", ctx)
+    if not path then
+      return cb(("Cannot list %s: %s"):format(tostring(input.path), perr), true)
+    end
+    local handle = uv.fs_scandir(path)
     if not handle then
       return cb("Not a directory: " .. tostring(input.path), true)
     end
@@ -477,6 +618,153 @@ tool({
   end,
 })
 
+-- todo_write (plan tool) --------------------------------------------------
+
+local TODO_MARKS = { pending = "·", in_progress = "▶", completed = "✓" }
+
+tool({
+  name = "todo_write",
+  safe = true,
+  parent_only = true, -- a read-only sub-agent has no business keeping the plan
+  description = "Maintain your task list for multi-step work. Replaces the whole list each call: plan the steps before starting, then keep statuses current as you work (exactly one item in_progress at a time). Skip it for trivial single-step tasks.",
+  input_schema = {
+    type = "object",
+    properties = {
+      items = {
+        type = "array",
+        description = "The full task list, in order",
+        items = {
+          type = "object",
+          properties = {
+            content = { type = "string", description = "Short imperative description of the step" },
+            status = { type = "string", enum = { "pending", "in_progress", "completed" } },
+          },
+          required = { "content", "status" },
+        },
+      },
+    },
+    required = { "items" },
+  },
+  summary = function(input)
+    local items = type(input.items) == "table" and input.items or {}
+    local done = 0
+    for _, it in ipairs(items) do
+      if it.status == "completed" then done = done + 1 end
+    end
+    return ("%d/%d done"):format(done, #items)
+  end,
+  run = function(input, ctx, cb)
+    local items = input.items
+    if type(items) ~= "table" or #items == 0 then
+      return cb("items must be a non-empty array of {content, status}", true)
+    end
+    ctx.todos = items
+    local lines, done = {}, 0
+    for _, it in ipairs(items) do
+      if it.status == "completed" then done = done + 1 end
+      lines[#lines + 1] = ("  %s %s"):format(TODO_MARKS[it.status] or "·", tostring(it.content or ""))
+    end
+    table.insert(lines, 1, ("todo %d/%d"):format(done, #items))
+    -- show the checklist in the transcript; headless callers just get the cb
+    pcall(function() require("advantage.ui.chat").notice(table.concat(lines, "\n")) end)
+    cb(("Todo list updated — %d/%d done."):format(done, #items), false)
+  end,
+})
+
+-- memory / skills (the self-learning harness) ---------------------------
+
+tool({
+  name = "remember",
+  safe = true,
+  memory = true,
+  description = "Save a durable, repo-specific fact to persistent memory so future sessions start already knowing it. Use for an architecture invariant, a convention, a build/test/lint command, a gotcha, or a preference the user states — one crisp, self-contained fact per call. Do NOT save trivia, transient state, or anything a quick file read re-derives.",
+  input_schema = {
+    type = "object",
+    properties = {
+      fact = { type = "string", description = "The single fact to remember, phrased concisely and self-contained." },
+      section = {
+        type = "string",
+        description = "Where it belongs.",
+        enum = { "Conventions", "Architecture", "Commands", "Gotchas", "Preferences", "Notes" },
+      },
+    },
+    required = { "fact" },
+  },
+  summary = function(input)
+    local f = (input.fact or ""):gsub("%s+", " ")
+    return #f > 60 and (f:sub(1, 57) .. "…") or f
+  end,
+  run = function(input, ctx, cb)
+    local memory = require("advantage.memory")
+    if not memory.enabled() then
+      return cb("Memory is disabled (config.memory.enabled = false).", true)
+    end
+    local res = memory.remember(input.fact, input.section)
+    if res.status == "empty" then
+      return cb("Nothing to remember (empty fact).", true)
+    elseif res.status == "duplicate" then
+      return cb("Already known — a near-identical fact is in memory; not duplicated.", false)
+    elseif res.status == "updated" then
+      return cb(("Updated the existing fact under %s."):format(res.section), false)
+    end
+    local extra = (res.evicted and res.evicted > 0)
+      and (" (evicted %d oldest fact%s to stay within budget)"):format(res.evicted, res.evicted == 1 and "" or "s") or ""
+    cb(("Remembered under %s%s. It is now in your repo memory automatically."):format(res.section, extra), false)
+  end,
+})
+
+tool({
+  name = "use_skill",
+  safe = true,
+  memory = true,
+  description = "Load the full steps of a named skill (a reusable procedure for this repo). Skill names and descriptions are listed in your context under 'Skills'; call this when a skill's description matches the task, before doing that task.",
+  input_schema = {
+    type = "object",
+    properties = {
+      name = { type = "string", description = "The skill name, exactly as listed in the skills index." },
+    },
+    required = { "name" },
+  },
+  summary = function(input) return input.name or "" end,
+  run = function(input, ctx, cb)
+    local memory = require("advantage.memory")
+    local body, desc = memory.use_skill(input.name)
+    if not body then
+      local names = {}
+      for _, s in ipairs(memory.skills_index()) do names[#names + 1] = s.name end
+      return cb(("No skill named %q. Available: %s"):format(
+        tostring(input.name), #names > 0 and table.concat(names, ", ") or "(none)"), true)
+    end
+    cb(("Skill: %s — %s\n\n%s"):format(input.name, desc or "", body), false)
+  end,
+})
+
+tool({
+  name = "save_skill",
+  safe = true,
+  memory = true,
+  description = "Create or update a reusable skill: a named, multi-step procedure for this repo (e.g. how to run the test suite, cut a release, add a provider). Worthwhile only for genuinely reusable procedures of ~3+ steps, not one-offs.",
+  input_schema = {
+    type = "object",
+    properties = {
+      name = { type = "string", description = "Short kebab-case skill name." },
+      description = { type = "string", description = "One line describing when to use this skill (its trigger)." },
+      body = { type = "string", description = "The procedure/steps, in Markdown." },
+    },
+    required = { "name", "description", "body" },
+  },
+  summary = function(input) return input.name or "" end,
+  run = function(input, ctx, cb)
+    local memory = require("advantage.memory")
+    if not memory.enabled() then
+      return cb("Memory is disabled (config.memory.enabled = false).", true)
+    end
+    local ok, err = memory.save_skill(input.name, input.description, input.body)
+    if not ok then return cb("Could not save skill: " .. tostring(err), true) end
+    cb(("Saved skill %q. It is now in the skills index; load its steps with use_skill."):format(input.name), false)
+  end,
+})
+
 -- registry --------------------------------------------------------------
 
 local by_name = {}
@@ -493,13 +781,17 @@ M.resolve = resolve
 
 ---Tool schemas in Anthropic format (providers convert as needed).
 function M.schemas()
+  local memory_on = require("advantage.config").options.memory
+  memory_on = not memory_on or memory_on.enabled ~= false
   local out = {}
   for _, def in ipairs(M.list) do
-    out[#out + 1] = {
-      name = def.name,
-      description = def.description,
-      input_schema = def.input_schema,
-    }
+    if not (def.memory and not memory_on) then
+      out[#out + 1] = {
+        name = def.name,
+        description = def.description,
+        input_schema = def.input_schema,
+      }
+    end
   end
   return out
 end

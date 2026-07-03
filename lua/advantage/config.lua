@@ -22,6 +22,10 @@ M.defaults = {
       base_url = "https://api.anthropic.com",
       version = "2023-06-01",
       max_tokens = 32000,
+      ---Send the interleaved-thinking beta (like the real CLI) so thinking
+      ---persists across tool calls within a turn. Disable if your account
+      ---rejects the beta.
+      interleaved_thinking = true,
     },
     openai = {
       api_key_env = "OPENAI_API_KEY",
@@ -45,6 +49,10 @@ M.defaults = {
     ---Tools that never prompt: read_file/list_dir/grep/find_files are always safe.
     ---Add e.g. `bash = true` at your own risk.
     auto_approve = {},
+    ---File tools (and their permission previews) are confined to the project
+    ---root: absolute paths and `..` traversal outside it are rejected. Set true
+    ---to allow reading/writing anywhere the user can (bash is always gated).
+    allow_outside_root = false,
     ---Skip ALL permission prompts (a.k.a. --dangerously-skip-permissions).
     ---Also toggleable at runtime with `/yolo` or `:Advantage yolo`.
     yolo = false,
@@ -70,6 +78,25 @@ M.defaults = {
     enabled = true,
     ---Maximum provider turns a sub-agent may take, including tool loops.
     max_turns = 6,
+    ---Run a fan-out batch of `sub_agent` calls concurrently (overlapping their
+    ---network latency) instead of one-at-a-time. Only pure read-only sub_agent
+    ---batches are parallelised; mutating/permissioned tools always run in order.
+    parallel = true,
+  },
+
+  ---Per-repo self-learning harness: the agent records durable facts about a repo
+  ---as it works (rendered into the cached system prefix, so ~free after turn one),
+  ---and stores reusable named "skills" whose bodies load on demand. Deterministic
+  ---and offline — no embeddings, no validator model. Files live under `<root>/.advantage/`.
+  memory = {
+    enabled = true,
+    ---Rough token cap for the learned-facts block (chars/4). Oldest facts are
+    ---evicted past this so the block can never bloat context.
+    budget_tokens = 1200,
+    ---Token cap for ingested project memory (AGENTS.md / CLAUDE.md).
+    project_budget_tokens = 2000,
+    ---Word-overlap ratio above which a new fact counts as a duplicate.
+    dedupe_threshold = 0.8,
   },
 
   keymaps = {

@@ -12,14 +12,17 @@ local function ledger_path()
   return dir .. "/usage.jsonl"
 end
 
----Append one usage record. Called once per API response.
-function M.record(model, input, output)
+---Append one usage record. Called once per API response. `cached` is the portion
+---of `input` served from the prompt cache (billed at ~10%), tracked so the
+---dashboard can show real cost instead of full-price input.
+function M.record(model, input, output, cached)
   if (input or 0) == 0 and (output or 0) == 0 then return end
   local rec = {
     t = os.time(),
     m = (model and (model.provider .. "/" .. model.id)) or "?",
     i = input or 0,
     o = output or 0,
+    c = (cached or 0) > 0 and cached or nil,
   }
   local ok, line = pcall(vim.json.encode, rec)
   if not ok then return end
@@ -75,7 +78,7 @@ function M.stats(now)
   local today_start = midnight(0)
 
   local st = {
-    today = { input = 0, output = 0, total = 0, requests = 0 },
+    today = { input = 0, output = 0, total = 0, requests = 0, cached = 0 },
     last_hour = 0,
     days = {}, -- 7 entries, oldest first
     by_model = {}, -- today, model -> total
@@ -96,6 +99,7 @@ function M.stats(now)
       st.today.output = st.today.output + (r.o or 0)
       st.today.total = st.today.total + total
       st.today.requests = st.today.requests + 1
+      st.today.cached = st.today.cached + (r.c or 0)
       st.by_model[r.m or "?"] = (st.by_model[r.m or "?"] or 0) + total
       st.first_today = math.min(st.first_today or r.t, r.t)
     end
@@ -142,6 +146,12 @@ function M.dashboard_lines(session_usage)
   add("today", ("↑%s ↓%s · %s total · %d request%s"):format(
     fmt(st.today.input), fmt(st.today.output), fmt(st.today.total),
     st.today.requests, st.today.requests == 1 and "" or "s"))
+  if (st.today.cached or 0) > 0 then
+    -- cache reads bill at ~10%, so ~90% of cached input tokens are money saved
+    local saved = math.floor(st.today.cached * 0.9)
+    local pct = st.today.input > 0 and math.floor(st.today.cached / st.today.input * 100 + 0.5) or 0
+    add("cached", ("%s of input (%d%%) · ~%s saved"):format(fmt(st.today.cached), pct, fmt(saved)))
+  end
   add("last hour", fmt(st.last_hour) .. " tokens")
   add("pace", fmt(st.pace) .. "/h")
   add("7 days", ("%s  %s total · avg %s/day"):format(sparkline(st.days), fmt(st.week_total), fmt(st.week_avg)))
@@ -153,6 +163,25 @@ function M.dashboard_lines(session_usage)
   table.sort(models, function(a, b) return a[2] > b[2] end)
   for i, m in ipairs(models) do
     add(i == 1 and "by model" or "", ("%s  %s"):format(fmt(m[2]), m[1]))
+  end
+
+  -- Harness instrumentation: what the repo memory injects per turn (cached),
+  -- and what the index-only skill design avoided versus inlining every body.
+  local mok, memory = pcall(require, "advantage.memory")
+  if mok and memory.enabled() then
+    local ok_hs, hs = pcall(memory.stats)
+    if ok_hs and (hs.block_tokens > 0 or hs.skills > 0) then
+      lines[#lines + 1] = ""
+      add("harness", ("repo memory ~%s tok/turn, rides the cached prefix"):format(fmt(hs.block_tokens)))
+      if hs.skills > 0 then
+        local turns = (session_usage and session_usage.turns) or 0
+        local saved = turns > 0 and math.max(0, turns * hs.bodies_tokens - hs.loaded_tokens) or 0
+        add("", ("%d skill%s indexed · %d load%s on demand%s"):format(
+          hs.skills, hs.skills == 1 and "" or "s",
+          hs.loads, hs.loads == 1 and "" or "s",
+          saved > 0 and (" · ~%s tok saved vs inlining bodies"):format(fmt(saved)) or ""))
+      end
+    end
   end
 
   lines[#lines + 1] = ""

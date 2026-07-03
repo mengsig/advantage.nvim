@@ -11,29 +11,71 @@ local uv = vim.uv or vim.loop
 local Agent = {}
 Agent.__index = Agent
 
+local function git_branch(cwd)
+  local head = io.open(cwd .. "/.git/HEAD", "r")
+  if not head then return nil end
+  local ref = head:read("*l") or ""
+  head:close()
+  return ref:match("ref: refs/heads/(.+)$") or ref:sub(1, 8)
+end
+
 local function default_system_prompt()
   local cwd = uv.cwd()
+  local branch = git_branch(cwd)
   local lines = {
     "You are advantage, an expert coding agent running inside Neovim, working directly in the user's project.",
     "",
-    "Project root: " .. cwd,
-    "Platform: " .. (uv.os_uname().sysname or "unknown"),
-    "",
-    "Rules:",
-    "- Use the tools to read, search, edit and run things. Paths are relative to the project root.",
-    "- Read before you edit. Prefer edit_file for surgical changes; write_file only for new or fully rewritten files.",
-    "- After a code change, verify it when a cheap check exists (build, test, syntax check).",
-    "- Be direct and concise. Lead with what you did or found; skip filler and restating the request.",
-    "- If a task is ambiguous, state your assumption and proceed rather than stalling.",
+    "Environment:",
+    "- Project root: " .. cwd,
+    "- Platform: " .. (uv.os_uname().sysname or "unknown"),
   }
+  if branch then lines[#lines + 1] = "- Git branch: " .. branch end
+  vim.list_extend(lines, {
+    "",
+    "How to work:",
+    "- Use the tools to read, search, edit and run things. Paths are relative to the project root.",
+    "- Gather context before acting: read the files and search the code rather than guessing. Batch independent reads/searches in one step, and delegate wide fan-out investigations to the read-only `sub_agent` tool.",
+    "- Read a file before editing it. Prefer edit_file for surgical changes; write_file only for new or fully rewritten files.",
+    "- Match the surrounding code's style, naming and conventions. Don't add comments that just restate the code.",
+    "- After a code change, verify it when a cheap check exists (build, test, lint, syntax check), and fix what you broke.",
+    "- For multi-step work, keep a plan with the todo_write tool and update statuses as you go; several changes to one file go in a single multi_edit call.",
+    "- Stay within the project: file tools are confined to the project root. Ask before anything destructive or irreversible.",
+    "",
+    "Style: be direct and concise. Lead with what you did or found; skip filler and restating the request. If a task is ambiguous, state your assumption and proceed rather than stalling.",
+  })
   return table.concat(lines, "\n")
 end
+
+---Instructions for the memory tools. Only injected while memory is enabled —
+---teaching the model to call `remember`/`use_skill` when those tools are absent
+---from the schema would just produce "Unknown tool" errors.
+local MEMORY_GUIDE = table.concat({
+  "Persistent repo memory (this is your edge — it makes you faster and cheaper over time):",
+  "- Repo memory and skills are injected below. Treat repo memory as trusted prior knowledge about THIS codebase; prefer it over re-deriving the same facts.",
+  "- When you learn a durable, non-obvious fact future sessions would want — an architecture invariant, a convention, a build/test command, a gotcha, or a preference the user states — call `remember` to save it (one crisp fact, right section). Don't record trivia or anything a quick file read re-derives.",
+  "- A skill is a reusable procedure. When a listed skill's description matches the task, call `use_skill` to load its full steps before doing that task. Codify a genuinely reusable multi-step procedure with `save_skill`.",
+}, "\n")
 
 function M.system_prompt()
   local cfg = config.options.system_prompt
   local base = default_system_prompt()
-  if type(cfg) == "string" then return cfg end
-  if type(cfg) == "function" then return cfg(base) end
+  if type(cfg) == "string" then
+    base = cfg
+  elseif type(cfg) == "function" then
+    base = cfg(base)
+  end
+  -- Append the memory-tool instructions plus the per-repo learned context and
+  -- skills index. It rides the cached system prefix, so after the first turn it
+  -- costs ~10%, and it saves tokens by sparing the model repeated read/grep
+  -- loops to re-derive known facts. Skipped entirely when memory is disabled.
+  local ok, memory = pcall(require, "advantage.memory")
+  if ok and memory.enabled() then
+    base = base .. "\n\n" .. MEMORY_GUIDE
+    local block = memory.render()
+    if block and block ~= "" then
+      base = base .. "\n\n" .. block
+    end
+  end
   return base
 end
 
@@ -59,6 +101,19 @@ function M.new(opts)
   self.active_tools = {} -- tool_use_id -> cancellable handle returned by a running tool
   self.snapshots = {} -- abs path -> content before the agent's first touch (false = new file)
   self.turn_changed = {} -- abs paths changed during the current turn
+  -- fresh conversation: allow skills to be hinted again, restart savings math,
+  -- and seed the on-disk memory file the first time this repo is used
+  pcall(function()
+    local memory = require("advantage.memory")
+    memory.reset_session()
+    if memory.bootstrap() then
+      vim.schedule(function()
+        pcall(require("advantage.ui.chat").notify,
+          "repo memory created (.advantage/context.md) — /context init teaches the agent this repo now",
+          vim.log.levels.INFO)
+      end)
+    end
+  end)
   return self
 end
 
@@ -82,6 +137,22 @@ local function user_content(text, opts, cwd)
   opts = opts or {}
   -- inline @file mentions; the transcript shows the original text
   local send_text = require("advantage.attach").expand_mentions(text, cwd)
+  -- Auto-surface relevant skills: a deterministic keyword match against the
+  -- skill index appends a one-line hint to the outgoing message (never the
+  -- system prompt, so the cached prefix stays byte-identical). Once per skill
+  -- per session; the transcript shows the user's original text.
+  local mok, memory = pcall(require, "advantage.memory")
+  if mok then
+    local hints = memory.skill_hints(text)
+    if #hints > 0 then
+      local lines = { "", "<repo-skill-hint>" }
+      for _, s in ipairs(hints) do
+        lines[#lines + 1] = ("The %q skill may apply here (%s). If relevant, load its steps with use_skill before proceeding."):format(s.name, s.description)
+      end
+      lines[#lines + 1] = "</repo-skill-hint>"
+      send_text = send_text .. table.concat(lines, "\n")
+    end
+  end
   local content = {}
   for _, img in ipairs(opts.images or {}) do
     content[#content + 1] = {
@@ -173,7 +244,7 @@ function Agent:_drain_interrupts_as_user_messages()
   return true
 end
 
-local MUTATING = { write_file = true, edit_file = true }
+local MUTATING = { write_file = true, edit_file = true, multi_edit = true }
 
 ---Remember a file's pre-edit content so `/review` can diff against it.
 function Agent:_snapshot(call)
@@ -220,7 +291,11 @@ end
 
 function Agent:_turn_impl()
   self.ctx.model = self.model
-  self:_maybe_compact(false)
+  -- Compaction is best-effort: a failure here must not abort the user's turn,
+  -- so fall through to streaming with un-compacted history rather than erroring.
+  pcall(function() self:_maybe_compact(false) end)
+  -- provider-request count; /usage uses it for the harness savings math
+  self.usage.turns = (self.usage.turns or 0) + 1
 
   local provider = providers.get(self.model.provider)
   if not provider then
@@ -265,7 +340,7 @@ function Agent:_turn_impl()
         self.turn_usage.output = self.turn_usage.output + out
         self.turn_usage.cached = (self.turn_usage.cached or 0) + cached
         ui.set_usage(self.usage)
-        require("advantage.usage").record(self.model, inp, out)
+        require("advantage.usage").record(self.model, inp, out, cached)
       end,
       complete = function(blocks, stop_reason)
         self.job = nil
@@ -315,10 +390,84 @@ function Agent:_turn_impl()
   })
 end
 
+---Fan-out fast path: a batch of read-only `sub_agent` calls needs no permission
+---prompts and shares no mutable state, so we launch them together and let their
+---network round-trips overlap on the event loop instead of running end-to-end
+---one at a time. Results are collected by position and fed back once all settle.
+function Agent:_run_tools_parallel(calls)
+  local ui = self:ui()
+  local results, pending, finished, launching = {}, #calls, false, true
+
+  local function maybe_finish()
+    if finished or launching or pending > 0 then return end
+    finished = true
+    if self.cancelled then return end
+    local dense = {}
+    for i = 1, #calls do
+      if results[i] then dense[#dense + 1] = results[i] end
+    end
+    table.insert(self.messages, { role = "user", content = dense })
+    self:_turn()
+  end
+
+  for idx, call in ipairs(calls) do
+    local tool = tools.get(call.name)
+    local detail = tool and tool.summary and tool.summary(call.input) or nil
+    ui.tool_update(call.id, { name = call.name, detail = detail, status = "running" })
+    ui.set_status("tool", call.name)
+
+    local function settle(output, is_error)
+      if self.cancelled then return end
+      results[idx] = { type = "tool_result", tool_use_id = call.id, content = output, is_error = is_error or nil }
+      ui.tool_update(call.id, { status = is_error and "error" or "ok" })
+      pending = pending - 1
+      maybe_finish()
+    end
+
+    if not tool then
+      settle("Unknown tool: " .. tostring(call.name), true)
+    else
+      local done = false
+      local ok, handle = pcall(tool.run, call.input, self.ctx, vim.schedule_wrap(function(output, is_error, meta)
+        if self.cancelled then return end
+        if meta and meta.stream then
+          if ui.tool_output then ui.tool_output(call.id, output or "") end
+          return
+        end
+        if done then return end
+        done = true
+        self.active_tools[call.id] = nil
+        settle(output, is_error)
+      end))
+      if ok and type(handle) == "table" and (handle.stop or handle.kill) then
+        self.active_tools[call.id] = handle
+      elseif not ok then
+        done = true
+        self.active_tools[call.id] = nil
+        settle("Tool crashed: " .. tostring(handle), true)
+      end
+    end
+  end
+
+  launching = false
+  maybe_finish()
+end
+
 function Agent:_run_tools(calls)
   self.status = "tools"
   local ui = self:ui()
   local cfg = config.options
+
+  -- Concurrent fan-out only when every call is a read-only sub_agent; any
+  -- mutating or permission-gated tool keeps the whole batch strictly ordered.
+  if cfg.subagents and cfg.subagents.parallel ~= false and #calls > 1 and #self.interrupts == 0 then
+    local all_subagent = true
+    for _, c in ipairs(calls) do
+      if c.name ~= "sub_agent" then all_subagent = false break end
+    end
+    if all_subagent then return self:_run_tools_parallel(calls) end
+  end
+
   local results = {}
 
   local function finish_tools()

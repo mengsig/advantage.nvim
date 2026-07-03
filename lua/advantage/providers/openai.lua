@@ -173,6 +173,7 @@ local function make_handler(on)
 end
 
 M._to_input_items = to_input_items
+M._to_tools = to_tools
 M._make_handler = make_handler
 
 function M.stream(req)

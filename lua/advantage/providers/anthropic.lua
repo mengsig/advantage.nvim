@@ -153,10 +153,11 @@ function M.stream(req)
     -- A cache breakpoint on the last system block caches the whole static
     -- prefix (tools, then system, in Anthropic's cache ordering) so it is read
     -- from cache on every turn instead of re-billed.
+    local betas = {}
     local system
     if cred.mode == "oauth" then
       headers[#headers + 1] = "authorization: Bearer " .. cred.token
-      headers[#headers + 1] = "anthropic-beta: oauth-2025-04-20"
+      betas[#betas + 1] = "oauth-2025-04-20"
       system = {
         { type = "text", text = OAUTH_IDENTITY },
         { type = "text", text = req.system, cache_control = CACHE_CONTROL },
@@ -164,6 +165,14 @@ function M.stream(req)
     else
       headers[#headers + 1] = "x-api-key: " .. cred.key
       system = { { type = "text", text = req.system, cache_control = CACHE_CONTROL } }
+    end
+    -- Parity with the real CLI: keep thinking blocks flowing between tool calls
+    -- so multi-tool turns stay reasoned end-to-end instead of resetting.
+    if req.model.thinking ~= false and pcfg.interleaved_thinking ~= false then
+      betas[#betas + 1] = "interleaved-thinking-2025-05-14"
+    end
+    if #betas > 0 then
+      headers[#headers + 1] = "anthropic-beta: " .. table.concat(betas, ",")
     end
 
     local messages = sanitize_messages(req.messages)

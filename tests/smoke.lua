@@ -5,6 +5,11 @@
 local root = vim.fn.fnamemodify(debug.getinfo(1, "S").source:sub(2), ":h:h")
 vim.opt.rtp:prepend(root)
 
+-- keep the memory harness (bootstrap writes on agent creation) out of the real repo
+local MEMTMP = vim.fn.tempname()
+vim.fn.mkdir(MEMTMP, "p")
+require("advantage.memory")._root_override = MEMTMP
+
 local failed = 0
 local function check(ok, label)
   if ok then
@@ -744,6 +749,7 @@ do
   providers.register("fakeyolo", file_writer(tmp .. "/yolo.txt"))
   config.options.tools.yolo = true
   local ag = agent_mod.new({ model = { provider = "fakeyolo", id = "m", label = "m" } })
+  ag.ctx.cwd = tmp -- targets live in tmp; containment scopes tools to ctx.cwd
   ag:send("write it")
   vim.wait(5000, function() return ag.status == "idle" end, 10)
   check(not confirm_called, "yolo skips the permission card")
@@ -761,6 +767,7 @@ do
     cb("deny", "use a different name")
   end
   local ag2 = agent_mod.new({ model = { provider = "fakedeny", id = "m", label = "m" } })
+  ag2.ctx.cwd = tmp
   ag2:send("write it")
   vim.wait(5000, function() return ag2.status == "idle" end, 10)
   chat.confirm = orig_confirm
@@ -775,6 +782,488 @@ do
     end
   end
   check(forwarded, "deny comment forwarded to the model")
+end
+
+-- 12. repo memory / skills harness --------------------------------------------
+
+section("repo memory / skills harness")
+do
+  local memory = require("advantage.memory")
+  local config = require("advantage.config")
+  local tmp = vim.fn.tempname()
+  vim.fn.mkdir(tmp, "p")
+  memory._root_override = tmp -- keep the real repo's .advantage/ untouched
+  config.options.memory = { enabled = true, budget_tokens = 1200, project_budget_tokens = 2000, dedupe_threshold = 0.8 }
+
+  -- remember + deterministic dedup
+  local r1 = memory.remember("The SSE parser lives in util.lua and splits on double newlines", "Architecture")
+  check(r1.status == "added" and r1.section == "Architecture", "remember stores a fact under a section")
+  local r2 = memory.remember("SSE parser lives in util.lua and splits on double newlines", "Architecture")
+  check(r2.status == "duplicate" or r2.status == "updated", "near-duplicate fact is not stored twice")
+  memory.remember("Run tests with nvim -l tests/smoke.lua", "Commands")
+
+  local block = memory.render()
+  check(block:find("SSE parser", 1, true) and block:find("nvim -l tests/smoke.lua", 1, true),
+    "learned facts render into the system-prompt block")
+
+  -- skills: index always known, body only on demand
+  check(memory.save_skill("run-tests", "How to run the offline test suite",
+    "1. Run `nvim -l tests/smoke.lua`\n2. Every check must print ok"), "save_skill writes a skill")
+  local in_index = false
+  for _, s in ipairs(memory.skills_index()) do if s.name == "run-tests" then in_index = true end end
+  check(in_index, "skill appears in the index")
+  local body, desc = memory.use_skill("run-tests")
+  check(body and body:find("smoke.lua", 1, true) and desc:find("offline", 1, true), "use_skill loads the full body on demand")
+  check(memory.render():find("run-tests:", 1, true) ~= nil, "skill index (name: description) is injected")
+  check(memory.render():find("Every check must print ok", 1, true) == nil, "skill BODY stays out of the always-on context")
+
+  -- verify: flag facts whose path anchor is gone, keep ones that resolve
+  vim.fn.writefile({ "x" }, tmp .. "/real_file.lua")
+  memory.remember("Config defaults live in real_file.lua at the repo root", "Architecture")
+  memory.remember("Deprecated helper is in ghost/gone.lua", "Notes")
+  local stale, ghost_hit, real_ok = memory.verify(), false, true
+  for _, s in ipairs(stale) do
+    if s.missing:find("ghost/gone.lua", 1, true) then ghost_hit = true end
+    if s.missing:find("real_file.lua", 1, true) then real_ok = false end
+  end
+  check(ghost_hit and real_ok, "verify flags only facts whose referenced path is missing")
+
+  -- budget: learned block can never bloat context
+  config.options.memory.budget_tokens = 30
+  for i = 1, 12 do memory.remember(("Filler note %d about widget subsystem alpha beta gamma"):format(i), "Notes") end
+  check(#memory.render() < 3000, "token budget keeps the learned block bounded")
+
+  -- forget (curation)
+  config.options.memory.budget_tokens = 1200
+  memory.remember("A very specific forgettable marker phrase qxz", "Notes")
+  check(memory.forget("forgettable marker phrase qxz") >= 1, "forget removes matching facts")
+
+  -- gated off injects nothing
+  config.options.memory.enabled = false
+  check(memory.render() == "", "disabled memory injects nothing")
+  check(#require("advantage.tools").schemas() > 0, "tool schemas still present with memory off")
+  local names = {}
+  for _, t in ipairs(require("advantage.tools").schemas()) do names[t.name] = true end
+  check(not names.remember, "memory tools are hidden from the schema when disabled")
+  config.options.memory.enabled = true
+  memory._root_override = MEMTMP
+end
+
+-- 13. parallel sub-agent fan-out ----------------------------------------------
+
+section("parallel sub-agents")
+do
+  local providers = require("advantage.providers")
+  local agent_mod = require("advantage.agent")
+
+  local sub_started, concurrent, max_concurrent = 0, 0, 0
+  providers.register("fakesubpar", {
+    stream = function(req)
+      sub_started = sub_started + 1
+      concurrent = concurrent + 1
+      max_concurrent = math.max(max_concurrent, concurrent)
+      local prompt = req.messages[1].content[1].text
+      vim.defer_fn(function()
+        concurrent = concurrent - 1
+        req.on.complete({ { type = "text", text = "sub-report: " .. prompt } }, "end_turn")
+      end, 30)
+      return { stop = function() end }
+    end,
+  })
+
+  local pturn, final_results = 0, nil
+  providers.register("fakepar", {
+    stream = function(req)
+      pturn = pturn + 1
+      vim.defer_fn(function()
+        if pturn == 1 then
+          req.on.complete({
+            { type = "tool_use", id = "s1", name = "sub_agent", input = { prompt = "alpha", model = "fakesubpar/m" } },
+            { type = "tool_use", id = "s2", name = "sub_agent", input = { prompt = "beta", model = "fakesubpar/m" } },
+            { type = "tool_use", id = "s3", name = "sub_agent", input = { prompt = "gamma", model = "fakesubpar/m" } },
+          }, "tool_use")
+        else
+          for _, m in ipairs(req.messages) do
+            if m.role == "user" then
+              local trs = {}
+              for _, b in ipairs(m.content) do if b.type == "tool_result" then trs[#trs + 1] = b end end
+              if #trs == 3 then final_results = trs end
+            end
+          end
+          req.on.complete({ { type = "text", text = "all done" } }, "end_turn")
+        end
+      end, 10)
+      return { stop = function() end }
+    end,
+  })
+
+  local ag = agent_mod.new({ model = { provider = "fakepar", id = "m", label = "par" } })
+  ag:send("fan out")
+  vim.wait(6000, function() return pturn >= 2 and final_results ~= nil end, 10)
+
+  check(sub_started == 3, "all three sub-agents ran")
+  check(max_concurrent >= 2, "sub-agents overlapped instead of running one-at-a-time")
+  check(final_results and #final_results == 3, "three tool_results merged into one user turn")
+  local ids = {}
+  for _, tr in ipairs(final_results or {}) do ids[tr.tool_use_id] = true end
+  check(ids.s1 and ids.s2 and ids.s3, "each sub_agent call got its matching tool_result")
+end
+
+-- 14. cache-aware usage reporting ---------------------------------------------
+
+section("cache-aware usage")
+do
+  local usage = require("advantage.usage")
+  usage._ledger_override = vim.fn.tempname() .. "-cache.jsonl"
+  usage.record({ provider = "anthropic", id = "claude" }, 1000, 50, 800)
+  local st = usage.stats(os.time())
+  check(st.today.cached == 800, "ledger records the cached portion of input tokens")
+  local txt = table.concat(usage.dashboard_lines(), "\n")
+  check(txt:find("cached", 1, true) ~= nil, "dashboard surfaces cache savings")
+end
+
+-- 15. repeated compaction preserves oldest history ----------------------------
+
+section("repeated compaction")
+do
+  local compact = require("advantage.compact")
+  local msgs = {}
+  for i = 1, 30 do
+    msgs[#msgs + 1] = { role = i % 2 == 0 and "assistant" or "user",
+      content = { { type = "text", text = ("OLDEST-MARKER-%02d "):format(i) .. string.rep("y", 200) } } }
+  end
+  local once = select(1, compact.force(msgs, { keep_recent_messages = 4, summary_max_chars = 4000 }))
+  check(once[1].content[1].text:find("OLDEST-MARKER-01", 1, true) ~= nil, "first compaction keeps the oldest marker")
+  -- age in more turns and compact again; the oldest marker must survive
+  for i = 31, 50 do
+    once[#once + 1] = { role = i % 2 == 0 and "assistant" or "user",
+      content = { { type = "text", text = ("NEW-%02d "):format(i) .. string.rep("z", 200) } } }
+  end
+  local twice = select(1, compact.force(once, { keep_recent_messages = 4, summary_max_chars = 4000 }))
+  check(twice[1].content[1].text:find("OLDEST-MARKER-01", 1, true) ~= nil,
+    "second compaction still preserves the oldest history (no destructive re-truncation)")
+end
+
+-- 16. project-root containment --------------------------------------------------
+
+section("project-root containment")
+do
+  local tools = require("advantage.tools")
+  local config = require("advantage.config")
+  local tmp = vim.fn.tempname()
+  vim.fn.mkdir(tmp .. "/sub", "p")
+  vim.fn.writefile({ "inside-content" }, tmp .. "/sub/ok.txt")
+  local parent = vim.fs.dirname(tmp)
+  vim.fn.writefile({ "outside-secret" }, parent .. "/escape.txt")
+  local ctx = { cwd = tmp }
+
+  local function run(name, input)
+    local result, is_err, done = nil, nil, false
+    tools.get(name).run(input, ctx, function(out, err)
+      result, is_err, done = out, err, true
+    end)
+    vim.wait(5000, function() return done end, 10)
+    return result, is_err
+  end
+
+  local r, e = run("read_file", { path = "sub/ok.txt" })
+  check(e == false and r:find("inside-content", 1, true), "relative read inside root works")
+
+  r, e = run("read_file", { path = tmp .. "/sub/ok.txt" })
+  check(e == false and r:find("inside-content", 1, true), "absolute read inside root works")
+
+  r, e = run("read_file", { path = "../escape.txt" })
+  check(e == true and not tostring(r):find("outside-secret", 1, true), "traversal read is blocked")
+
+  r, e = run("read_file", { path = "/etc/passwd" })
+  check(e == true, "absolute outside read is blocked")
+
+  r, e = run("write_file", { path = "../escape2.txt", content = "x" })
+  check(e == true and vim.fn.filereadable(parent .. "/escape2.txt") == 0, "traversal write is blocked")
+
+  r, e = run("list_dir", { path = "/" })
+  check(e == true, "outside list_dir is blocked")
+
+  r, e = run("grep", { pattern = "root", path = "/etc" })
+  check(e == true, "outside grep is blocked")
+
+  -- previews must not leak outside-project contents before approval
+  local pv = tools.get("write_file").preview({ path = parent .. "/escape.txt", content = "new" }, ctx)
+  check(table.concat(pv.lines, "\n"):find("blocked", 1, true) ~= nil
+    and not table.concat(pv.lines, "\n"):find("outside-secret", 1, true), "write preview blocked outside root")
+  local pe = tools.get("edit_file").preview({ path = "../escape.txt", old_string = "outside", new_string = "x" }, ctx)
+  check(table.concat(pe.lines, "\n"):find("blocked", 1, true) ~= nil, "edit preview blocked outside root")
+
+  -- explicit opt-out restores external access
+  config.options.tools.allow_outside_root = true
+  r, e = run("read_file", { path = "../escape.txt" })
+  check(e == false and r:find("outside-secret", 1, true), "allow_outside_root opts out of containment")
+  config.options.tools.allow_outside_root = false
+end
+
+-- 17. multi_edit + todo_write ---------------------------------------------------
+
+section("multi_edit + todo_write")
+do
+  local tools = require("advantage.tools")
+  local tmp = vim.fn.tempname()
+  vim.fn.mkdir(tmp, "p")
+  vim.fn.writefile({ "alpha beta", "gamma beta" }, tmp .. "/m.txt")
+  local ctx = { cwd = tmp }
+
+  local function run(name, input)
+    local result, is_err, done = nil, nil, false
+    tools.get(name).run(input, ctx, function(out, err)
+      result, is_err, done = out, err, true
+    end)
+    vim.wait(5000, function() return done end, 10)
+    return result, is_err
+  end
+
+  local r, e = run("multi_edit", { path = "m.txt", edits = {
+    { old_string = "alpha", new_string = "ALPHA" },
+    { old_string = "beta", new_string = "B", replace_all = true },
+  } })
+  local after = table.concat(vim.fn.readfile(tmp .. "/m.txt"), "\n")
+  check(e == false and after:find("ALPHA B") and after:find("gamma B"), "multi_edit applies edits in order")
+
+  -- atomicity: a failing edit must leave the file untouched
+  r, e = run("multi_edit", { path = "m.txt", edits = {
+    { old_string = "ALPHA", new_string = "A2" },
+    { old_string = "does-not-exist", new_string = "x" },
+  } })
+  local unchanged = table.concat(vim.fn.readfile(tmp .. "/m.txt"), "\n")
+  check(e == true and unchanged:find("ALPHA", 1, true) ~= nil, "multi_edit is atomic — failed batch writes nothing")
+
+  local pv = tools.get("multi_edit").preview({ path = "m.txt", edits = {
+    { old_string = "gamma", new_string = "GAMMA" },
+  } }, ctx)
+  check(pv.filetype == "diff" and table.concat(pv.lines, "\n"):find("+GAMMA"), "multi_edit preview is a unified diff")
+
+  r, e = run("todo_write", { items = {
+    { content = "step one", status = "completed" },
+    { content = "step two", status = "in_progress" },
+    { content = "step three", status = "pending" },
+  } })
+  check(e == false and r:find("1/3 done", 1, true), "todo_write tracks completion")
+  check(type(ctx.todos) == "table" and #ctx.todos == 3, "todo list stored on the agent context")
+  r, e = run("todo_write", { items = {} })
+  check(e == true, "todo_write rejects an empty list")
+
+  -- todo_write must not leak into read-only sub-agents
+  local sub_names = {}
+  for _, def in ipairs(require("advantage.tools").list) do
+    if def.safe and def.name ~= "sub_agent" and not def.memory and not def.parent_only then
+      sub_names[def.name] = true
+    end
+  end
+  check(not sub_names.todo_write, "todo_write excluded from sub-agent toolset")
+end
+
+-- 18. skill auto-surfacing ------------------------------------------------------
+
+section("skill auto-surfacing")
+do
+  local memory = require("advantage.memory")
+  local config = require("advantage.config")
+  local tmp = vim.fn.tempname()
+  vim.fn.mkdir(tmp, "p")
+  memory._root_override = tmp
+  config.options.memory = { enabled = true, budget_tokens = 1200, project_budget_tokens = 2000, dedupe_threshold = 0.8 }
+  memory.reset_session()
+
+  memory.save_skill("deploy-docs", "How to build and deploy the documentation site",
+    "1. build the site\n2. push to the docs branch\n3. verify the published pages")
+
+  local h = memory.skill_hints("please deploy the docs site for me")
+  check(#h >= 1 and h[1].name == "deploy-docs", "matching prompt surfaces the skill")
+  check(#memory.skill_hints("please deploy the docs site for me") == 0, "a skill is hinted at most once per session")
+  memory.reset_session()
+  check(#memory.skill_hints("refactor the sse parser") == 0, "unrelated prompt gets no hint")
+
+  -- loaded skills are never re-hinted
+  memory.use_skill("deploy-docs")
+  check(#memory.skill_hints("deploy the docs site") == 0, "already-loaded skill is not hinted")
+
+  -- end-to-end: the hint lands in the outgoing message, not the transcript text
+  memory.reset_session()
+  local providers = require("advantage.providers")
+  local agent_mod = require("advantage.agent")
+  local sent
+  providers.register("fakehint", {
+    stream = function(req)
+      sent = req.messages[#req.messages].content
+      vim.defer_fn(function()
+        req.on.complete({ { type = "text", text = "ok" } }, "end_turn")
+      end, 10)
+      return { stop = function() end }
+    end,
+  })
+  local ag = agent_mod.new({ model = { provider = "fakehint", id = "m", label = "m" } })
+  memory.reset_session() -- agent_mod.new resets; keep the hint budget fresh for this test
+  ag:send("deploy the docs site")
+  vim.wait(5000, function() return sent ~= nil and ag.status == "idle" end, 10)
+  local sent_text = sent and sent[#sent].text or ""
+  check(sent_text:find("<repo-skill-hint>", 1, true) ~= nil and sent_text:find("deploy-docs", 1, true) ~= nil,
+    "hint is appended to the outgoing user message")
+
+  memory._root_override = MEMTMP
+end
+
+-- 19. harness savings instrumentation --------------------------------------------
+
+section("harness instrumentation")
+do
+  local memory = require("advantage.memory")
+  local config = require("advantage.config")
+  local usage = require("advantage.usage")
+  local tmp = vim.fn.tempname()
+  vim.fn.mkdir(tmp, "p")
+  memory._root_override = tmp
+  config.options.memory = { enabled = true, budget_tokens = 1200, project_budget_tokens = 2000, dedupe_threshold = 0.8 }
+  memory.reset_session()
+
+  memory.remember("Build with make all from the repo root", "Commands")
+  memory.save_skill("cut-release", "How to cut and publish a release",
+    string.rep("1. bump the version and tag the commit\n", 20))
+
+  local st = memory.stats()
+  check(st.block_tokens > 0, "stats reports the injected block size")
+  check(st.skills == 1 and st.bodies_tokens > 50, "stats reports index size and total body tokens")
+  check(st.loads == 0, "no on-demand loads yet")
+  memory.use_skill("cut-release")
+  st = memory.stats()
+  check(st.loads == 1 and st.loaded_tokens > 0, "on-demand load is counted")
+
+  local lines = table.concat(usage.dashboard_lines({ input = 100, output = 10, turns = 8 }), "\n")
+  check(lines:find("harness", 1, true) ~= nil, "dashboard shows the harness line")
+  check(lines:find("saved vs inlining", 1, true) ~= nil, "dashboard shows the savings counterfactual")
+
+  memory._root_override = MEMTMP
+  memory.reset_session()
+end
+
+-- 20. memory bootstrap & the learn flywheel --------------------------------------
+
+section("memory bootstrap & flywheel")
+do
+  local memory = require("advantage.memory")
+  local config = require("advantage.config")
+  local providers = require("advantage.providers")
+  local agent_mod = require("advantage.agent")
+  local tmp = vim.fn.tempname()
+  vim.fn.mkdir(tmp, "p")
+  memory._root_override = tmp
+  config.options.memory = { enabled = true, budget_tokens = 1200, project_budget_tokens = 2000, dedupe_threshold = 0.8 }
+
+  -- flywheel provider: turn 1 records a fact via the remember tool; turn 2
+  -- captures the system prompt so we can prove the fact came back around.
+  local turn, sys2 = 0, nil
+  providers.register("fakelearn", {
+    stream = function(req)
+      turn = turn + 1
+      if turn == 2 then sys2 = req.system end
+      vim.defer_fn(function()
+        if turn == 1 then
+          req.on.tool_start("mem1", "remember")
+          req.on.complete({
+            { type = "tool_use", id = "mem1", name = "remember",
+              input = { fact = "Run make ci before pushing anything", section = "Commands" } },
+          }, "tool_use")
+        else
+          req.on.complete({ { type = "text", text = "noted" } }, "end_turn")
+        end
+      end, 10)
+      return { stop = function() end }
+    end,
+  })
+
+  -- bootstrap: creating an agent seeds the memory file for a fresh repo
+  local ag = agent_mod.new({ model = { provider = "fakelearn", id = "m", label = "m" } })
+  check(vim.fn.filereadable(tmp .. "/.advantage/context.md") == 1, "agent init bootstraps .advantage/context.md")
+  local seed = table.concat(vim.fn.readfile(tmp .. "/.advantage/context.md"), "\n")
+  check(seed:find("# Repo memory", 1, true) == 1 and seed:find("Managed by advantage.nvim", 1, true) ~= nil,
+    "bootstrapped file has the managed header")
+  check(memory.render():find("`remember` tool", 1, true) ~= nil, "empty memory nudges the model to start recording")
+
+  -- flywheel end-to-end: remember tool → sectioned markdown → next turn's system prompt
+  ag:send("teach yourself the ci rule")
+  vim.wait(6000, function() return turn >= 2 and ag.status == "idle" end, 10)
+
+  local file = table.concat(vim.fn.readfile(tmp .. "/.advantage/context.md"), "\n")
+  check(file:find("## Commands", 1, true) ~= nil and file:find("- Run make ci before pushing anything", 1, true) ~= nil,
+    "remember tool writes a clean sectioned markdown file")
+  check(file:find("Nothing recorded yet", 1, true) == nil, "placeholder line is replaced by real content")
+  check(sys2 ~= nil and sys2:find("Run make ci before pushing anything", 1, true) ~= nil,
+    "next turn's system prompt carries the learned fact")
+
+  -- bootstrap must never clobber an existing file
+  check(memory.bootstrap() == false, "bootstrap is idempotent on an existing file")
+
+  -- /context init parity prompt: exploration + verified facts + skill extraction
+  local ip = memory.init_prompt()
+  check(ip:find("remember", 1, true) ~= nil and ip:find("save_skill", 1, true) ~= nil,
+    "init prompt teaches both memory verbs")
+  check(ip:find("Commands", 1, true) ~= nil and ip:find("Architecture", 1, true)
+    and ip:find("Gotchas", 1, true), "init prompt routes facts to sections")
+  check(ip:find("do not guess", 1, true) ~= nil and ip:find("never record a guess", 1, true) ~= nil,
+    "init prompt forbids recording guesses")
+
+  memory._root_override = MEMTMP
+end
+
+-- 21. fresh-repo linkage (all models, git-root discovery, gated guidance) --------
+
+section("fresh-repo linkage")
+do
+  local memory = require("advantage.memory")
+  local config = require("advantage.config")
+  local agent_mod = require("advantage.agent")
+  config.options.memory = { enabled = true, budget_tokens = 1200, project_budget_tokens = 2000, dedupe_threshold = 0.8 }
+
+  -- a brand-new repo: git root at repo/, nvim opened in a SUBDIRECTORY
+  local repo = vim.fn.tempname()
+  vim.fn.mkdir(repo .. "/.git", "p")
+  vim.fn.mkdir(repo .. "/src/deep", "p")
+  memory._root_override = nil -- exercise the real git-root walk
+  local prev_cwd = vim.fn.getcwd()
+  vim.fn.chdir(repo .. "/src/deep")
+
+  check(memory.root() == repo, "memory root walks up to the git root from a subdirectory")
+  agent_mod.new({ model = { provider = "fake", id = "m", label = "m" } })
+  check(vim.fn.filereadable(repo .. "/.advantage/context.md") == 1,
+    "bootstrap lands at the git root, not the subdirectory")
+
+  -- the model is taught the harness, and told the memory is empty
+  local sys = agent_mod.system_prompt()
+  check(sys:find("Persistent repo memory", 1, true) ~= nil, "system prompt carries the memory guide")
+  check(sys:find("hasn't been learned yet", 1, true) ~= nil, "system prompt carries the empty-memory nudge")
+
+  -- every provider gets the memory tools on a fresh repo, no setup required
+  local schemas = require("advantage.tools").schemas()
+  local names = {}
+  for _, t in ipairs(schemas) do names[t.name] = t end
+  check(names.remember and names.use_skill and names.save_skill,
+    "anthropic-format schemas include all memory tools")
+  local converted = require("advantage.providers.openai")._to_tools(schemas)
+  local oai = {}
+  for _, t in ipairs(converted) do oai[t.name] = t end
+  check(oai.remember and oai.remember.type == "function"
+      and oai.remember.parameters and oai.remember.parameters.properties.fact ~= nil,
+    "openai/codex conversion preserves the memory tools intact")
+
+  -- disabled memory: guidance AND tools both disappear together (no orphan instructions)
+  config.options.memory.enabled = false
+  local sys_off = agent_mod.system_prompt()
+  check(sys_off:find("Persistent repo memory", 1, true) == nil,
+    "memory guide is not injected when memory is disabled")
+  local off = {}
+  for _, t in ipairs(require("advantage.tools").schemas()) do off[t.name] = true end
+  check(not off.remember and not off.use_skill, "memory tools absent from schemas when disabled")
+  config.options.memory.enabled = true
+
+  vim.fn.chdir(prev_cwd)
+  memory._root_override = MEMTMP
 end
 
 print("")

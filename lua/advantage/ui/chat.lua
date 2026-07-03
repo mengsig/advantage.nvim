@@ -418,6 +418,8 @@ end
 local SLASH = {
   usage = function() require("advantage").usage() end,
   compact = function() require("advantage").compact() end,
+  context = function(arg) require("advantage").context(arg) end,
+  memory = function(arg) require("advantage").context(arg) end,
   new = function() require("advantage").new_session() end,
   clear = function() require("advantage").new_session() end,
   model = function() require("advantage").pick_model() end,
@@ -453,7 +455,7 @@ local function submit(mode)
       vim.cmd.stopinsert()
       fn(cmd_arg)
     else
-      M.notify("unknown command: /" .. cmd .. "  (try /usage, /compact, /review, /yolo, /effort, /new, /model, /resume, /help)", vim.log.levels.WARN)
+      M.notify("unknown command: /" .. cmd .. "  (try /usage, /compact, /context, /review, /yolo, /effort, /new, /model, /resume, /help)", vim.log.levels.WARN)
     end
     return
   end
@@ -498,6 +500,7 @@ local function help_lines()
     "  /usage   token dashboard   /compact shrink old context",
     "  /new     fresh session     /model   switch model",
     "  /resume  resume session    /review  diff agent edits",
+    "  /context repo memory + skills (verify · forget <text>)",
     "  /yolo    skip permissions",
     "  /effort [mode]  tune thinking/reasoning (OpenAI: minimal/low/medium/high; Claude: adaptive/off/low/medium/high)",
     "",
@@ -508,6 +511,7 @@ local function help_lines()
     "  :Advantage resume     resume a session",
     "  :Advantage usage      token dashboard",
     "  :Advantage compact    shrink old conversation context",
+    "  :Advantage context    view/verify/forget repo memory",
     "  :Advantage help       keybind and command cheatsheet",
     "  :Advantage review     diff the agent's changes",
     "  :Advantage yolo       toggle skip-all-permissions",
