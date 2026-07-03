@@ -578,8 +578,8 @@ do
   end
 
   -- agent-level path: Agent:compact({mode="llm"}) end-to-end. A message sent
-  -- mid-compaction has no "next tool call" to inject before, so it must queue
-  -- and dispatch once compaction settles rather than get lost or 400 the API.
+  -- mid-compaction has no "next tool call" to inject before, so it is refused
+  -- (not queued, not appended) — the user retries once compaction settles.
   do
     local ag = agent_mod.new({ model = { provider = "fakesummarizer", id = "mini", label = "mini" } })
     ag.messages = make_messages(10)
@@ -592,7 +592,8 @@ do
     check(ag:busy() == true, "agent reports busy while compacting")
 
     ag:send("during compaction")
-    check(#ag.queue == 1, "a message sent mid-compaction is queued rather than injected as an interrupt")
+    check(#ag.queue == 0, "a message sent mid-compaction is refused, not queued")
+    check(#ag.messages == 10, "a message sent mid-compaction is not appended to the transcript")
 
     vim.wait(2000, function()
       return ag.status == "idle"
@@ -600,14 +601,6 @@ do
     check(cb_info ~= nil, "compact callback received info")
     check(#ag.messages < 10, "agent messages array was replaced with the compacted result")
     check(ag.usage.input >= 500, "summarizer usage was folded into session usage totals")
-
-    -- Let the queued message's own dispatched turn (scheduled once compaction
-    -- settled) fully finish before moving on, so it can't leak a pending
-    -- callback into a later, unrelated test section.
-    vim.wait(2000, function()
-      return ag.status == "idle" and #ag.messages > 4
-    end, 5)
-    check(#ag.messages == 6, "queued message dispatched its own follow-up turn once compaction settled")
   end
 
   -- failure path: the summarizer errors, so compaction must still succeed via

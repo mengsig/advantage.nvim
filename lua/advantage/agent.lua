@@ -135,23 +135,11 @@ function Agent:compact(opts, callback)
     return callback(nil)
   end
   self.status = "compacting"
-  self:ui().set_status("tool", "compacting…")
+  self:ui().compaction_start(require("advantage.compact").estimate_tokens(self.messages))
   self:_maybe_compact(true, opts, function(info)
     self.status = "idle"
-    self:ui().set_status("idle")
+    self:ui().compaction_done()
     callback(info)
-    -- A message sent while compaction was in flight was queued (there's no
-    -- "next tool call" to inject it before); dispatch it now, mirroring _finish.
-    if #self.queue > 0 then
-      local nxt = table.remove(self.queue, 1)
-      self:ui().set_queue(#self.queue)
-      vim.schedule(function()
-        if not self:busy() then
-          nxt.opts.mode = nil
-          self:send(nxt.text, nxt.opts)
-        end
-      end)
-    end
   end)
 end
 
@@ -201,10 +189,15 @@ end
 ---@param opts? {images?: {name:string, media_type:string, data:string}[], mode?: "instant"|"queued"}
 function Agent:send(text, opts)
   opts = opts or {}
+  -- Compaction is a brief, blocking operation: there is no "next tool call" to
+  -- inject before, so refuse the send (the UI blocks submit too, keeping the
+  -- typed text) rather than silently queuing it.
+  if self.status == "compacting" then
+    self:ui().notify("compacting context — wait for it to finish before sending", vim.log.levels.WARN)
+    return
+  end
   if self:busy() then
-    -- Mid-compaction there is no "next tool call" to inject an interrupt
-    -- before, so always queue instead (dispatched once compaction finishes).
-    if opts.mode == "queued" or self.status == "compacting" then
+    if opts.mode == "queued" then
       self.queue[#self.queue + 1] = { text = text, opts = opts }
       self:ui().queued(#self.queue, text)
       return

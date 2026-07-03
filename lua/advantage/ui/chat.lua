@@ -28,8 +28,9 @@ local S = {
   last_kind = nil, -- "header" | "text" | "tool" | "user" | nil
   spinner = 1,
   timer = nil,
-  status = "idle", -- idle | streaming | tool | waiting
+  status = "idle", -- idle | streaming | tool | waiting | compacting
   status_detail = nil,
+  compact = nil, -- { t0 = ms, est = ms, done = bool } while compacting
   usage = { input = 0, output = 0 },
   auth_badge = nil,
   model_label = "",
@@ -173,6 +174,15 @@ local function winbar_text()
     right = right .. ("%%#AdvBarBusy#%s %s "):format(FRAMES[S.spinner], esc_bar(S.status_detail or "tool"))
   elseif S.status == "waiting" then
     right = right .. ("%%#AdvBarBusy#● approve %s? "):format(esc_bar(S.status_detail or ""))
+  elseif S.status == "compacting" then
+    local c = S.compact or {}
+    local frac = 0
+    if c.t0 and c.est and c.est > 0 then frac = math.min(0.95, (uv.now() - c.t0) / c.est) end
+    if c.done then frac = 1 end
+    local width = 12
+    local filled = math.floor(frac * width + 0.5)
+    local bar = string.rep("█", filled) .. string.rep("░", width - filled)
+    right = right .. ("%%#AdvBarBusy#compacting %s %d%%%% "):format(bar, math.floor(frac * 100 + 0.5))
   end
   return left .. " %=" .. right
 end
@@ -484,6 +494,14 @@ local function submit(mode)
         vim.log.levels.WARN
       )
     end
+    return
+  end
+
+  -- Context compaction is a brief, blocking operation with no "next tool call"
+  -- to inject before; block the send (keeping the typed text intact) instead of
+  -- silently queuing it. Slash commands above still work during compaction.
+  if S.status == "compacting" then
+    M.notify("compacting context — wait for it to finish before sending", vim.log.levels.WARN)
     return
   end
 
@@ -992,6 +1010,26 @@ end
 
 function M.finish_turn()
   S.mode = nil
+end
+
+---Begin a determinate compaction progress bar. `tokens` (the size of the
+---context being summarised) drives the fill speed via a rough duration estimate;
+---the bar holds at 95% until compaction_done snaps it to 100%.
+---@param tokens? integer
+function M.compaction_start(tokens)
+  local est = math.max(6000, math.min(90000, 4000 + (tonumber(tokens) or 0) * 0.25))
+  S.compact = { t0 = uv.now(), est = est, done = false }
+  M.set_status("compacting")
+end
+
+---Finish compaction: flash a full bar briefly, then return to idle.
+function M.compaction_done()
+  if S.compact then S.compact.done = true end
+  update_winbar()
+  vim.defer_fn(function()
+    S.compact = nil
+    if S.status == "compacting" then M.set_status("idle") end
+  end, 300)
 end
 
 function M.set_status(status, detail)
