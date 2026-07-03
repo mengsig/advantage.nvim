@@ -14,9 +14,7 @@ end, {
   nargs = "*",
   range = true,
   desc = "advantage.nvim — coding agent harness",
-  complete = function(arglead)
-    return vim.tbl_filter(function(s)
-      return vim.startswith(s, arglead)
-    end, require("advantage")._subcommands)
+  complete = function(arglead, cmdline)
+    return require("advantage")._complete(arglead, cmdline)
   end,
 })

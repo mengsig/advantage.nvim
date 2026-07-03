@@ -209,6 +209,9 @@ end
 
 -- 5. agent e2e with a fake provider + UI ----------------------------------------
 
+-- keep test token usage out of the user's real ledger
+require("advantage.usage")._ledger_override = vim.fn.tempname() .. "-usage.jsonl"
+
 section("agent e2e (fake provider, real ui)")
 do
   require("advantage").setup({
@@ -272,6 +275,185 @@ do
   check(msgs[2].content[2].type == "tool_use", "assistant tool_use recorded")
   check(msgs[3].content[1].type == "tool_result" and msgs[3].content[1].content:find("agent%-was%-here") ~= nil,
     "tool_result captured bash output")
+end
+
+-- 6. message queue ---------------------------------------------------------------
+
+section("message queue")
+do
+  local adv = require("advantage")
+  local ui = require("advantage.ui.chat")
+  adv.ask("first queued test")
+  adv.ask("second queued test") -- agent is busy → must queue, not error
+  check(ui.state.queue_count == 1, "second message queued while turn runs")
+
+  vim.wait(8000, function()
+    local text = table.concat(vim.api.nvim_buf_get_lines(ui.state.buf, 0, -1, false), "\n")
+    return ui.state.status == "idle" and ui.state.queue_count == 0
+      and text:find("▍ you", text:find("second queued test", 1, true) or 1, true) ~= nil
+  end, 25)
+
+  local text = table.concat(vim.api.nvim_buf_get_lines(ui.state.buf, 0, -1, false), "\n")
+  check(text:find("queued #1", 1, true) ~= nil, "queue notice rendered")
+  check(text:find("first queued test", 1, true) ~= nil and text:find("second queued test", 1, true) ~= nil,
+    "queued message dispatched after the running turn")
+  check(ui.state.queue_count == 0, "queue drained")
+end
+
+-- 7. ui regressions ---------------------------------------------------------------
+
+section("ui regressions")
+do
+  local ui = require("advantage.ui.chat")
+  ui.clear()
+  for _ = 1, 3 do
+    ui.close()
+    ui.open(false)
+  end
+  local marks = vim.api.nvim_buf_get_extmarks(ui.state.buf, -1, 0, -1, { details = true })
+  local banners = 0
+  for _, m in ipairs(marks) do
+    if m[4] and m[4].virt_lines then banners = banners + 1 end
+  end
+  check(banners == 1, "welcome banner rendered exactly once after reopens")
+  check(vim.bo[ui.state.buf].modifiable == false, "transcript buffer is read-only")
+end
+
+-- 8. attachments / @mentions -------------------------------------------------------
+
+section("attachments / mentions")
+do
+  local attach = require("advantage.attach")
+  local tmp = vim.fn.tempname()
+  vim.fn.mkdir(tmp, "p")
+  vim.fn.writefile({ "hello", "world" }, tmp .. "/ctx.txt")
+
+  local expanded, files = attach.expand_mentions("look at @ctx.txt please", tmp)
+  check(#files == 1 and expanded:find("hello\nworld", 1, true) ~= nil, "@mention inlines file content")
+  check(expanded:find("```", 1, true) ~= nil, "inlined file is fenced")
+
+  local same, none = attach.expand_mentions("email me @ home and check @missing.txt", tmp)
+  check(#none == 0 and same == "email me @ home and check @missing.txt", "non-file mentions left untouched")
+
+  -- line-range mentions
+  local p, lo, hi = attach._parse_token("lua/chat.lua:L10-20")
+  check(p == "lua/chat.lua" and lo == 10 and hi == 20, "parses @file:L10-20")
+  p, lo, hi = attach._parse_token("chat.lua:L7")
+  check(p == "chat.lua" and lo == 7 and hi == 7, "parses single-line @file:L7")
+  p, lo, hi = attach._parse_token("chat.lua#L3-L5")
+  check(p == "chat.lua" and lo == 3 and hi == 5, "parses #L3-L5 variant")
+  p, lo, hi = attach._parse_token("plain/path.lua")
+  check(p == "plain/path.lua" and lo == nil, "plain path has no range")
+
+  vim.fn.writefile({ "one", "two", "three", "four", "five" }, tmp .. "/ranged.txt")
+  local rexp, rfiles = attach.expand_mentions("fix @ranged.txt:L2-4 please", tmp)
+  check(#rfiles == 1 and rfiles[1].lo == 2 and rfiles[1].hi == 4, "range captured in file list")
+  check(rexp:find("two\nthree\nfour", 1, true) ~= nil, "only the requested lines inlined")
+  check(rexp:find("one", 1, true) == nil and rexp:find("five", 1, true) == nil, "out-of-range lines excluded")
+  check(rexp:find("L2-4", 1, true) ~= nil and rexp:find("of 5 lines", 1, true) ~= nil, "range + total in fence header")
+
+  local clamped = select(1, attach.expand_mentions("see @ranged.txt:L4-99", tmp))
+  check(clamped:find("four\nfive", 1, true) ~= nil and clamped:find("L4-5", 1, true) ~= nil, "range clamped to file length")
+
+  local listed = attach.project_files(50)
+  check(type(listed) == "table" and #listed > 0, "project files listed for @completion")
+end
+
+-- 9. usage ledger + dashboard -------------------------------------------------------
+
+section("usage")
+do
+  local usage = require("advantage.usage")
+  check(usage._sparkline({ 0, 0, 0 }) == "▁▁▁", "sparkline handles all-zero weeks")
+  check(vim.fn.strchars(usage._sparkline({ 1, 5, 10 })) == 3, "sparkline renders one cell per day")
+
+  usage.record({ provider = "fake", id = "test-model" }, 111, 22)
+  local st = usage.stats()
+  check(st.today.total >= 133 and st.today.requests >= 1, "recorded usage aggregates into today")
+  check(#st.days == 7, "seven day buckets")
+
+  local ok, lines = pcall(usage.dashboard_lines, { input = 10, output = 5 })
+  local joined = ok and table.concat(lines, "\n") or ""
+  check(ok and joined:find("today", 1, true) and joined:find("pace", 1, true), "dashboard renders")
+end
+
+-- 10. yolo / deny with comment / review ---------------------------------------------
+
+section("yolo · deny+comment · review")
+do
+  local providers = require("advantage.providers")
+  local config = require("advantage.config")
+  local chat = require("advantage.ui.chat")
+  local agent_mod = require("advantage.agent")
+  local tmp = vim.fn.tempname()
+  vim.fn.mkdir(tmp, "p")
+
+  -- provider that asks to write one file, then finishes
+  local function file_writer(path)
+    local t = 0
+    return {
+      stream = function(req)
+        t = t + 1
+        vim.defer_fn(function()
+          if t == 1 then
+            req.on.tool_start("w1", "write_file")
+            req.on.usage(10, 5)
+            req.on.complete({
+              { type = "tool_use", id = "w1", name = "write_file", input = { path = path, content = "yolo file\n" } },
+            }, "tool_use", { input = 10, output = 5 })
+          else
+            req.on.text("done")
+            req.on.usage(5, 2)
+            req.on.complete({ { type = "text", text = "done" } }, "end_turn", { input = 5, output = 2 })
+          end
+        end, 10)
+        return { stop = function() end }
+      end,
+    }
+  end
+
+  local orig_confirm = chat.confirm
+  local confirm_called = false
+  chat.confirm = function(_, cb)
+    confirm_called = true
+    cb("deny")
+  end
+
+  -- yolo: write_file is NOT auto-approved, but must run without a card
+  providers.register("fakeyolo", file_writer(tmp .. "/yolo.txt"))
+  config.options.tools.yolo = true
+  local ag = agent_mod.new({ model = { provider = "fakeyolo", id = "m", label = "m" } })
+  ag:send("write it")
+  vim.wait(5000, function() return ag.status == "idle" end, 10)
+  check(not confirm_called, "yolo skips the permission card")
+  check(vim.fn.filereadable(tmp .. "/yolo.txt") == 1, "tool executed under yolo")
+  check(ag.snapshots[vim.fs.normalize(tmp .. "/yolo.txt")] == false, "new-file snapshot recorded")
+  config.options.tools.yolo = false
+
+  local items = require("advantage.review")._changes(ag)
+  check(#items == 1 and items[1].new and items[1].after:find("yolo file", 1, true) ~= nil,
+    "review collects the agent's change")
+
+  -- deny with comment: feedback must reach the tool_result
+  providers.register("fakedeny", file_writer(tmp .. "/deny.txt"))
+  chat.confirm = function(_, cb)
+    cb("deny", "use a different name")
+  end
+  local ag2 = agent_mod.new({ model = { provider = "fakedeny", id = "m", label = "m" } })
+  ag2:send("write it")
+  vim.wait(5000, function() return ag2.status == "idle" end, 10)
+  chat.confirm = orig_confirm
+  check(vim.fn.filereadable(tmp .. "/deny.txt") == 0, "denied tool did not run")
+  local forwarded = false
+  for _, msg in ipairs(ag2.messages) do
+    for _, b in ipairs(msg.content) do
+      if b.type == "tool_result" and type(b.content) == "string"
+        and b.content:find("use a different name", 1, true) then
+        forwarded = true
+      end
+    end
+  end
+  check(forwarded, "deny comment forwarded to the model")
 end
 
 print("")

@@ -18,7 +18,7 @@ local function sanitize_messages(messages)
     local content = {}
     for _, block in ipairs(msg.content) do
       if block.type == "text" or block.type == "tool_use" or block.type == "tool_result"
-        or block.type == "thinking" or block.type == "redacted_thinking" then
+        or block.type == "thinking" or block.type == "redacted_thinking" or block.type == "image" then
         content[#content + 1] = block
       end
     end
@@ -139,7 +139,13 @@ function M.stream(req)
       tools = req.tools,
     }
     if req.model.thinking ~= false then
-      body.thinking = { type = "adaptive", display = "summarized" }
+      if type(req.model.thinking) == "table" then
+        body.thinking = req.model.thinking
+      elseif req.model.thinking_budget then
+        body.thinking = { type = "enabled", budget_tokens = req.model.thinking_budget }
+      else
+        body.thinking = { type = "adaptive", display = "summarized" }
+      end
     end
 
     local on_event, is_completed = make_handler(req.on)

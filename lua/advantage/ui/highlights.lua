@@ -73,6 +73,7 @@ function M.setup()
     AdvBarFaint = { fg = ghost },
     AdvBarInfo = { fg = faint },
     AdvBarBusy = { fg = hex(warn), bold = true },
+    AdvBarDanger = { fg = hex(err), bold = true },
     AdvFloatTitle = { fg = accent_hex, bold = true },
     AdvFloatHint = { fg = ghost, italic = true },
     AdvRule = { fg = blend(fg, bg, 0.12) },

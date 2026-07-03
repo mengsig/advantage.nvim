@@ -397,6 +397,9 @@ function M.get(name)
   return by_name[name]
 end
 
+---Resolve a tool path argument against the project root (for snapshots etc).
+M.resolve = resolve
+
 ---Tool schemas in Anthropic format (providers convert as needed).
 function M.schemas()
   local out = {}

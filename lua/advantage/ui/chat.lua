@@ -35,6 +35,9 @@ local S = {
   model_label = "",
   welcome_mark = nil,
   on_submit = nil,
+  attachments = {}, -- pending prompt images: {name=, path=, media_type=, data=}
+  follow = true, -- stick to the bottom of the transcript
+  queue_count = 0, -- messages waiting for the running turn to finish
 }
 M.state = S
 
@@ -48,6 +51,15 @@ local function esc_bar(s)
   return (s or ""):gsub("%%", "%%%%")
 end
 
+---The transcript is read-only for the user; all internal writes go through here.
+local function buf_write(fn)
+  if not util.buf_valid(S.buf) then return end
+  vim.bo[S.buf].modifiable = true
+  local ok, err = pcall(fn)
+  vim.bo[S.buf].modifiable = false
+  if not ok then error(err, 0) end
+end
+
 local function clear_welcome()
   if S.welcome_mark and util.buf_valid(S.buf) then
     pcall(api.nvim_buf_del_extmark, S.buf, ns_extra, S.welcome_mark)
@@ -58,31 +70,33 @@ end
 local function append(lines)
   if not util.buf_valid(S.buf) then return end
   clear_welcome()
-  local lc = api.nvim_buf_line_count(S.buf)
-  local first = api.nvim_buf_get_lines(S.buf, 0, 1, false)[1]
-  if lc == 1 and (first == nil or first == "") then
-    -- drop leading separators when the transcript is still empty
-    while lines[1] == "" and #lines > 1 do
-      table.remove(lines, 1)
+  buf_write(function()
+    local lc = api.nvim_buf_line_count(S.buf)
+    local first = api.nvim_buf_get_lines(S.buf, 0, 1, false)[1]
+    if lc == 1 and (first == nil or first == "") then
+      -- drop leading separators when the transcript is still empty
+      while lines[1] == "" and #lines > 1 do
+        table.remove(lines, 1)
+      end
+      api.nvim_buf_set_lines(S.buf, 0, 1, false, lines)
+    else
+      api.nvim_buf_set_lines(S.buf, lc, lc, false, lines)
     end
-    api.nvim_buf_set_lines(S.buf, 0, 1, false, lines)
-  else
-    api.nvim_buf_set_lines(S.buf, lc, lc, false, lines)
-  end
+  end)
 end
 
 local function last_row()
   return api.nvim_buf_line_count(S.buf) - 1
 end
 
+---Follow the stream only while the user is at (or near) the bottom. `S.follow`
+---is maintained from CursorMoved in the chat window, so scrolling up anywhere
+---(even while a response streams, or from the prompt) stops the auto-jump.
 local function autoscroll()
   if not util.win_valid(S.win) then return end
+  if not S.follow then return end
   local lc = api.nvim_buf_line_count(S.buf)
-  local cur = api.nvim_win_get_cursor(S.win)[1]
-  -- follow output unless the user has scrolled up to read
-  if cur >= lc - 2 or api.nvim_get_current_win() ~= S.win then
-    pcall(api.nvim_win_set_cursor, S.win, { lc, 0 })
-  end
+  pcall(api.nvim_win_set_cursor, S.win, { lc, 0 })
 end
 
 local function stream_chunk(text)
@@ -90,7 +104,9 @@ local function stream_chunk(text)
   local row = last_row()
   local last = api.nvim_buf_get_lines(S.buf, row, row + 1, false)[1] or ""
   local lines = vim.split(text, "\n", { plain = true })
-  api.nvim_buf_set_text(S.buf, row, #last, row, #last, lines)
+  buf_write(function()
+    api.nvim_buf_set_text(S.buf, row, #last, row, #last, lines)
+  end)
   if S.mode == "thinking" and S.think_start then
     local erow = last_row()
     local eline = api.nvim_buf_get_lines(S.buf, erow, erow + 1, false)[1] or ""
@@ -124,9 +140,15 @@ local function winbar_text()
   if S.auth_badge then
     left = left .. (" %%#AdvBarFaint#(%s)"):format(esc_bar(S.auth_badge))
   end
+  if config.options.tools.yolo then
+    left = left .. " %#AdvBarDanger#⚡ yolo"
+  end
   local right = ""
+  if S.queue_count > 0 then
+    right = ("%%#AdvBarInfo#⧗ %d queued "):format(S.queue_count)
+  end
   if S.usage.input > 0 or S.usage.output > 0 then
-    right = ("%%#AdvBarInfo#↑%s ↓%s "):format(util.fmt_tokens(S.usage.input), util.fmt_tokens(S.usage.output))
+    right = right .. ("%%#AdvBarInfo#↑%s ↓%s "):format(util.fmt_tokens(S.usage.input), util.fmt_tokens(S.usage.output))
   end
   if S.status == "streaming" then
     right = right .. ("%%#AdvBarBusy#%s streaming "):format(FRAMES[S.spinner])
@@ -169,7 +191,9 @@ local function redraw_tool(id)
   local row = pos[1]
   local old = api.nvim_buf_get_lines(S.buf, row, row + 1, false)[1] or ""
   local text, hl = tool_line(t)
-  api.nvim_buf_set_text(S.buf, row, 0, row, #old, { text })
+  buf_write(function()
+    api.nvim_buf_set_text(S.buf, row, 0, row, #old, { text })
+  end)
   -- restore the row anchor and style the line
   t.mark = api.nvim_buf_set_extmark(S.buf, ns, row, 0, { id = t.mark, right_gravity = false })
   t.hl_mark = api.nvim_buf_set_extmark(S.buf, ns, row, 0, {
@@ -232,14 +256,19 @@ local function show_welcome()
     { "", "" },
     { "   model    " .. S.model_label, "AdvWelcomeDim" },
     { "   send     ⏎        newline  ⇧⏎ / ⌃j", "AdvWelcomeDim" },
-    { "   cancel   ⌃c       models   :Advantage model", "AdvWelcomeDim" },
-    { "   hide     q        help     g?", "AdvWelcomeDim" },
+    { "   files    @path    image    ⌃v (paste)", "AdvWelcomeDim" },
+    { "   usage    /usage   review   /review", "AdvWelcomeDim" },
+    { "   cancel   ⌃c       help     g?", "AdvWelcomeDim" },
   }
   local virt = {}
   for _, h in ipairs(hints) do
     virt[#virt + 1] = { { h[1], h[2] } }
   end
-  S.welcome_mark = api.nvim_buf_set_extmark(S.buf, ns_extra, 0, 0, { virt_lines = virt })
+  -- reuse the extmark id so repeated opens never stack duplicate banners
+  S.welcome_mark = api.nvim_buf_set_extmark(S.buf, ns_extra, 0, 0, {
+    id = S.welcome_mark,
+    virt_lines = virt,
+  })
 end
 
 -- buffers / windows ---------------------------------------------------------
@@ -250,10 +279,50 @@ local function input_placeholder()
   local lines = api.nvim_buf_get_lines(S.input_buf, 0, -1, false)
   if #lines == 1 and lines[1] == "" then
     api.nvim_buf_set_extmark(S.input_buf, ns_extra, 0, 0, {
-      virt_text = { { "describe a task, or ask about the code…", "AdvWelcomeDim" } },
+      virt_text = { { "describe a task…  (@ file · ⌃v image · / commands)", "AdvWelcomeDim" } },
       virt_text_pos = "overlay",
     })
   end
+end
+
+local function input_winbar_text()
+  local left = "%#AdvBarFaint# ❯ prompt"
+  if #S.attachments > 0 then
+    left = left .. ("%%#AdvBarInfo# · %d image%s"):format(#S.attachments, #S.attachments == 1 and "" or "s")
+  end
+  return left .. " %=%#AdvBarFaint#⏎ send · g? keys "
+end
+
+local function update_input_winbar()
+  if util.win_valid(S.input_win) then
+    opt("winbar", input_winbar_text(), S.input_win)
+  end
+end
+
+---Grow/shrink the prompt window with its content (wrapped display lines).
+local function resize_input()
+  if not (util.win_valid(S.input_win) and util.buf_valid(S.input_buf)) then return end
+  local width = math.max(1, api.nvim_win_get_width(S.input_win))
+  local h = 0
+  for _, l in ipairs(api.nvim_buf_get_lines(S.input_buf, 0, -1, false)) do
+    h = h + math.max(1, math.ceil(api.nvim_strwidth(l) / width))
+  end
+  local min_h = config.options.ui.input_height
+  local max_h = math.max(min_h, math.floor(vim.o.lines * 0.4))
+  h = math.min(math.max(h + 1, min_h), max_h) -- +1 for the winbar
+  if api.nvim_win_get_height(S.input_win) ~= h then
+    api.nvim_win_set_height(S.input_win, h)
+  end
+end
+
+---Scroll the transcript without leaving the prompt.
+local function scroll_chat(keys)
+  if not util.win_valid(S.win) then return end
+  api.nvim_win_call(S.win, function()
+    pcall(vim.cmd, "normal! " .. api.nvim_replace_termcodes(keys, true, false, true))
+    local lc = api.nvim_buf_line_count(S.buf)
+    S.follow = api.nvim_win_get_cursor(S.win)[1] >= lc - 2
+  end)
 end
 
 local function focus_input(insert)
@@ -269,13 +338,115 @@ local function focus_chat()
   end
 end
 
+local function chip_for(item)
+  return ("[image: %s]"):format(item.name)
+end
+
+---Attach an image to the next message and drop a visible, deletable chip
+---into the prompt text.
+function M.attach_image(item)
+  M.open(false)
+  S.attachments[#S.attachments + 1] = item
+  local chip = chip_for(item) .. " "
+  if api.nvim_get_current_win() == S.input_win and vim.fn.mode():find("i") then
+    api.nvim_paste(chip, false, -1)
+  else
+    local lines = api.nvim_buf_get_lines(S.input_buf, 0, -1, false)
+    local last = lines[#lines] or ""
+    lines[#lines] = last == "" and chip or (last .. " " .. chip)
+    api.nvim_buf_set_lines(S.input_buf, 0, -1, false, lines)
+  end
+  input_placeholder()
+  update_input_winbar()
+  resize_input()
+  M.notify("attached " .. item.name .. " — delete its [image: …] chip to remove it")
+end
+
+---Append an @file mention to the prompt and focus it.
+function M.add_mention(path)
+  M.open(false)
+  local lines = api.nvim_buf_get_lines(S.input_buf, 0, -1, false)
+  local last = lines[#lines] or ""
+  local chip = "@" .. path .. " "
+  lines[#lines] = last == "" and chip or (last .. " " .. chip)
+  api.nvim_buf_set_lines(S.input_buf, 0, -1, false, lines)
+  input_placeholder()
+  resize_input()
+  if util.win_valid(S.input_win) then
+    api.nvim_set_current_win(S.input_win)
+    api.nvim_win_set_cursor(S.input_win, { #lines, math.max(#lines[#lines] - 1, 0) })
+    vim.cmd.startinsert({ bang = true })
+  end
+end
+
+---⌃v in the prompt: clipboard image if there is one, plain text paste otherwise.
+local function smart_paste()
+  local attach = require("advantage.attach")
+  local img, why = attach.clipboard_image()
+  if img then
+    return M.attach_image(img)
+  end
+  local text = vim.fn.getreg("+")
+  if text == nil or text == "" then text = vim.fn.getreg('"') end
+  if text and text ~= "" then
+    api.nvim_paste(text, false, -1)
+  else
+    M.notify(why or "clipboard is empty", vim.log.levels.WARN)
+  end
+end
+
+---Slash commands typed into the prompt (`/usage`, `/new`, …).
+local SLASH = {
+  usage = function() require("advantage").usage() end,
+  new = function() require("advantage").new_session() end,
+  clear = function() require("advantage").new_session() end,
+  model = function() require("advantage").pick_model() end,
+  models = function() require("advantage").pick_model() end,
+  resume = function() require("advantage").resume() end,
+  review = function() require("advantage").review() end,
+  diff = function() require("advantage").review() end,
+  yolo = function() require("advantage").toggle_yolo() end,
+  effort = function(arg) if arg and arg ~= "" then require("advantage").set_effort(arg) else require("advantage").pick_effort() end end,
+  help = function() M.show_help() end,
+  keys = function() M.show_help() end,
+}
+
 local function submit()
   local lines = api.nvim_buf_get_lines(S.input_buf, 0, -1, false)
   local text = vim.trim(table.concat(lines, "\n"))
   if text == "" then return end
-  api.nvim_buf_set_lines(S.input_buf, 0, -1, false, {})
-  input_placeholder()
-  if S.on_submit then S.on_submit(text) end
+
+  local function clear_input()
+    api.nvim_buf_set_lines(S.input_buf, 0, -1, false, {})
+    input_placeholder()
+    update_input_winbar()
+    resize_input()
+  end
+
+  -- slash commands never hit the model
+  local cmd, cmd_arg = text:match("^/(%S+)%s*(.-)%s*$")
+  if cmd and text:sub(1, 1) == "/" then
+    local fn = SLASH[cmd:lower()]
+    clear_input()
+    if fn then
+      vim.cmd.stopinsert()
+      fn(cmd_arg)
+    else
+      M.notify("unknown command: /" .. cmd .. "  (try /usage, /review, /yolo, /effort, /new, /model, /resume, /help)", vim.log.levels.WARN)
+    end
+    return
+  end
+
+  -- only keep attachments whose chip is still present (deleting the chip detaches)
+  local images = {}
+  for _, a in ipairs(S.attachments) do
+    if text:find(chip_for(a), 1, true) then
+      images[#images + 1] = a
+    end
+  end
+  S.attachments = {}
+  clear_input()
+  if S.on_submit then S.on_submit(text, images) end
 end
 
 local function help_lines()
@@ -286,14 +457,39 @@ local function help_lines()
     "  ]]  [[   next/prev turn    g?   this help",
     "",
     "prompt window",
-    "  ⏎        send              ⇧⏎ ⌃j newline",
-    "  ⇥        jump to chat      q    hide panel",
+    "  ⏎        send (queues if a turn is running)",
+    "  ⇧⏎ ⌃j    newline           ⇥    jump to chat",
+    "  @        complete a project file mention",
+    "  ⌃v       paste — attaches clipboard images",
+    "  ⌃u ⌃d    scroll the chat (normal mode)",
+    "",
+    "context",
+    "  @path/to/file        inline a file into the message",
+    "  @file:L10-20         inline exactly those lines",
+    "  [image: …] chips     delete a chip to detach its image",
+    "",
+    "permission card",
+    "  a allow · A always (session) · d deny",
+    "  c        deny with a comment for the agent",
+    "",
+    "slash commands",
+    "  /usage   token dashboard   /new     fresh session",
+    "  /model   switch model      /resume  resume session",
+    "  /review  diff agent edits  /yolo    skip permissions",
+    "  /effort [mode]  tune thinking/reasoning (OpenAI: minimal/low/medium/high; Claude: adaptive/off/low/medium/high)",
     "",
     "commands",
     "  :Advantage            toggle panel",
     "  :Advantage new        fresh session",
     "  :Advantage model      switch model",
     "  :Advantage resume     resume a session",
+    "  :Advantage usage      token dashboard",
+    "  :Advantage review     diff the agent's changes",
+    "  :Advantage yolo       toggle skip-all-permissions",
+    "  :Advantage effort [mode] tune thinking/reasoning level",
+    "  :Advantage add        add current file to the prompt",
+    "  :Advantage files      pick a project file to add",
+    "  :Advantage attach {p} attach an image / mention a file",
     "  :Advantage ask {q}    one-shot prompt",
   }
 end
@@ -301,6 +497,7 @@ end
 local function show_help()
   M.float({ title = "advantage · keys", lines = help_lines(), filetype = "" })
 end
+M.show_help = show_help
 
 local function jump_turn(dir)
   if not util.win_valid(S.win) then return end
@@ -330,6 +527,7 @@ local function ensure_bufs()
   vim.bo[S.buf].bufhidden = "hide"
   vim.bo[S.buf].swapfile = false
   vim.bo[S.buf].filetype = "advantage"
+  vim.bo[S.buf].modifiable = false
   if not pcall(vim.treesitter.start, S.buf, "markdown") then
     vim.bo[S.buf].syntax = "markdown"
   end
@@ -341,8 +539,10 @@ local function ensure_bufs()
   vim.bo[S.input_buf].swapfile = false
   vim.bo[S.input_buf].filetype = "advantage_prompt"
 
-  local function map(buf, mode, lhs, rhs, desc)
-    vim.keymap.set(mode, lhs, rhs, { buffer = buf, silent = true, desc = "advantage: " .. desc })
+  local function map(buf, mode, lhs, rhs, desc, opts)
+    opts = opts or {}
+    opts.buffer, opts.silent, opts.desc = buf, true, "advantage: " .. desc
+    vim.keymap.set(mode, lhs, rhs, opts)
   end
 
   -- chat maps
@@ -357,21 +557,62 @@ local function ensure_bufs()
   map(S.buf, "n", "[[", function() jump_turn(-1) end, "previous turn")
 
   -- prompt maps
-  map(S.input_buf, "i", "<CR>", function() submit() end, "send")
+  map(S.input_buf, "i", "<CR>", function()
+    if vim.fn.pumvisible() == 1 then
+      -- accept the @file completion instead of sending
+      api.nvim_feedkeys(api.nvim_replace_termcodes("<C-y>", true, false, true), "n", false)
+      return
+    end
+    submit()
+  end, "send")
   map(S.input_buf, "n", "<CR>", function() submit() end, "send")
   map(S.input_buf, "i", "<S-CR>", "<CR>", "newline")
   map(S.input_buf, "i", "<C-j>", "<CR>", "newline")
   map(S.input_buf, "n", "<Tab>", focus_chat, "focus chat")
   map(S.input_buf, "n", "q", function() M.close() end, "hide panel")
+  map(S.input_buf, "n", "g?", show_help, "help")
   map(S.input_buf, "n", "<C-c>", function() require("advantage").stop() end, "cancel")
   map(S.input_buf, "i", "<C-c>", function()
     vim.cmd.stopinsert()
     require("advantage").stop()
   end, "cancel")
+  map(S.input_buf, { "n", "i" }, "<C-v>", smart_paste, "paste (image-aware)")
+  map(S.input_buf, "n", "<C-u>", function() scroll_chat("<C-u>") end, "scroll chat up")
+  map(S.input_buf, "n", "<C-d>", function() scroll_chat("<C-d>") end, "scroll chat down")
+
+  -- `@` pops project-file completion for mentions
+  map(S.input_buf, "i", "@", function()
+    vim.schedule(function()
+      if api.nvim_get_current_buf() ~= S.input_buf or not vim.fn.mode():find("i") then return end
+      local files = require("advantage.attach").project_files(400)
+      if #files == 0 then return end
+      local col = api.nvim_win_get_cursor(0)[2]
+      vim.fn.complete(col + 1, files)
+    end)
+    return "@"
+  end, "file mention", { expr = true })
 
   api.nvim_create_autocmd({ "TextChanged", "TextChangedI" }, {
     buffer = S.input_buf,
-    callback = input_placeholder,
+    callback = function()
+      input_placeholder()
+      resize_input()
+    end,
+  })
+
+  -- keep `follow` in sync with where the user actually is in the transcript
+  api.nvim_create_autocmd("CursorMoved", {
+    buffer = S.buf,
+    callback = function()
+      local lc = api.nvim_buf_line_count(S.buf)
+      local cur = api.nvim_win_get_cursor(0)[1]
+      S.follow = cur >= lc - 2
+    end,
+  })
+
+  api.nvim_create_autocmd("VimResized", {
+    group = api.nvim_create_augroup("AdvantageResize", { clear = true }),
+    callback = resize_input,
   })
 end
 
@@ -414,11 +655,12 @@ function M.open(focus)
   opt("winfixheight", true, S.input_win)
   opt("wrap", true, S.input_win)
   opt("fillchars", "eob: ", S.input_win)
-  opt("winbar", "%#AdvBarFaint# ❯ prompt %=%#AdvBarFaint#⏎ send · g? keys ", S.input_win)
+  update_input_winbar()
 
   update_winbar()
   show_welcome()
   input_placeholder()
+  resize_input()
   if focus ~= false then focus_input(true) end
 end
 
@@ -439,22 +681,27 @@ function M.clear()
   ensure_bufs()
   api.nvim_buf_clear_namespace(S.buf, ns, 0, -1)
   api.nvim_buf_clear_namespace(S.buf, ns_extra, 0, -1)
-  api.nvim_buf_set_lines(S.buf, 0, -1, false, {})
+  buf_write(function()
+    api.nvim_buf_set_lines(S.buf, 0, -1, false, {})
+  end)
   S.tools = {}
   S.header_mark, S.meta_mark = nil, nil
   S.think_mark, S.think_start = nil, nil
   S.mode, S.last_kind = nil, nil
   S.usage = { input = 0, output = 0 }
   S.welcome_mark = nil
+  S.follow = true
+  S.queue_count = 0
   show_welcome()
   update_winbar()
 end
 
 -- transcript rendering ------------------------------------------------------
 
-function M.user_message(text)
+function M.user_message(text, images)
   ensure_bufs()
   S.mode, S.last_kind = nil, "user"
+  S.follow = true -- sending a message snaps back to the live end
   local head = "▍ you"
   append({ "", head })
   local row = last_row()
@@ -476,7 +723,34 @@ function M.user_message(text)
     virt_text_pos = "right_align",
   })
   append(vim.split(text, "\n", { plain = true }))
+  -- image chips that aren't already visible in the text
+  for _, img in ipairs(images or {}) do
+    local chip = ("[image: %s]"):format(img.name or "image")
+    if not text:find(chip, 1, true) then
+      append({ "  🖼 " .. (img.name or "image") })
+      local r = last_row()
+      api.nvim_buf_set_extmark(S.buf, ns, r, 0, {
+        end_row = r,
+        end_col = #api.nvim_buf_get_lines(S.buf, r, r + 1, false)[1],
+        hl_group = "AdvMeta",
+      })
+    end
+  end
   autoscroll()
+end
+
+---Queue indicator: `n` messages waiting for the running turn to finish.
+function M.set_queue(n)
+  S.queue_count = n or 0
+  update_winbar()
+end
+
+---Announce a message that was queued behind the running turn.
+function M.queued(n, text)
+  M.set_queue(n)
+  local head = text:gsub("%s+", " ")
+  if #head > 48 then head = head:sub(1, 45) .. "…" end
+  M.notice(("queued #%d — %s"):format(n, head))
 end
 
 function M.begin_assistant(label)
@@ -609,6 +883,11 @@ function M.set_auth(badge)
   end
 end
 
+---Repaint the winbar (e.g. after toggling yolo).
+function M.refresh()
+  update_winbar()
+end
+
 function M.set_model_label(label)
   S.model_label = label
   update_winbar()
@@ -663,19 +942,19 @@ function M.float(opts)
   return win, buf
 end
 
----Permission card. cb("allow"|"always"|"deny"), exactly once.
+---Permission card. cb("allow"|"always"|"deny", comment?), exactly once.
 function M.confirm(preview, cb)
   local done = false
-  local function decide(what)
+  local function decide(what, comment)
     if done then return end
     done = true
-    cb(what)
+    cb(what, comment)
   end
   local win, buf = M.float({
     title = preview.title or "allow?",
     lines = preview.lines or {},
     filetype = preview.filetype,
-    footer = "a allow · A always · d deny",
+    footer = "a allow · A always · d deny · c deny + comment",
   })
   local maps = {
     a = "allow",
@@ -690,6 +969,17 @@ function M.confirm(preview, cb)
       decide(decision)
     end, { buffer = buf, silent = true, nowait = true })
   end
+  -- deny with feedback: claim the decision before closing the float so the
+  -- WinClosed fallback below can't fire a plain deny first
+  vim.keymap.set("n", "c", function()
+    if done then return end
+    done = true
+    if util.win_valid(win) then api.nvim_win_close(win, true) end
+    vim.ui.input({ prompt = "deny — what should the agent do instead? " }, function(input)
+      input = input and vim.trim(input) or ""
+      cb("deny", input ~= "" and input or nil)
+    end)
+  end, { buffer = buf, silent = true, nowait = true })
   api.nvim_create_autocmd("WinClosed", {
     pattern = tostring(win),
     once = true,
@@ -707,10 +997,16 @@ function M.render_transcript(messages, model_label)
   S.model_label = model_label or S.model_label
   for mi, msg in ipairs(messages) do
     if msg.role == "user" then
+      local texts, images = {}, {}
       for _, block in ipairs(msg.content) do
         if block.type == "text" then
-          M.user_message(block.text)
+          texts[#texts + 1] = block.text
+        elseif block.type == "image" then
+          images[#images + 1] = { name = "image" }
         end
+      end
+      if #texts > 0 or #images > 0 then
+        M.user_message(#texts > 0 and table.concat(texts, "\n") or "(image)", images)
       end
     else
       local printed_header = false

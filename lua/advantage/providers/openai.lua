@@ -26,6 +26,16 @@ local function to_input_items(messages)
         else
           items[#items + 1] = { role = "user", content = { { type = "input_text", text = block.text } } }
         end
+      elseif block.type == "image" and block.source and block.source.data then
+        items[#items + 1] = {
+          role = "user",
+          content = {
+            {
+              type = "input_image",
+              image_url = ("data:%s;base64,%s"):format(block.source.media_type or "image/png", block.source.data),
+            },
+          },
+        }
       elseif block.type == "tool_use" then
         items[#items + 1] = {
           type = "function_call",

@@ -53,6 +53,9 @@ function M.new(opts)
   self.turn_open = false
   self.ctx = { cwd = uv.cwd() }
   self.allowed = {} -- per-session "always allow" tool names
+  self.queue = {} -- messages submitted while a turn was running
+  self.snapshots = {} -- abs path -> content before the agent's first touch (false = new file)
+  self.turn_changed = {} -- abs paths changed during the current turn
   return self
 end
 
@@ -64,22 +67,54 @@ function Agent:busy()
   return self.status ~= "idle"
 end
 
----Entry point: user sends a prompt.
-function Agent:send(text)
+---Entry point: user sends a prompt. While a turn is running, messages are
+---queued and dispatched one by one as turns finish.
+---@param opts? {images?: {name:string, media_type:string, data:string}[]}
+function Agent:send(text, opts)
+  opts = opts or {}
   if self:busy() then
-    self:ui().notify("a turn is already running — <C-c> to cancel it first", vim.log.levels.WARN)
+    self.queue[#self.queue + 1] = { text = text, opts = opts }
+    self:ui().queued(#self.queue, text)
     return
   end
   if not self.title then
     self.title = text:gsub("%s+", " "):sub(1, 56)
   end
-  table.insert(self.messages, { role = "user", content = { { type = "text", text = text } } })
-  self:ui().user_message(text)
+
+  -- inline @file mentions; the transcript shows the original text
+  local send_text = require("advantage.attach").expand_mentions(text, self.ctx.cwd)
+  local content = {}
+  for _, img in ipairs(opts.images or {}) do
+    content[#content + 1] = {
+      type = "image",
+      source = { type = "base64", media_type = img.media_type, data = img.data },
+    }
+  end
+  content[#content + 1] = { type = "text", text = send_text }
+
+  table.insert(self.messages, { role = "user", content = content })
+  self:ui().user_message(text, opts.images)
   self.cancelled = false
   self.turn_started = uv.hrtime()
   self.turn_usage = { input = 0, output = 0 }
   self.turn_open = false
+  self.turn_changed = {}
   self:_turn()
+end
+
+local MUTATING = { write_file = true, edit_file = true }
+
+---Remember a file's pre-edit content so `/review` can diff against it.
+function Agent:_snapshot(call)
+  if not MUTATING[call.name] then return end
+  local path = tools.resolve and tools.resolve(call.input and call.input.path, self.ctx)
+  if not path then return end
+  if self.snapshots[path] == nil then
+    local f = io.open(path, "r")
+    self.snapshots[path] = f and f:read("*a") or false
+    if f then f:close() end
+  end
+  return path
 end
 
 function Agent:_turn()
@@ -121,6 +156,7 @@ function Agent:_turn()
         self.turn_usage.input = self.turn_usage.input + inp
         self.turn_usage.output = self.turn_usage.output + out
         ui.set_usage(self.usage)
+        require("advantage.usage").record(self.model, inp, out)
       end,
       complete = function(blocks, stop_reason)
         self.job = nil
@@ -201,10 +237,14 @@ function Agent:_run_tools(calls)
     local function execute()
       ui.set_status("tool", call.name)
       ui.tool_update(call.id, { status = "running" })
+      local touched = self:_snapshot(call)
       local ok, err = pcall(tool.run, call.input, self.ctx, vim.schedule_wrap(function(output, is_error)
         if self.cancelled then return end
         record(call, output, is_error)
         ui.tool_update(call.id, { status = is_error and "error" or "ok" })
+        if touched and not is_error then
+          self.turn_changed[touched] = true
+        end
         run_next()
       end))
       if not ok then
@@ -214,7 +254,7 @@ function Agent:_run_tools(calls)
       end
     end
 
-    if tool.safe or self.allowed[call.name] or cfg.tools.auto_approve[call.name] then
+    if tool.safe or self.allowed[call.name] or cfg.tools.auto_approve[call.name] or cfg.tools.yolo then
       return execute()
     end
 
@@ -222,7 +262,7 @@ function Agent:_run_tools(calls)
       or { title = call.name, lines = vim.split(vim.inspect(call.input), "\n"), filetype = "lua" }
     ui.tool_update(call.id, { status = "waiting" })
     ui.set_status("waiting", call.name)
-    ui.confirm(preview, function(decision)
+    ui.confirm(preview, function(decision, comment)
       if self.cancelled then return end
       if decision == "always" then
         self.allowed[call.name] = true
@@ -230,7 +270,14 @@ function Agent:_run_tools(calls)
       elseif decision == "allow" then
         return execute()
       else
-        record(call, "The user denied this action. Ask before retrying, or take a different approach.", true)
+        local msg = "The user denied this action."
+        if comment and comment ~= "" then
+          msg = msg .. " Their feedback: " .. comment
+          ui.notice("deny → " .. comment)
+        else
+          msg = msg .. " Ask before retrying, or take a different approach."
+        end
+        record(call, msg, true)
         ui.tool_update(call.id, { status = "denied" })
         run_next()
       end
@@ -248,11 +295,32 @@ function Agent:_finish(errored)
   if not errored and config.options.sessions.autosave then
     require("advantage.session").save(self)
   end
+  local changed = vim.tbl_count(self.turn_changed or {})
+  if changed > 0 and not self.cancelled then
+    ui.notice(("%d file%s changed — /review to inspect"):format(changed, changed == 1 and "" or "s"))
+    self.turn_changed = {}
+  end
+  -- dispatch the next queued message, if any
+  if not errored and not self.cancelled and #self.queue > 0 then
+    local nxt = table.remove(self.queue, 1)
+    ui.set_queue(#self.queue)
+    vim.schedule(function()
+      if not self:busy() then
+        self:send(nxt.text, nxt.opts)
+      end
+    end)
+  else
+    ui.set_queue(#self.queue)
+  end
 end
 
 function Agent:cancel()
   if not self:busy() then return end
   self.cancelled = true
+  if #self.queue > 0 then
+    self:ui().notice(("dropped %d queued message%s"):format(#self.queue, #self.queue == 1 and "" or "s"))
+    self.queue = {}
+  end
   if self.job then
     self.job.stop()
     self.job = nil
