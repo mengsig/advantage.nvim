@@ -114,9 +114,7 @@ local function make_handler(on)
     local t = d.type or name
     if t == "response.output_item.added" then
       local item = d.item or {}
-      if item.type == "function_call" then
-        on.tool_start(item.call_id or item.id, item.name)
-      end
+      if item.type == "function_call" then on.tool_start(item.call_id or item.id, item.name) end
     elseif t == "response.output_text.delta" then
       if d.delta and d.delta ~= "" then on.text(d.delta) end
     elseif t == "response.reasoning_summary_text.delta" then
@@ -139,9 +137,7 @@ local function make_handler(on)
         for _, part in ipairs(item.content or {}) do
           if part.type == "output_text" then text[#text + 1] = part.text end
         end
-        if #text > 0 then
-          blocks[#blocks + 1] = { type = "text", text = table.concat(text) }
-        end
+        if #text > 0 then blocks[#blocks + 1] = { type = "text", text = table.concat(text) } end
       elseif item.type == "reasoning" then
         blocks[#blocks + 1] = { type = "openai_reasoning", item = item }
       end
@@ -169,7 +165,9 @@ local function make_handler(on)
     end
   end
 
-  return on_event, function() return completed end
+  return on_event, function()
+    return completed
+  end
 end
 
 M._to_input_items = to_input_items
@@ -178,69 +176,79 @@ M._make_handler = make_handler
 
 function M.stream(req)
   local pcfg = config.options.providers.openai
-  local cancelled, inner = false, nil
+  local cancelled, inner, reauthed = false, nil, false
+  local attempt
 
-  auth.openai(function(cred, autherr)
-    if cancelled then return end
-    if not cred then
-      return req.on.error(autherr)
-    end
-    if req.on.auth then req.on.auth(cred.badge) end
+  attempt = function(force)
+    auth.openai(function(cred, autherr)
+      if cancelled then return end
+      if not cred then return req.on.error(autherr) end
+      if req.on.auth then req.on.auth(cred.badge) end
 
-    local url, headers
-    local otools = to_tools(req.tools)
-    local body = {
-      model = req.model.id,
-      input = to_input_items(req.messages),
-      instructions = req.system,
-      -- omit when empty: Lua can't distinguish {} array from {} object, so an
-      -- empty table would serialize as a JSON object and the Responses API 400s.
-      tools = #otools > 0 and otools or nil,
-      tool_choice = #otools > 0 and "auto" or nil,
-      stream = true,
-      store = false,
-      include = { "reasoning.encrypted_content" },
-      reasoning = {
-        effort = req.model.reasoning_effort or pcfg.reasoning_effort,
-        summary = "auto",
-      },
-    }
-
-    if cred.mode == "chatgpt" then
-      url = "https://chatgpt.com/backend-api/codex/responses"
-      headers = {
-        "content-type: application/json",
-        "accept: text/event-stream",
-        "authorization: Bearer " .. cred.token,
-        "chatgpt-account-id: " .. cred.account_id,
-        "OpenAI-Beta: responses=experimental",
-        "originator: codex_cli_rs",
-        "session_id: " .. uuid(),
+      local url, headers
+      local otools = to_tools(req.tools)
+      local body = {
+        model = req.model.id,
+        input = to_input_items(req.messages),
+        instructions = req.system,
+        -- omit when empty: Lua can't distinguish {} array from {} object, so an
+        -- empty table would serialize as a JSON object and the Responses API 400s.
+        tools = #otools > 0 and otools or nil,
+        tool_choice = #otools > 0 and "auto" or nil,
+        stream = true,
+        store = false,
+        include = { "reasoning.encrypted_content" },
+        reasoning = {
+          effort = req.model.reasoning_effort or pcfg.reasoning_effort,
+          summary = "auto",
+        },
       }
-    else
-      url = pcfg.base_url .. "/v1/responses"
-      headers = {
-        "content-type: application/json",
-        "authorization: Bearer " .. cred.key,
-      }
-      body.max_output_tokens = pcfg.max_output_tokens
-    end
 
-    local on_event, is_completed = make_handler(req.on)
+      if cred.mode == "chatgpt" then
+        url = "https://chatgpt.com/backend-api/codex/responses"
+        headers = {
+          "content-type: application/json",
+          "accept: text/event-stream",
+          "authorization: Bearer " .. cred.token,
+          "chatgpt-account-id: " .. cred.account_id,
+          "OpenAI-Beta: responses=experimental",
+          "originator: codex_cli_rs",
+          "session_id: " .. uuid(),
+        }
+      else
+        url = pcfg.base_url .. "/v1/responses"
+        headers = {
+          "content-type: application/json",
+          "authorization: Bearer " .. cred.key,
+        }
+        body.max_output_tokens = pcfg.max_output_tokens
+      end
 
-    inner = util.request_sse({
-      url = url,
-      headers = headers,
-      body = vim.json.encode(body),
-      on_event = vim.schedule_wrap(on_event),
-      on_error = vim.schedule_wrap(function(msg)
-        if not is_completed() then req.on.error(msg) end
-      end),
-      on_done = vim.schedule_wrap(function()
-        if not is_completed() then req.on.error("stream ended unexpectedly") end
-      end),
-    })
-  end)
+      local on_event, is_completed = make_handler(req.on)
+
+      inner = util.request_sse({
+        url = url,
+        headers = headers,
+        body = vim.json.encode(body),
+        on_event = vim.schedule_wrap(on_event),
+        on_error = vim.schedule_wrap(function(msg, status)
+          if is_completed() then return end
+          -- A mid-flight 401 means the token was rotated/revoked server-side:
+          -- force a fresh token once and retry before surfacing an error.
+          if status == 401 and not reauthed and not cancelled then
+            reauthed = true
+            return attempt(true)
+          end
+          req.on.error(msg)
+        end),
+        on_done = vim.schedule_wrap(function()
+          if not is_completed() then req.on.error("stream ended unexpectedly") end
+        end),
+      })
+    end, force)
+  end
+
+  attempt(false)
 
   return {
     stop = function()

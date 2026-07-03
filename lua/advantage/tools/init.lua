@@ -12,16 +12,36 @@ local MAX_LINE_LEN = 500
 ---Resolve a tool path against the project root and enforce containment: file
 ---tools (including their permission-card previews, which read the target before
 ---approval) must not reach outside ctx.cwd via absolute paths or `..` traversal.
----`tools.allow_outside_root = true` opts out. Lexical containment: a symlink
----already inside the repo can still point out, but planting one requires write
----access the attacker wouldn't need this hole for.
+---`tools.allow_outside_root = true` opts out. Containment is enforced both
+---lexically and by resolving symlinks (realpath), so a symlink committed inside
+---the repo that points outside cannot be used to escape the sandbox.
 ---@return string|nil abs_path, string|nil err
+local function under(root, abs)
+  return abs == root or abs:sub(1, #root + 1) == root .. "/"
+end
+
+---Follow symlinks and verify the resolved path stays under `root`. Handles
+---not-yet-existing paths (e.g. write_file to a new file) by resolving the
+---deepest existing ancestor — the missing tail cannot itself be a symlink.
+local function realpath_contained(abs, root)
+  local real_root = uv.fs_realpath(root)
+  if not real_root then return true end -- root missing: nothing to escape
+  local rp = uv.fs_realpath(abs)
+  if rp then return under(real_root, rp) end
+  local dir = abs
+  while true do
+    dir = dir:match("^(.*)/[^/]+$") or ""
+    if dir == "" then dir = "/" end
+    local rdir = uv.fs_realpath(dir)
+    if rdir then return under(real_root, rdir) end
+    if dir == "/" then return false end
+  end
+end
+
 local function resolve(path, ctx)
   if not path or path == "" then return nil, "empty path" end
   path = vim.fs.normalize(path)
-  if path:sub(1, 1) ~= "/" then
-    path = vim.fs.normalize(ctx.cwd .. "/" .. path)
-  end
+  if path:sub(1, 1) ~= "/" then path = vim.fs.normalize(ctx.cwd .. "/" .. path) end
   -- fold "." and ".." lexically (vim.fs.normalize does not resolve "..")
   local parts = {}
   for comp in path:gmatch("[^/]+") do
@@ -36,9 +56,10 @@ local function resolve(path, ctx)
   local tcfg = require("advantage.config").options.tools or {}
   if tcfg.allow_outside_root then return abs end
   local root = vim.fs.normalize(ctx.cwd)
-  if abs ~= root and abs:sub(1, #root + 1) ~= root .. "/" then
+  if not under(root, abs) then
     return nil, "outside the project root (set tools.allow_outside_root to permit external paths)"
   end
+  if not realpath_contained(abs, root) then return nil, "path resolves (via a symlink) outside the project root" end
   return abs
 end
 
@@ -61,9 +82,7 @@ end
 
 local function truncate(s, limit)
   limit = limit or MAX_OUTPUT
-  if #s > limit then
-    return s:sub(1, limit) .. "\n… [output truncated at " .. limit .. " chars]"
-  end
+  if #s > limit then return s:sub(1, limit) .. "\n… [output truncated at " .. limit .. " chars]" end
   return s
 end
 
@@ -137,16 +156,14 @@ tool({
     },
     required = { "path" },
   },
-  summary = function(input) return input.path or "" end,
+  summary = function(input)
+    return input.path or ""
+  end,
   run = function(input, ctx, cb)
     local path, perr = resolve(input.path, ctx)
-    if not path then
-      return cb(("Cannot read %s: %s"):format(tostring(input.path), perr), true)
-    end
+    if not path then return cb(("Cannot read %s: %s"):format(tostring(input.path), perr), true) end
     local content = read_all(path)
-    if not content then
-      return cb("File not found: " .. tostring(input.path), true)
-    end
+    if not content then return cb("File not found: " .. tostring(input.path), true) end
     local lines = vim.split(content, "\n", { plain = true })
     local offset = math.max(1, input.offset or 1)
     local limit = math.min(input.limit or MAX_LINES, MAX_LINES)
@@ -156,9 +173,7 @@ tool({
       if #line > MAX_LINE_LEN then line = line:sub(1, MAX_LINE_LEN) .. "…" end
       out[#out + 1] = string.format("%6d→%s", i, line)
     end
-    if #out == 0 then
-      return cb("(empty range — file has " .. #lines .. " lines)", false)
-    end
+    if #out == 0 then return cb("(empty range — file has " .. #lines .. " lines)", false) end
     local suffix = ""
     if offset + limit - 1 < #lines then
       suffix = ("\n… %d more lines (use offset=%d)"):format(#lines - (offset + limit - 1), offset + limit)
@@ -181,7 +196,9 @@ tool({
     },
     required = { "path", "content" },
   },
-  summary = function(input) return input.path or "" end,
+  summary = function(input)
+    return input.path or ""
+  end,
   preview = function(input, ctx)
     local path, perr = resolve(input.path, ctx)
     if not path then
@@ -189,11 +206,19 @@ tool({
     end
     local old = read_all(path)
     if old then
-      return { title = "write · " .. input.path, lines = unified_diff(old, input.content, input.path), filetype = "diff" }
+      return {
+        title = "write · " .. input.path,
+        lines = unified_diff(old, input.content, input.path),
+        filetype = "diff",
+      }
     end
     local lines = vim.split(input.content, "\n", { plain = true })
     table.insert(lines, 1, "── new file: " .. input.path .. " ──")
-    return { title = "write · " .. input.path, lines = lines, filetype = vim.filetype.match({ filename = input.path }) or "" }
+    return {
+      title = "write · " .. input.path,
+      lines = lines,
+      filetype = vim.filetype.match({ filename = input.path }) or "",
+    }
   end,
   run = function(input, ctx, cb)
     local path, perr = resolve(input.path, ctx)
@@ -222,7 +247,9 @@ tool({
     },
     required = { "path", "old_string", "new_string" },
   },
-  summary = function(input) return input.path or "" end,
+  summary = function(input)
+    return input.path or ""
+  end,
   preview = function(input, ctx)
     if not input.old_string or input.old_string == "" then
       return { title = "edit · " .. tostring(input.path), lines = { "invalid edit: empty old_string" }, filetype = "" }
@@ -243,19 +270,21 @@ tool({
       return cb("old_string must be a non-empty exact match. Use write_file to create or fully rewrite a file.", true)
     end
     local path, perr = resolve(input.path, ctx)
-    if not path then
-      return cb(("Cannot edit %s: %s"):format(tostring(input.path), perr), true)
-    end
+    if not path then return cb(("Cannot edit %s: %s"):format(tostring(input.path), perr), true) end
     local content = read_all(path)
-    if not content then
-      return cb("File not found: " .. tostring(input.path), true)
-    end
+    if not content then return cb("File not found: " .. tostring(input.path), true) end
     local n = count_plain(content, input.old_string)
     if n == 0 then
       return cb("old_string not found in " .. input.path .. ". Read the file and match the text exactly.", true)
     end
     if n > 1 and not input.replace_all then
-      return cb(("old_string appears %d times in %s. Add surrounding context to make it unique, or set replace_all."):format(n, input.path), true)
+      return cb(
+        ("old_string appears %d times in %s. Add surrounding context to make it unique, or set replace_all."):format(
+          n,
+          input.path
+        ),
+        true
+      )
     end
     local new_content, count = replace_plain(content, input.old_string, input.new_string, input.replace_all)
     local ok, err = write_all(path, new_content)
@@ -270,13 +299,9 @@ tool({
 ---Apply one exact-string edit with edit_file's uniqueness rules.
 ---@return string|nil new_content, string|nil err
 local function apply_edit(content, e)
-  if not e.old_string or e.old_string == "" then
-    return nil, "empty old_string"
-  end
+  if not e.old_string or e.old_string == "" then return nil, "empty old_string" end
   local n = count_plain(content, e.old_string)
-  if n == 0 then
-    return nil, "old_string not found"
-  end
+  if n == 0 then return nil, "old_string not found" end
   if n > 1 and not e.replace_all then
     return nil, ("old_string appears %d times; add surrounding context or set replace_all"):format(n)
   end
@@ -314,18 +339,18 @@ tool({
   preview = function(input, ctx)
     local title = "multi-edit · " .. tostring(input.path)
     local path, perr = resolve(input.path, ctx)
-    if not path then
-      return { title = title, lines = { "⛔ blocked: " .. perr }, filetype = "" }
-    end
+    if not path then return { title = title, lines = { "⛔ blocked: " .. perr }, filetype = "" } end
     local old = read_all(path)
-    if not old then
-      return { title = title, lines = { "file not found" }, filetype = "" }
-    end
+    if not old then return { title = title, lines = { "file not found" }, filetype = "" } end
     local new = old
     for i, e in ipairs(type(input.edits) == "table" and input.edits or {}) do
       local applied, aerr = apply_edit(new, e)
       if not applied then
-        return { title = title, lines = { ("edit %d failed: %s — nothing will be written"):format(i, aerr) }, filetype = "" }
+        return {
+          title = title,
+          lines = { ("edit %d failed: %s — nothing will be written"):format(i, aerr) },
+          filetype = "",
+        }
       end
       new = applied
     end
@@ -333,13 +358,9 @@ tool({
   end,
   run = function(input, ctx, cb)
     local path, perr = resolve(input.path, ctx)
-    if not path then
-      return cb(("Cannot edit %s: %s"):format(tostring(input.path), perr), true)
-    end
+    if not path then return cb(("Cannot edit %s: %s"):format(tostring(input.path), perr), true) end
     local content = read_all(path)
-    if not content then
-      return cb("File not found: " .. tostring(input.path), true)
-    end
+    if not content then return cb("File not found: " .. tostring(input.path), true) end
     local edits = input.edits
     if type(edits) ~= "table" or #edits == 0 then
       return cb("edits must be a non-empty array of {old_string, new_string}", true)
@@ -415,8 +436,12 @@ tool({
       cwd = ctx.cwd,
       stdout_buffered = not stream,
       stderr_buffered = not stream,
-      on_stdout = function(_, data) add_chunk(data) end,
-      on_stderr = function(_, data) add_chunk(data) end,
+      on_stdout = function(_, data)
+        add_chunk(data)
+      end,
+      on_stderr = function(_, data)
+        add_chunk(data)
+      end,
       on_exit = function(_, code)
         vim.schedule(function()
           if finished then return end
@@ -442,11 +467,15 @@ tool({
     end
 
     timer = uv.new_timer()
-    timer:start(timeout, 0, vim.schedule_wrap(function()
-      if finished then return end
-      timed_out = true
-      pcall(vim.fn.jobstop, job)
-    end))
+    timer:start(
+      timeout,
+      0,
+      vim.schedule_wrap(function()
+        if finished then return end
+        timed_out = true
+        pcall(vim.fn.jobstop, job)
+      end)
+    )
 
     return {
       stop = function()
@@ -469,35 +498,31 @@ tool({
     properties = {
       pattern = { type = "string", description = "Regex pattern to search for" },
       path = { type = "string", description = "Directory or file to search (default: project root)" },
-      glob = { type = "string", description = "Filter files, e.g. \"*.lua\"" },
+      glob = { type = "string", description = 'Filter files, e.g. "*.lua"' },
     },
     required = { "pattern" },
   },
-  summary = function(input) return input.pattern or "" end,
+  summary = function(input)
+    return input.pattern or ""
+  end,
   run = function(input, ctx, cb)
     local search_path = "."
     if input.path and input.path ~= "" and input.path ~= "." then
       local p, perr = resolve(input.path, ctx)
-      if not p then
-        return cb(("Cannot search %s: %s"):format(tostring(input.path), perr), true)
-      end
+      if not p then return cb(("Cannot search %s: %s"):format(tostring(input.path), perr), true) end
       search_path = p
     end
     local cmd
     if vim.fn.executable("rg") == 1 then
       cmd = { "rg", "--line-number", "--no-heading", "--color=never", "--max-count=100", "-e", input.pattern }
-      if input.glob then
-        vim.list_extend(cmd, { "--glob", input.glob })
-      end
+      if input.glob then vim.list_extend(cmd, { "--glob", input.glob }) end
       cmd[#cmd + 1] = search_path
     else
       cmd = { "grep", "-rn", "-E", input.pattern, search_path }
     end
     vim.system(cmd, { cwd = ctx.cwd, text = true }, function(res)
       vim.schedule(function()
-        if res.code > 1 then
-          return cb("Search failed: " .. (res.stderr or ""), true)
-        end
+        if res.code > 1 then return cb("Search failed: " .. (res.stderr or ""), true) end
         local out = vim.trim(res.stdout or "")
         cb(out == "" and "No matches." or truncate(out), false)
       end)
@@ -510,7 +535,7 @@ tool({
 tool({
   name = "find_files",
   safe = true,
-  description = "List project files matching a glob pattern, e.g. \"**/*.lua\" or \"src/**\".",
+  description = 'List project files matching a glob pattern, e.g. "**/*.lua" or "src/**".',
   input_schema = {
     type = "object",
     properties = {
@@ -518,7 +543,9 @@ tool({
     },
     required = { "pattern" },
   },
-  summary = function(input) return input.pattern or "" end,
+  summary = function(input)
+    return input.pattern or ""
+  end,
   run = function(input, ctx, cb)
     local cmd, filter_re
     if vim.fn.executable("rg") == 1 then
@@ -566,16 +593,14 @@ tool({
       path = { type = "string", description = "Directory path (default: project root)" },
     },
   },
-  summary = function(input) return input.path or "." end,
+  summary = function(input)
+    return input.path or "."
+  end,
   run = function(input, ctx, cb)
     local path, perr = resolve((input.path and input.path ~= "") and input.path or ".", ctx)
-    if not path then
-      return cb(("Cannot list %s: %s"):format(tostring(input.path), perr), true)
-    end
+    if not path then return cb(("Cannot list %s: %s"):format(tostring(input.path), perr), true) end
     local handle = uv.fs_scandir(path)
-    if not handle then
-      return cb("Not a directory: " .. tostring(input.path), true)
-    end
+    if not handle then return cb("Not a directory: " .. tostring(input.path), true) end
     local dirs, files = {}, {}
     while true do
       local name, t = uv.fs_scandir_next(handle)
@@ -599,13 +624,16 @@ tool({
 tool({
   name = "sub_agent",
   safe = true,
-  description = "Spawn a read-only sub-agent for independent investigation. The sub-agent can read/search/list files and returns a concise report; it cannot edit files.",
+  description = "Spawn a read-only sub-agent for independent investigation. The sub-agent can read/search/list files and returns a concise report; it cannot edit files. Batch several sub_agent calls in a single response to run them concurrently — best for independent questions. Issue them one per turn only when a later investigation depends on an earlier result.",
   input_schema = {
     type = "object",
     properties = {
       prompt = { type = "string", description = "Investigation task for the sub-agent" },
       model = { type = "string", description = "Optional model ref provider/model-id; defaults to the current model" },
-      max_turns = { type = "integer", description = "Maximum sub-agent turns including tool loops (default from config, capped at 12)" },
+      max_turns = {
+        type = "integer",
+        description = "Maximum sub-agent turns including tool loops (default from config, capped at 12)",
+      },
     },
     required = { "prompt" },
   },
@@ -666,7 +694,9 @@ tool({
     end
     table.insert(lines, 1, ("todo %d/%d"):format(done, #items))
     -- show the checklist in the transcript; headless callers just get the cb
-    pcall(function() require("advantage.ui.chat").notice(table.concat(lines, "\n")) end)
+    pcall(function()
+      require("advantage.ui.chat").notice(table.concat(lines, "\n"))
+    end)
     cb(("Todo list updated — %d/%d done."):format(done, #items), false)
   end,
 })
@@ -696,20 +726,40 @@ tool({
   end,
   run = function(input, ctx, cb)
     local memory = require("advantage.memory")
-    if not memory.enabled() then
-      return cb("Memory is disabled (config.memory.enabled = false).", true)
-    end
+    if not memory.enabled() then return cb("Memory is disabled (config.memory.enabled = false).", true) end
     local res = memory.remember(input.fact, input.section)
     if res.status == "empty" then
       return cb("Nothing to remember (empty fact).", true)
+    elseif res.status == "procedural" then
+      return cb(
+        "This reads like a multi-step procedure, not a fact. Procedures cost their full length in every request as memory bullets but only one index line as skills — record it with save_skill instead (or split out the single durable fact).",
+        true
+      )
     elseif res.status == "duplicate" then
       return cb("Already known — a near-identical fact is in memory; not duplicated.", false)
     elseif res.status == "updated" then
       return cb(("Updated the existing fact under %s."):format(res.section), false)
     end
-    local extra = (res.evicted and res.evicted > 0)
-      and (" (evicted %d oldest fact%s to stay within budget)"):format(res.evicted, res.evicted == 1 and "" or "s") or ""
-    cb(("Remembered under %s%s. It is now in your repo memory automatically."):format(res.section, extra), false)
+    local msg = ("Remembered under %s."):format(res.section)
+    if res.evicted and #res.evicted > 0 then
+      local shown = {}
+      for i = 1, math.min(3, #res.evicted) do
+        shown[#shown + 1] = '"' .. res.evicted[i] .. '"'
+      end
+      msg = msg
+        .. (" Memory hit its budget — %d oldest fact%s evicted: %s%s. If any is still valuable, re-record it tighter or fold it into a skill."):format(
+          #res.evicted,
+          #res.evicted == 1 and "" or "s",
+          table.concat(shown, ", "),
+          #res.evicted > 3 and ", …" or ""
+        )
+    elseif res.utilization and res.utilization > 0.85 then
+      msg = msg
+        .. (" Memory is at %d%% of its budget — a curation pass (merge duplicates, extract procedures to skills) is due soon."):format(
+          math.floor(res.utilization * 100 + 0.5)
+        )
+    end
+    cb(msg, false)
   end,
 })
 
@@ -725,15 +775,24 @@ tool({
     },
     required = { "name" },
   },
-  summary = function(input) return input.name or "" end,
+  summary = function(input)
+    return input.name or ""
+  end,
   run = function(input, ctx, cb)
     local memory = require("advantage.memory")
     local body, desc = memory.use_skill(input.name)
     if not body then
       local names = {}
-      for _, s in ipairs(memory.skills_index()) do names[#names + 1] = s.name end
-      return cb(("No skill named %q. Available: %s"):format(
-        tostring(input.name), #names > 0 and table.concat(names, ", ") or "(none)"), true)
+      for _, s in ipairs(memory.skills_index()) do
+        names[#names + 1] = s.name
+      end
+      return cb(
+        ("No skill named %q. Available: %s"):format(
+          tostring(input.name),
+          #names > 0 and table.concat(names, ", ") or "(none)"
+        ),
+        true
+      )
     end
     cb(("Skill: %s — %s\n\n%s"):format(input.name, desc or "", body), false)
   end,
@@ -753,12 +812,12 @@ tool({
     },
     required = { "name", "description", "body" },
   },
-  summary = function(input) return input.name or "" end,
+  summary = function(input)
+    return input.name or ""
+  end,
   run = function(input, ctx, cb)
     local memory = require("advantage.memory")
-    if not memory.enabled() then
-      return cb("Memory is disabled (config.memory.enabled = false).", true)
-    end
+    if not memory.enabled() then return cb("Memory is disabled (config.memory.enabled = false).", true) end
     local ok, err = memory.save_skill(input.name, input.description, input.body)
     if not ok then return cb("Could not save skill: " .. tostring(err), true) end
     cb(("Saved skill %q. It is now in the skills index; load its steps with use_skill."):format(input.name), false)

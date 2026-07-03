@@ -72,9 +72,7 @@ function M.system_prompt()
   if ok and memory.enabled() then
     base = base .. "\n\n" .. MEMORY_GUIDE
     local block = memory.render()
-    if block and block ~= "" then
-      base = base .. "\n\n" .. block
-    end
+    if block and block ~= "" then base = base .. "\n\n" .. block end
   end
   return base
 end
@@ -108,9 +106,11 @@ function M.new(opts)
     memory.reset_session()
     if memory.bootstrap() then
       vim.schedule(function()
-        pcall(require("advantage.ui.chat").notify,
+        pcall(
+          require("advantage.ui.chat").notify,
           "repo memory created (.advantage/context.md) — /context init teaches the agent this repo now",
-          vim.log.levels.INFO)
+          vim.log.levels.INFO
+        )
       end)
     end
   end)
@@ -147,7 +147,10 @@ local function user_content(text, opts, cwd)
     if #hints > 0 then
       local lines = { "", "<repo-skill-hint>" }
       for _, s in ipairs(hints) do
-        lines[#lines + 1] = ("The %q skill may apply here (%s). If relevant, load its steps with use_skill before proceeding."):format(s.name, s.description)
+        lines[#lines + 1] = ("The %q skill may apply here (%s). If relevant, load its steps with use_skill before proceeding."):format(
+          s.name,
+          s.description
+        )
       end
       lines[#lines + 1] = "</repo-skill-hint>"
       send_text = send_text .. table.concat(lines, "\n")
@@ -167,9 +170,7 @@ end
 function Agent:_push_user_message(text, opts, show)
   local content = user_content(text, opts, self.ctx.cwd)
   table.insert(self.messages, { role = "user", content = content })
-  if show ~= false then
-    self:ui().user_message(text, opts and opts.images)
-  end
+  if show ~= false then self:ui().user_message(text, opts and opts.images) end
 end
 
 ---Entry point: user sends a prompt. While a turn is running, `mode = "queued"`
@@ -188,14 +189,10 @@ function Agent:send(text, opts)
     self.interrupts[#self.interrupts + 1] = item
     self:ui().user_message(text, opts.images)
     self:ui().notice("will send before the next tool call")
-    if self.pending_permission then
-      self.pending_permission("interrupt")
-    end
+    if self.pending_permission then self.pending_permission("interrupt") end
     return
   end
-  if not self.title then
-    self.title = text:gsub("%s+", " "):sub(1, 56)
-  end
+  if not self.title then self.title = text:gsub("%s+", " "):sub(1, 56) end
 
   self:_push_user_message(text, opts)
   self.cancelled = false
@@ -225,9 +222,7 @@ function Agent:_drain_interrupts(results, remaining_calls)
   -- mixed "tool_result + text" content array can produce 400s after an
   -- interrupt.  The canonical history therefore becomes:
   --   assistant(tool_use), user(tool_result...), user(actual interruption)
-  if #results > 0 then
-    table.insert(self.messages, { role = "user", content = results })
-  end
+  if #results > 0 then table.insert(self.messages, { role = "user", content = results }) end
   for _, item in ipairs(self.interrupts) do
     table.insert(self.messages, { role = "user", content = item.content })
   end
@@ -271,17 +266,21 @@ function Agent:_maybe_compact(force)
   end
   if info then
     self.messages = next_messages
-    self:ui().notice(("compacted %d old messages (~%s → ~%s tokens)"):format(
-      info.compacted_messages,
-      require("advantage.util").fmt_tokens(info.before_tokens),
-      require("advantage.util").fmt_tokens(info.after_tokens)
-    ))
+    self:ui().notice(
+      ("compacted %d old messages (~%s → ~%s tokens)"):format(
+        info.compacted_messages,
+        require("advantage.util").fmt_tokens(info.before_tokens),
+        require("advantage.util").fmt_tokens(info.after_tokens)
+      )
+    )
   end
   return info
 end
 
 function Agent:_turn()
-  local ok, err = pcall(function() self:_turn_impl() end)
+  local ok, err = pcall(function()
+    self:_turn_impl()
+  end)
   if not ok then
     self.job = nil
     self:ui().notice("error starting turn: " .. tostring(err))
@@ -293,7 +292,9 @@ function Agent:_turn_impl()
   self.ctx.model = self.model
   -- Compaction is best-effort: a failure here must not abort the user's turn,
   -- so fall through to streaming with un-compacted history rather than erroring.
-  pcall(function() self:_maybe_compact(false) end)
+  pcall(function()
+    self:_maybe_compact(false)
+  end)
   -- provider-request count; /usage uses it for the harness savings math
   self.usage.turns = (self.usage.turns or 0) + 1
 
@@ -345,9 +346,7 @@ function Agent:_turn_impl()
       complete = function(blocks, stop_reason)
         self.job = nil
         if self.cancelled then return end
-        if #blocks > 0 then
-          table.insert(self.messages, { role = "assistant", content = blocks })
-        end
+        if #blocks > 0 then table.insert(self.messages, { role = "assistant", content = blocks }) end
         ui.message_meta(self.turn_usage, self.turn_started and (uv.hrtime() - self.turn_started) or nil)
 
         if stop_reason == "tool_use" then
@@ -394,7 +393,9 @@ end
 ---prompts and shares no mutable state, so we launch them together and let their
 ---network round-trips overlap on the event loop instead of running end-to-end
 ---one at a time. Results are collected by position and fed back once all settle.
-function Agent:_run_tools_parallel(calls)
+---`seed` carries tool_results already produced by a sequential prefix of the
+---same batch (e.g. a todo_write ahead of the fan-out); they lead the reply.
+function Agent:_run_tools_parallel(calls, seed)
   local ui = self:ui()
   local results, pending, finished, launching = {}, #calls, false, true
 
@@ -403,6 +404,9 @@ function Agent:_run_tools_parallel(calls)
     finished = true
     if self.cancelled then return end
     local dense = {}
+    for _, r in ipairs(seed or {}) do
+      dense[#dense + 1] = r
+    end
     for i = 1, #calls do
       if results[i] then dense[#dense + 1] = results[i] end
     end
@@ -428,17 +432,22 @@ function Agent:_run_tools_parallel(calls)
       settle("Unknown tool: " .. tostring(call.name), true)
     else
       local done = false
-      local ok, handle = pcall(tool.run, call.input, self.ctx, vim.schedule_wrap(function(output, is_error, meta)
-        if self.cancelled then return end
-        if meta and meta.stream then
-          if ui.tool_output then ui.tool_output(call.id, output or "") end
-          return
-        end
-        if done then return end
-        done = true
-        self.active_tools[call.id] = nil
-        settle(output, is_error)
-      end))
+      local ok, handle = pcall(
+        tool.run,
+        call.input,
+        self.ctx,
+        vim.schedule_wrap(function(output, is_error, meta)
+          if self.cancelled then return end
+          if meta and meta.stream then
+            if ui.tool_output then ui.tool_output(call.id, output or "") end
+            return
+          end
+          if done then return end
+          done = true
+          self.active_tools[call.id] = nil
+          settle(output, is_error)
+        end)
+      )
       if ok and type(handle) == "table" and (handle.stop or handle.kill) then
         self.active_tools[call.id] = handle
       elseif not ok then
@@ -458,15 +467,12 @@ function Agent:_run_tools(calls)
   local ui = self:ui()
   local cfg = config.options
 
-  -- Concurrent fan-out only when every call is a read-only sub_agent; any
-  -- mutating or permission-gated tool keeps the whole batch strictly ordered.
-  if cfg.subagents and cfg.subagents.parallel ~= false and #calls > 1 and #self.interrupts == 0 then
-    local all_subagent = true
-    for _, c in ipairs(calls) do
-      if c.name ~= "sub_agent" then all_subagent = false break end
-    end
-    if all_subagent then return self:_run_tools_parallel(calls) end
-  end
+  -- Read-only sub_agent calls need no permission prompts and share no mutable
+  -- state, so once only sub_agents remain in the batch the rest fan out
+  -- concurrently. Any mutating or permission-gated tools ahead of them (a
+  -- todo_write before the fan-out, say) still run in strict order first;
+  -- run_next hands off to the parallel path at that boundary.
+  local parallel_subagents = cfg.subagents and cfg.subagents.parallel ~= false
 
   local results = {}
 
@@ -500,11 +506,25 @@ function Agent:_run_tools(calls)
       self.turn_open = false
       return self:_turn()
     end
+    if parallel_subagents and #calls - i > 1 then
+      local tail_all_subagent = true
+      for j = i + 1, #calls do
+        if calls[j].name ~= "sub_agent" then
+          tail_all_subagent = false
+          break
+        end
+      end
+      if tail_all_subagent then
+        local tail = {}
+        for j = i + 1, #calls do
+          tail[#tail + 1] = calls[j]
+        end
+        return self:_run_tools_parallel(tail, results)
+      end
+    end
     i = i + 1
     local call = calls[i]
-    if not call then
-      return finish_tools()
-    end
+    if not call then return finish_tools() end
 
     local tool = tools.get(call.name)
     if not tool then
@@ -521,22 +541,25 @@ function Agent:_run_tools(calls)
       ui.tool_update(call.id, { status = "running" })
       local touched = self:_snapshot(call)
       local settled = false
-      local ok, handle_or_err = pcall(tool.run, call.input, self.ctx, vim.schedule_wrap(function(output, is_error, meta)
-        if self.cancelled then return end
-        if meta and meta.stream then
-          if ui.tool_output then ui.tool_output(call.id, output or "") end
-          return
-        end
-        if settled then return end
-        settled = true
-        self.active_tools[call.id] = nil
-        record(call, output, is_error)
-        ui.tool_update(call.id, { status = is_error and "error" or "ok" })
-        if touched and not is_error then
-          self.turn_changed[touched] = true
-        end
-        run_next()
-      end))
+      local ok, handle_or_err = pcall(
+        tool.run,
+        call.input,
+        self.ctx,
+        vim.schedule_wrap(function(output, is_error, meta)
+          if self.cancelled then return end
+          if meta and meta.stream then
+            if ui.tool_output then ui.tool_output(call.id, output or "") end
+            return
+          end
+          if settled then return end
+          settled = true
+          self.active_tools[call.id] = nil
+          record(call, output, is_error)
+          ui.tool_update(call.id, { status = is_error and "error" or "ok" })
+          if touched and not is_error then self.turn_changed[touched] = true end
+          run_next()
+        end)
+      )
       if ok and type(handle_or_err) == "table" and (handle_or_err.stop or handle_or_err.kill) then
         self.active_tools[call.id] = handle_or_err
       end
@@ -582,9 +605,7 @@ function Agent:_run_tools(calls)
         run_next()
       end
     end)
-    if #self.interrupts > 0 and self.pending_permission then
-      self.pending_permission("interrupt")
-    end
+    if #self.interrupts > 0 and self.pending_permission then self.pending_permission("interrupt") end
   end
 
   run_next()
@@ -595,9 +616,7 @@ function Agent:_finish(errored)
   local ui = self:ui()
   ui.finish_turn(self.turn_started and (uv.hrtime() - self.turn_started) or nil)
   ui.set_status("idle")
-  if not errored and config.options.sessions.autosave then
-    require("advantage.session").save(self)
-  end
+  if not errored and config.options.sessions.autosave then require("advantage.session").save(self) end
   local changed = vim.tbl_count(self.turn_changed or {})
   if changed > 0 and not self.cancelled then
     ui.notice(("%d file%s changed — /review to inspect"):format(changed, changed == 1 and "" or "s"))

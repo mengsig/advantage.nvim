@@ -155,19 +155,17 @@ end
 -- winbar / status ---------------------------------------------------------
 
 local function winbar_text()
-  local left = ("%%#AdvBarIcon# %s %%#AdvBarTitle#advantage %%#AdvBarFaint#·%%#AdvBarInfo# %s"):format(ICON, esc_bar(S.model_label))
-  if S.auth_badge then
-    left = left .. (" %%#AdvBarFaint#(%s)"):format(esc_bar(S.auth_badge))
-  end
-  if config.options.tools.yolo then
-    left = left .. " %#AdvBarDanger#⚡ yolo"
-  end
+  local left = ("%%#AdvBarIcon# %s %%#AdvBarTitle#advantage %%#AdvBarFaint#·%%#AdvBarInfo# %s"):format(
+    ICON,
+    esc_bar(S.model_label)
+  )
+  if S.auth_badge then left = left .. (" %%#AdvBarFaint#(%s)"):format(esc_bar(S.auth_badge)) end
+  if config.options.tools.yolo then left = left .. " %#AdvBarDanger#⚡ yolo" end
   local right = ""
-  if S.queue_count > 0 then
-    right = ("%%#AdvBarInfo#⧗ %d queued "):format(S.queue_count)
-  end
+  if S.queue_count > 0 then right = ("%%#AdvBarInfo#⧗ %d queued "):format(S.queue_count) end
   if S.usage.input > 0 or S.usage.output > 0 then
-    right = right .. ("%%#AdvBarInfo#↑%s ↓%s "):format(util.fmt_tokens(S.usage.input), util.fmt_tokens(S.usage.output))
+    right = right
+      .. ("%%#AdvBarInfo#↑%s ↓%s "):format(util.fmt_tokens(S.usage.input), util.fmt_tokens(S.usage.output))
   end
   if S.status == "streaming" then
     right = right .. ("%%#AdvBarBusy#%s streaming "):format(FRAMES[S.spinner])
@@ -180,9 +178,7 @@ local function winbar_text()
 end
 
 local function update_winbar()
-  if util.win_valid(S.win) then
-    opt("winbar", winbar_text(), S.win)
-  end
+  if util.win_valid(S.win) then opt("winbar", winbar_text(), S.win) end
 end
 
 local function tool_line(t)
@@ -196,9 +192,7 @@ local function tool_line(t)
   }
   local icon = icons[t.status or "pending"] or icons.pending
   local text = ("  %s %s"):format(icon[1], one_line(t.name or "?"))
-  if t.detail and t.detail ~= "" then
-    text = text .. "  " .. one_line(t.detail)
-  end
+  if t.detail and t.detail ~= "" then text = text .. "  " .. one_line(t.detail) end
   return text, icon[2]
 end
 
@@ -239,27 +233,29 @@ local function spinner_tick()
   S.spinner = S.spinner % #FRAMES + 1
   update_winbar()
   for id, t in pairs(S.tools) do
-    if t.status == "running" then
-      redraw_tool(id)
-    end
+    if t.status == "running" then redraw_tool(id) end
   end
 end
 
 local function ensure_timer()
   if S.timer then return end
   S.timer = uv.new_timer()
-  S.timer:start(0, 110, vim.schedule_wrap(function()
-    if S.status == "idle" then
-      if S.timer then
-        S.timer:stop()
-        S.timer:close()
-        S.timer = nil
+  S.timer:start(
+    0,
+    110,
+    vim.schedule_wrap(function()
+      if S.status == "idle" then
+        if S.timer then
+          S.timer:stop()
+          S.timer:close()
+          S.timer = nil
+        end
+        update_winbar()
+        return
       end
-      update_winbar()
-      return
-    end
-    spinner_tick()
-  end))
+      spinner_tick()
+    end)
+  )
 end
 
 -- welcome -----------------------------------------------------------------
@@ -313,9 +309,7 @@ local function input_winbar_text()
 end
 
 local function update_input_winbar()
-  if util.win_valid(S.input_win) then
-    opt("winbar", input_winbar_text(), S.input_win)
-  end
+  if util.win_valid(S.input_win) then opt("winbar", input_winbar_text(), S.input_win) end
 end
 
 ---Grow/shrink the prompt window with its content (wrapped display lines).
@@ -329,9 +323,7 @@ local function resize_input()
   local min_h = config.options.ui.input_height
   local max_h = math.max(min_h, math.floor(vim.o.lines * 0.4))
   h = math.min(math.max(h + 1, min_h), max_h) -- +1 for the winbar
-  if api.nvim_win_get_height(S.input_win) ~= h then
-    api.nvim_win_set_height(S.input_win, h)
-  end
+  if api.nvim_win_get_height(S.input_win) ~= h then api.nvim_win_set_height(S.input_win, h) end
 end
 
 ---Scroll the transcript without leaving the prompt.
@@ -352,9 +344,7 @@ local function focus_input(insert)
 end
 
 local function focus_chat()
-  if util.win_valid(S.win) then
-    api.nvim_set_current_win(S.win)
-  end
+  if util.win_valid(S.win) then api.nvim_set_current_win(S.win) end
 end
 
 local function chip_for(item)
@@ -402,9 +392,7 @@ end
 local function smart_paste()
   local attach = require("advantage.attach")
   local img, why = attach.clipboard_image()
-  if img then
-    return M.attach_image(img)
-  end
+  if img then return M.attach_image(img) end
   local text = vim.fn.getreg("+")
   if text == nil or text == "" then text = vim.fn.getreg('"') end
   if text and text ~= "" then
@@ -416,21 +404,55 @@ end
 
 ---Slash commands typed into the prompt (`/usage`, `/new`, …).
 local SLASH = {
-  usage = function() require("advantage").usage() end,
-  compact = function() require("advantage").compact() end,
-  context = function(arg) require("advantage").context(arg) end,
-  memory = function(arg) require("advantage").context(arg) end,
-  new = function() require("advantage").new_session() end,
-  clear = function() require("advantage").new_session() end,
-  model = function() require("advantage").pick_model() end,
-  models = function() require("advantage").pick_model() end,
-  resume = function() require("advantage").resume() end,
-  review = function() require("advantage").review() end,
-  diff = function() require("advantage").review() end,
-  yolo = function() require("advantage").toggle_yolo() end,
-  effort = function(arg) if arg and arg ~= "" then require("advantage").set_effort(arg) else require("advantage").pick_effort() end end,
-  help = function() M.show_help() end,
-  keys = function() M.show_help() end,
+  usage = function()
+    require("advantage").usage()
+  end,
+  compact = function()
+    require("advantage").compact()
+  end,
+  context = function(arg)
+    require("advantage").context(arg)
+  end,
+  memory = function(arg)
+    require("advantage").context(arg)
+  end,
+  new = function()
+    require("advantage").new_session()
+  end,
+  clear = function()
+    require("advantage").new_session()
+  end,
+  model = function()
+    require("advantage").pick_model()
+  end,
+  models = function()
+    require("advantage").pick_model()
+  end,
+  resume = function()
+    require("advantage").resume()
+  end,
+  review = function()
+    require("advantage").review()
+  end,
+  diff = function()
+    require("advantage").review()
+  end,
+  yolo = function()
+    require("advantage").toggle_yolo()
+  end,
+  effort = function(arg)
+    if arg and arg ~= "" then
+      require("advantage").set_effort(arg)
+    else
+      require("advantage").pick_effort()
+    end
+  end,
+  help = function()
+    M.show_help()
+  end,
+  keys = function()
+    M.show_help()
+  end,
 }
 
 local function submit(mode)
@@ -455,7 +477,12 @@ local function submit(mode)
       vim.cmd.stopinsert()
       fn(cmd_arg)
     else
-      M.notify("unknown command: /" .. cmd .. "  (try /usage, /compact, /context, /review, /yolo, /effort, /new, /model, /resume, /help)", vim.log.levels.WARN)
+      M.notify(
+        "unknown command: /"
+          .. cmd
+          .. "  (try /usage, /compact, /context, /review, /yolo, /effort, /new, /model, /resume, /help)",
+        vim.log.levels.WARN
+      )
     end
     return
   end
@@ -463,9 +490,7 @@ local function submit(mode)
   -- only keep attachments whose chip is still present (deleting the chip detaches)
   local images = {}
   for _, a in ipairs(S.attachments) do
-    if text:find(chip_for(a), 1, true) then
-      images[#images + 1] = a
-    end
+    if text:find(chip_for(a), 1, true) then images[#images + 1] = a end
   end
   S.attachments = {}
   clear_input()
@@ -535,16 +560,20 @@ local function jump_turn(dir)
   local target
   if dir > 0 then
     for i = row + 1, #lines do
-      if lines[i]:sub(1, #"▍") == "▍" then target = i break end
+      if lines[i]:sub(1, #"▍") == "▍" then
+        target = i
+        break
+      end
     end
   else
     for i = row - 1, 1, -1 do
-      if lines[i]:sub(1, #"▍") == "▍" then target = i break end
+      if lines[i]:sub(1, #"▍") == "▍" then
+        target = i
+        break
+      end
     end
   end
-  if target then
-    api.nvim_win_set_cursor(S.win, { target, 0 })
-  end
+  if target then api.nvim_win_set_cursor(S.win, { target, 0 }) end
 end
 
 local function ensure_bufs()
@@ -557,9 +586,7 @@ local function ensure_bufs()
   vim.bo[S.buf].swapfile = false
   vim.bo[S.buf].filetype = "advantage"
   vim.bo[S.buf].modifiable = false
-  if not pcall(vim.treesitter.start, S.buf, "markdown") then
-    vim.bo[S.buf].syntax = "markdown"
-  end
+  if not pcall(vim.treesitter.start, S.buf, "markdown") then vim.bo[S.buf].syntax = "markdown" end
 
   S.input_buf = api.nvim_create_buf(false, true)
   api.nvim_buf_set_name(S.input_buf, "advantage://prompt")
@@ -575,15 +602,27 @@ local function ensure_bufs()
   end
 
   -- chat maps
-  map(S.buf, "n", "q", function() M.close() end, "hide panel")
-  map(S.buf, "n", "<Tab>", function() focus_input(false) end, "focus prompt")
+  map(S.buf, "n", "q", function()
+    M.close()
+  end, "hide panel")
+  map(S.buf, "n", "<Tab>", function()
+    focus_input(false)
+  end, "focus prompt")
   for _, key in ipairs({ "i", "a", "o", "I", "A", "O" }) do
-    map(S.buf, "n", key, function() focus_input(true) end, "focus prompt (insert)")
+    map(S.buf, "n", key, function()
+      focus_input(true)
+    end, "focus prompt (insert)")
   end
-  map(S.buf, "n", "<C-c>", function() require("advantage").stop() end, "cancel")
+  map(S.buf, "n", "<C-c>", function()
+    require("advantage").stop()
+  end, "cancel")
   map(S.buf, "n", "g?", show_help, "help")
-  map(S.buf, "n", "]]", function() jump_turn(1) end, "next turn")
-  map(S.buf, "n", "[[", function() jump_turn(-1) end, "previous turn")
+  map(S.buf, "n", "]]", function()
+    jump_turn(1)
+  end, "next turn")
+  map(S.buf, "n", "[[", function()
+    jump_turn(-1)
+  end, "previous turn")
 
   -- prompt maps
   map(S.input_buf, "i", "<CR>", function()
@@ -594,21 +633,33 @@ local function ensure_bufs()
     end
     submit("instant")
   end, "send now")
-  map(S.input_buf, "n", "<CR>", function() submit("instant") end, "send now")
-  map(S.input_buf, { "n", "i" }, "<C-s>", function() submit("queued") end, "queue message")
+  map(S.input_buf, "n", "<CR>", function()
+    submit("instant")
+  end, "send now")
+  map(S.input_buf, { "n", "i" }, "<C-s>", function()
+    submit("queued")
+  end, "queue message")
   map(S.input_buf, "i", "<S-CR>", "<CR>", "newline")
   map(S.input_buf, "i", "<C-j>", "<CR>", "newline")
   map(S.input_buf, "n", "<Tab>", focus_chat, "focus chat")
-  map(S.input_buf, "n", "q", function() M.close() end, "hide panel")
+  map(S.input_buf, "n", "q", function()
+    M.close()
+  end, "hide panel")
   map(S.input_buf, "n", "g?", show_help, "help")
-  map(S.input_buf, "n", "<C-c>", function() require("advantage").stop() end, "cancel")
+  map(S.input_buf, "n", "<C-c>", function()
+    require("advantage").stop()
+  end, "cancel")
   map(S.input_buf, "i", "<C-c>", function()
     vim.cmd.stopinsert()
     require("advantage").stop()
   end, "cancel")
   map(S.input_buf, { "n", "i" }, "<C-v>", smart_paste, "paste (image-aware)")
-  map(S.input_buf, "n", "<C-u>", function() scroll_chat("<C-u>") end, "scroll chat up")
-  map(S.input_buf, "n", "<C-d>", function() scroll_chat("<C-d>") end, "scroll chat down")
+  map(S.input_buf, "n", "<C-u>", function()
+    scroll_chat("<C-u>")
+  end, "scroll chat up")
+  map(S.input_buf, "n", "<C-d>", function()
+    scroll_chat("<C-d>")
+  end, "scroll chat down")
 
   -- `@` pops project-file completion for mentions
   map(S.input_buf, "i", "@", function()
@@ -691,20 +742,31 @@ function M.open(focus)
   show_welcome()
   input_placeholder()
   resize_input()
+  -- Reopening while the agent is still working: restart the spinner we stopped on close.
+  if S.status ~= "idle" then ensure_timer() end
   if focus ~= false then focus_input(true) end
 end
 
 function M.close()
   for _, win in ipairs({ S.input_win, S.win }) do
-    if util.win_valid(win) then
-      pcall(api.nvim_win_close, win, true)
-    end
+    if util.win_valid(win) then pcall(api.nvim_win_close, win, true) end
   end
   S.win, S.input_win = nil, nil
+  -- Stop the spinner timer: it self-stops only on idle, so closing mid-stream
+  -- would otherwise leave it firing every 110ms into a hidden buffer.
+  if S.timer then
+    S.timer:stop()
+    S.timer:close()
+    S.timer = nil
+  end
 end
 
 function M.toggle()
-  if M.is_open() then M.close() else M.open() end
+  if M.is_open() then
+    M.close()
+  else
+    M.open()
+  end
 end
 
 function M.clear()
@@ -893,14 +955,10 @@ function M.message_meta(usage, elapsed_ns)
   local parts = {}
   if usage and (usage.input > 0 or usage.output > 0) then
     local up = ("↑%s ↓%s"):format(util.fmt_tokens(usage.input), util.fmt_tokens(usage.output))
-    if usage.cached and usage.cached > 0 then
-      up = up .. (" (%s cached)"):format(util.fmt_tokens(usage.cached))
-    end
+    if usage.cached and usage.cached > 0 then up = up .. (" (%s cached)"):format(util.fmt_tokens(usage.cached)) end
     parts[#parts + 1] = up
   end
-  if elapsed_ns then
-    parts[#parts + 1] = util.fmt_elapsed(elapsed_ns)
-  end
+  if elapsed_ns then parts[#parts + 1] = util.fmt_elapsed(elapsed_ns) end
   if #parts == 0 then return end
   S.meta_mark = api.nvim_buf_set_extmark(S.buf, ns, pos[1], 0, {
     id = S.meta_mark,
@@ -983,15 +1041,15 @@ function M.float(opts)
   api.nvim_buf_set_lines(buf, 0, -1, false, opts.lines)
   vim.bo[buf].modifiable = false
   vim.bo[buf].bufhidden = "wipe"
-  if opts.filetype and opts.filetype ~= "" then
-    vim.bo[buf].filetype = opts.filetype
-  end
+  if opts.filetype and opts.filetype ~= "" then vim.bo[buf].filetype = opts.filetype end
   local width = 20
   for _, l in ipairs(opts.lines) do
     width = math.max(width, api.nvim_strwidth(l) + 2)
   end
   width = math.min(width, math.floor(vim.o.columns * 0.8))
-  local height = math.min(#opts.lines, math.floor(vim.o.lines * 0.7))
+  -- Clamp to >=1: an empty `lines` (e.g. a permission preview with no body) would
+  -- otherwise ask nvim_open_win for height 0 and throw, dropping the card.
+  local height = math.max(1, math.min(#opts.lines, math.floor(vim.o.lines * 0.7)))
   local win = api.nvim_open_win(buf, true, {
     relative = "editor",
     row = math.floor((vim.o.lines - height) / 2 - 1),
@@ -1059,7 +1117,9 @@ function M.confirm(preview, cb)
     pattern = tostring(win),
     once = true,
     callback = function()
-      vim.schedule(function() decide("deny") end)
+      vim.schedule(function()
+        decide("deny")
+      end)
     end,
   })
   return function(decision, comment)
@@ -1106,9 +1166,7 @@ function M.render_transcript(messages, model_label)
           local nxt = messages[mi + 1]
           if nxt and nxt.role == "user" then
             for _, r in ipairs(nxt.content) do
-              if r.type == "tool_result" and r.tool_use_id == block.id and r.is_error then
-                status = "error"
-              end
+              if r.type == "tool_result" and r.tool_use_id == block.id and r.is_error then status = "error" end
             end
           end
           local def = require("advantage.tools").get(block.name)

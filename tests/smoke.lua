@@ -62,12 +62,24 @@ do
   local got = { text = {}, thinking = {}, tools = {} }
   local final
   local handler = anthropic._make_handler({
-    text = function(t) got.text[#got.text + 1] = t end,
-    thinking = function(t) got.thinking[#got.thinking + 1] = t end,
-    tool_start = function(id, name) got.tools[#got.tools + 1] = { id, name } end,
-    usage = function(i, o) got.usage = { i, o } end,
-    complete = function(blocks, stop, usage) final = { blocks = blocks, stop = stop, usage = usage } end,
-    error = function(msg) got.err = msg end,
+    text = function(t)
+      got.text[#got.text + 1] = t
+    end,
+    thinking = function(t)
+      got.thinking[#got.thinking + 1] = t
+    end,
+    tool_start = function(id, name)
+      got.tools[#got.tools + 1] = { id, name }
+    end,
+    usage = function(i, o)
+      got.usage = { i, o }
+    end,
+    complete = function(blocks, stop, usage)
+      final = { blocks = blocks, stop = stop, usage = usage }
+    end,
+    error = function(msg)
+      got.err = msg
+    end,
   })
   local feed = {
     { type = "message_start", message = { usage = { input_tokens = 12, cache_read_input_tokens = 3 } } },
@@ -89,7 +101,10 @@ do
     handler(ev.type, ev)
   end
   check(final ~= nil and final.stop == "tool_use", "stop_reason propagated")
-  check(final.blocks[1].type == "thinking" and final.blocks[1].signature == "sig", "thinking block with signature preserved")
+  check(
+    final.blocks[1].type == "thinking" and final.blocks[1].signature == "sig",
+    "thinking block with signature preserved"
+  )
   check(final.blocks[2].type == "text" and final.blocks[2].text == "let me check", "text block accumulated")
   check(final.blocks[3].type == "tool_use" and final.blocks[3].input.command == "ls", "tool_use input json assembled")
   check(got.usage[1] == 15 and got.usage[2] == 55, "usage reported")
@@ -115,21 +130,46 @@ do
   local got = { text = {}, tools = {} }
   local final
   local handler = openai._make_handler({
-    text = function(t) got.text[#got.text + 1] = t end,
+    text = function(t)
+      got.text[#got.text + 1] = t
+    end,
     thinking = function() end,
-    tool_start = function(id, name) got.tools[#got.tools + 1] = { id, name } end,
-    usage = function(i, o) got.usage = { i, o } end,
-    complete = function(blocks, stop, usage) final = { blocks = blocks, stop = stop, usage = usage } end,
-    error = function(msg) got.err = msg end,
+    tool_start = function(id, name)
+      got.tools[#got.tools + 1] = { id, name }
+    end,
+    usage = function(i, o)
+      got.usage = { i, o }
+    end,
+    complete = function(blocks, stop, usage)
+      final = { blocks = blocks, stop = stop, usage = usage }
+    end,
+    error = function(msg)
+      got.err = msg
+    end,
   })
   local feed = {
     { type = "response.output_item.added", item = { type = "reasoning", id = "rs_1" } },
     { type = "response.output_item.done", item = { type = "reasoning", id = "rs_1", encrypted_content = "xxx" } },
-    { type = "response.output_item.added", item = { type = "function_call", id = "fc_1", call_id = "call_1", name = "read_file" } },
+    {
+      type = "response.output_item.added",
+      item = { type = "function_call", id = "fc_1", call_id = "call_1", name = "read_file" },
+    },
     { type = "response.function_call_arguments.delta", item_id = "fc_1", delta = '{"path":' },
-    { type = "response.output_item.done", item = { type = "function_call", id = "fc_1", call_id = "call_1", name = "read_file", arguments = '{"path":"a.lua"}' } },
+    {
+      type = "response.output_item.done",
+      item = {
+        type = "function_call",
+        id = "fc_1",
+        call_id = "call_1",
+        name = "read_file",
+        arguments = '{"path":"a.lua"}',
+      },
+    },
     { type = "response.output_text.delta", delta = "on it" },
-    { type = "response.output_item.done", item = { type = "message", content = { { type = "output_text", text = "on it" } } } },
+    {
+      type = "response.output_item.done",
+      item = { type = "message", content = { { type = "output_text", text = "on it" } } },
+    },
     { type = "response.completed", response = { usage = { input_tokens = 9, output_tokens = 21 } } },
   }
   for _, ev in ipairs(feed) do
@@ -143,7 +183,10 @@ do
 
   local items = openai._to_input_items({
     { role = "user", content = { { type = "tool_result", tool_use_id = "missing", content = "orphan" } } },
-    { role = "assistant", content = { { type = "tool_use", id = "call_ok", name = "bash", input = { command = "true" } } } },
+    {
+      role = "assistant",
+      content = { { type = "tool_use", id = "call_ok", name = "bash", input = { command = "true" } } },
+    },
     { role = "user", content = { { type = "tool_result", tool_use_id = "call_ok", content = "ok" } } },
   })
   local outputs = 0
@@ -158,11 +201,23 @@ do
   check(outputs == 1, "openai input only replays matched tool outputs")
 
   items = openai._to_input_items({
-    { role = "user", content = { { type = "text", text = require("advantage.compact")._SUMMARY_PREFIX .. "\nold context" } } },
-    { role = "assistant", content = {
-      { type = "openai_reasoning", item = { type = "reasoning", encrypted_content = "stale" } },
-      { type = "tool_use", id = "call_after", openai_item_id = "fc_stale", name = "read_file", input = { path = "a" } },
-    } },
+    {
+      role = "user",
+      content = { { type = "text", text = require("advantage.compact")._SUMMARY_PREFIX .. "\nold context" } },
+    },
+    {
+      role = "assistant",
+      content = {
+        { type = "openai_reasoning", item = { type = "reasoning", encrypted_content = "stale" } },
+        {
+          type = "tool_use",
+          id = "call_after",
+          openai_item_id = "fc_stale",
+          name = "read_file",
+          input = { path = "a" },
+        },
+      },
+    },
     { role = "user", content = { { type = "tool_result", tool_use_id = "call_after", content = "ok" } } },
   })
   local reasoning, id_leaks = 0, 0
@@ -178,11 +233,23 @@ do
   local compact = require("advantage.compact")
   local reasoned = {
     { role = "user", content = { { type = "text", text = "look" } } },
-    { role = "assistant", content = {
-      { type = "openai_reasoning", item = { type = "reasoning", encrypted_content = "x" } },
-      { type = "tool_use", id = "call_keep2", openai_item_id = "fc_keep", name = "read_file", input = { path = "a" } },
-    } },
-    { role = "user", content = { { type = "tool_result", tool_use_id = "call_keep2", content = string.rep("r ", 100) } } },
+    {
+      role = "assistant",
+      content = {
+        { type = "openai_reasoning", item = { type = "reasoning", encrypted_content = "x" } },
+        {
+          type = "tool_use",
+          id = "call_keep2",
+          openai_item_id = "fc_keep",
+          name = "read_file",
+          input = { path = "a" },
+        },
+      },
+    },
+    {
+      role = "user",
+      content = { { type = "tool_result", tool_use_id = "call_keep2", content = string.rep("r ", 100) } },
+    },
     { role = "assistant", content = { { type = "text", text = string.rep("done ", 100) } } },
   }
   local reasoned_out = select(1, compact.force(reasoned, { keep_recent_messages = 2, summary_max_chars = 1000 }))
@@ -211,7 +278,9 @@ do
     tools.get(name).run(input, ctx, function(out, err)
       result, is_err, done = out, err, true
     end)
-    vim.wait(5000, function() return done end, 10)
+    vim.wait(5000, function()
+      return done
+    end, 10)
     return result, is_err
   end
 
@@ -242,20 +311,25 @@ do
 
   _, err = run("edit_file", { path = "x/hello.txt", old_string = "", new_string = "x", replace_all = true })
   check(err == true, "edit_file rejects empty old_string (no freeze)")
-  local p2 = tools.get("edit_file").preview({ path = "x/hello.txt", old_string = "", new_string = "x", replace_all = true }, ctx)
+  local p2 =
+    tools.get("edit_file").preview({ path = "x/hello.txt", old_string = "", new_string = "x", replace_all = true }, ctx)
   check(p2.lines[1]:find("invalid edit") ~= nil, "edit preview rejects empty old_string (no freeze)")
   -- optional streaming bash output reports partial chunks before the final result
   local streams = {}
   done, result, is_err = false, nil, nil
-  local h = tools.get("bash").run({ command = "printf one; sleep 0.05; printf two", stream = true }, ctx, function(out, err, meta)
-    if meta and meta.stream then
-      streams[#streams + 1] = out
-    else
-      result, is_err, done = out, err, true
-    end
-  end)
+  local h = tools
+    .get("bash")
+    .run({ command = "printf one; sleep 0.05; printf two", stream = true }, ctx, function(out, err, meta)
+      if meta and meta.stream then
+        streams[#streams + 1] = out
+      else
+        result, is_err, done = out, err, true
+      end
+    end)
   check(type(h) == "table" and h.stop ~= nil, "bash returns a cancellable handle")
-  vim.wait(5000, function() return done end, 10)
+  vim.wait(5000, function()
+    return done
+  end, 10)
   check(#streams >= 1 and result:find("one") and result:find("two") and not is_err, "bash can stream partial output")
 
   -- cancellation stops a running command and reports an error final result
@@ -264,7 +338,9 @@ do
     result, is_err, done = out, err, true
   end)
   h.stop()
-  vim.wait(5000, function() return done end, 10)
+  vim.wait(5000, function()
+    return done
+  end, 10)
   check(is_err == true and result:find("cancelled", 1, true), "bash cancellation stops the command")
 end
 
@@ -279,8 +355,8 @@ do
   local counter = dir .. "/n"
   vim.fn.writefile({
     "#!/usr/bin/env bash",
-    ('n=$(cat %q 2>/dev/null || echo 0)'):format(counter),
-    ('echo $((n+1)) > %q'):format(counter),
+    ("n=$(cat %q 2>/dev/null || echo 0)"):format(counter),
+    ("echo $((n+1)) > %q"):format(counter),
     "if [ \"$n\" -lt 2 ]; then echo 'curl: (52) Empty reply from server' >&2; exit 52; fi",
     "exit 0",
   }, dir .. "/curl")
@@ -294,12 +370,21 @@ do
     headers = {},
     body = "{}",
     max_attempts = 3,
-    on_retry = function() retries = retries + 1 end,
+    on_retry = function()
+      retries = retries + 1
+    end,
     on_event = function() end,
-    on_error = function() errored = true; done = true end,
-    on_done = function() done = true end,
+    on_error = function()
+      errored = true
+      done = true
+    end,
+    on_done = function()
+      done = true
+    end,
   })
-  vim.wait(5000, function() return done end, 10)
+  vim.wait(5000, function()
+    return done
+  end, 10)
   vim.env.PATH = old_path
   check(retries == 2 and not errored, "transient curl failures retried until success")
 end
@@ -311,9 +396,13 @@ do
   local compact = require("advantage.compact")
   local messages = {}
   for i = 1, 24 do
-    messages[#messages + 1] = { role = i % 2 == 0 and "assistant" or "user", content = { { type = "text", text = ("message %02d "):format(i) .. string.rep("x", 120) } } }
+    messages[#messages + 1] = {
+      role = i % 2 == 0 and "assistant" or "user",
+      content = { { type = "text", text = ("message %02d "):format(i) .. string.rep("x", 120) } },
+    }
   end
-  local out, info = compact.compact(messages, { compact_at_tokens = 100, keep_recent_messages = 6, summary_max_chars = 2000 })
+  local out, info =
+    compact.compact(messages, { compact_at_tokens = 100, keep_recent_messages = 6, summary_max_chars = 2000 })
   check(info and info.compacted_messages == 18, "compacts old messages when threshold is crossed")
   check(out[1].content[1].text:find(compact._SUMMARY_PREFIX, 1, true), "summary prepended")
   check(out[#out].content[1].text:find("message 24", 1, true), "recent messages kept verbatim")
@@ -337,26 +426,41 @@ do
     { role = "user", content = "legacy string content" },
   }
   for i = 1, 8 do
-    odd[#odd + 1] = { role = i % 2 == 0 and "assistant" or "user", content = { { type = "text", text = "recent " .. i } } }
+    odd[#odd + 1] =
+      { role = i % 2 == 0 and "assistant" or "user", content = { { type = "text", text = "recent " .. i } } }
   end
   local paired = {
     { role = "user", content = { { type = "text", text = "please inspect" } } },
-    { role = "assistant", content = { { type = "tool_use", id = "call_keep", name = "read_file", input = { path = "a" } } } },
-    { role = "user", content = { { type = "tool_result", tool_use_id = "call_keep", content = string.rep("result ", 100) } } },
-    { role = "assistant", content = {
-      { type = "openai_reasoning", item = { type = "reasoning", encrypted_content = "stale" } },
-      { type = "text", text = string.rep("final ", 100) },
-    } },
+    {
+      role = "assistant",
+      content = { { type = "tool_use", id = "call_keep", name = "read_file", input = { path = "a" } } },
+    },
+    {
+      role = "user",
+      content = { { type = "tool_result", tool_use_id = "call_keep", content = string.rep("result ", 100) } },
+    },
+    {
+      role = "assistant",
+      content = {
+        { type = "openai_reasoning", item = { type = "reasoning", encrypted_content = "stale" } },
+        { type = "text", text = string.rep("final ", 100) },
+      },
+    },
   }
   local paired_out = select(1, compact.force(paired, { keep_recent_messages = 2, summary_max_chars = 1000 }))
-  check(#paired_out == 4 and paired_out[2].content[1].type == "tool_use",
-    "compact does not orphan a recent tool_result from its tool_use")
+  check(
+    #paired_out == 4 and paired_out[2].content[1].type == "tool_use",
+    "compact does not orphan a recent tool_result from its tool_use"
+  )
   check(paired_out[4].content[1].type == "text", "compact strips stale OpenAI reasoning from retained messages")
 
   local ok_odd, odd_out = pcall(function()
     return compact.force(odd, { keep_recent_messages = 4, summary_max_chars = 2000 })
   end)
-  check(ok_odd and odd_out and odd_out[1].content[1].text:find("legacy raw message", 1, true), "compact tolerates legacy/malformed message shapes")
+  check(
+    ok_odd and odd_out and odd_out[1].content[1].text:find("legacy raw message", 1, true),
+    "compact tolerates legacy/malformed message shapes"
+  )
 
   -- Truncating the summary must not split a multi-byte UTF-8 character, or the
   -- provider rejects the request body ("str is not valid UTF-8").
@@ -364,14 +468,14 @@ do
   for i = 1, 12 do
     -- Each 4-byte emoji block exceeds the 900-byte per-line trim, forcing a cut
     -- at byte 899 which lands in the middle of a multi-byte character.
-    emoji[#emoji + 1] = { role = i % 2 == 0 and "assistant" or "user", content = { { type = "text", text = string.rep("🎉", 300) } } }
+    emoji[#emoji + 1] =
+      { role = i % 2 == 0 and "assistant" or "user", content = { { type = "text", text = string.rep("🎉", 300) } } }
   end
   local emoji_out = select(1, compact.force(emoji, { keep_recent_messages = 4, summary_max_chars = 20000 }))
   local summary_text = emoji_out[1].content[1].text
   -- json_encode rejects invalid UTF-8 exactly like the provider request does, so
   -- a clean encode proves the summary was truncated on a character boundary.
-  check(pcall(vim.fn.json_encode, summary_text),
-    "compact truncates the summary on a UTF-8 character boundary")
+  check(pcall(vim.fn.json_encode, summary_text), "compact truncates the summary on a UTF-8 character boundary")
 end
 
 -- 4b. sub-agent tool -------------------------------------------------------------
@@ -417,7 +521,9 @@ do
   }, function(out, is_err)
     result, err, done = out, is_err, true
   end)
-  vim.wait(5000, function() return done end, 10)
+  vim.wait(5000, function()
+    return done
+  end, 10)
   check(turn == 2 and saw_tool_result, "sub-agent can use read-only tools in its own loop")
   check(err == false and result:find("subagent evidence", 1, true), "sub-agent returns final report")
 end
@@ -519,9 +625,13 @@ do
   local msgs = sessions[1].messages
   check(#msgs == 4, "conversation has 4 messages")
   check(msgs[2].content[2].type == "tool_use", "assistant tool_use recorded")
-  check(msgs[3].content[1].type == "tool_result" and msgs[3].content[1].content:find("agent%-was%-here") ~= nil,
-    "tool_result captured bash output")
-  local public_ok = pcall(function() adv.compact() end)
+  check(
+    msgs[3].content[1].type == "tool_result" and msgs[3].content[1].content:find("agent%-was%-here") ~= nil,
+    "tool_result captured bash output"
+  )
+  local public_ok = pcall(function()
+    adv.compact()
+  end)
   check(public_ok, "public /compact command does not error on a small idle conversation")
 end
 
@@ -537,14 +647,17 @@ do
 
   vim.wait(8000, function()
     local text = table.concat(vim.api.nvim_buf_get_lines(ui.state.buf, 0, -1, false), "\n")
-    return ui.state.status == "idle" and ui.state.queue_count == 0
+    return ui.state.status == "idle"
+      and ui.state.queue_count == 0
       and text:find("▍ you", text:find("second queued test", 1, true) or 1, true) ~= nil
   end, 25)
 
   local text = table.concat(vim.api.nvim_buf_get_lines(ui.state.buf, 0, -1, false), "\n")
   check(text:find("queued #1", 1, true) ~= nil, "queue notice rendered")
-  check(text:find("first queued test", 1, true) ~= nil and text:find("second queued test", 1, true) ~= nil,
-    "queued message dispatched after the running turn")
+  check(
+    text:find("first queued test", 1, true) ~= nil and text:find("second queued test", 1, true) ~= nil,
+    "queued message dispatched after the running turn"
+  )
   check(ui.state.queue_count == 0, "queue drained")
 end
 
@@ -574,22 +687,38 @@ do
           on.complete({ { type = "text", text = "Adjusted before running the tool." } }, "end_turn")
         end
       end, turn == 1 and 30 or 10)
-      return { stop = function() stopped = true end }
+      return {
+        stop = function()
+          stopped = true
+        end,
+      }
     end,
   })
 
   local ag = agent_mod.new({ model = { provider = "fakeinterrupt", id = "m", label = "m" } })
   ag:send("first")
-  vim.defer_fn(function() ag:send("second before tool") end, 5)
-  vim.wait(8000, function() return turn >= 2 and ui.state.status == "idle" end, 25)
+  vim.defer_fn(function()
+    ag:send("second before tool")
+  end, 5)
+  vim.wait(8000, function()
+    return turn >= 2 and ui.state.status == "idle"
+  end, 25)
 
   check(stopped == false, "enter while running does not cancel the stream")
   check(turn == 2, "interrupt triggered a follow-up model turn")
   check(seen and seen[3] and seen[3].role == "user", "interrupt inserted tool-result turn before follow-up")
-  check(seen and seen[3] and seen[3].content[1].type == "tool_result" and seen[3].content[1].is_error == true,
-    "pending tool was skipped with a tool_result")
-  check(seen and seen[4] and seen[4].role == "user" and seen[4].content[1].type == "text" and seen[4].content[1].text:find("second before tool", 1, true),
-    "interrupt text sent as its own user turn")
+  check(
+    seen and seen[3] and seen[3].content[1].type == "tool_result" and seen[3].content[1].is_error == true,
+    "pending tool was skipped with a tool_result"
+  )
+  check(
+    seen
+      and seen[4]
+      and seen[4].role == "user"
+      and seen[4].content[1].type == "text"
+      and seen[4].content[1].text:find("second before tool", 1, true),
+    "interrupt text sent as its own user turn"
+  )
 
   require("advantage.config").options.tools.auto_approve = {}
   local wait_turn, wait_seen = 0, nil
@@ -614,13 +743,21 @@ do
   })
   local ag_wait = agent_mod.new({ model = { provider = "fakewaitinterrupt", id = "m", label = "m" } })
   ag_wait:send("needs permission")
-  vim.wait(8000, function() return ui.state.status == "waiting" end, 25)
+  vim.wait(8000, function()
+    return ui.state.status == "waiting"
+  end, 25)
   ag_wait:send("interrupt permission")
-  vim.wait(8000, function() return wait_turn >= 2 and ui.state.status == "idle" end, 25)
+  vim.wait(8000, function()
+    return wait_turn >= 2 and ui.state.status == "idle"
+  end, 25)
   check(wait_turn == 2, "enter while permission is waiting skips the pending tool")
-  check(wait_seen and wait_seen[3] and wait_seen[3].content[1].type == "tool_result"
+  check(
+    wait_seen
+      and wait_seen[3]
+      and wait_seen[3].content[1].type == "tool_result"
       and wait_seen[3].content[1].content:find("Tool skipped", 1, true),
-    "permission interrupt sends skipped tool_result")
+    "permission interrupt sends skipped tool_result"
+  )
 end
 
 -- 8. ui regressions ---------------------------------------------------------------
@@ -679,10 +816,27 @@ do
   check(rexp:find("L2-4", 1, true) ~= nil and rexp:find("of 5 lines", 1, true) ~= nil, "range + total in fence header")
 
   local clamped = select(1, attach.expand_mentions("see @ranged.txt:L4-99", tmp))
-  check(clamped:find("four\nfive", 1, true) ~= nil and clamped:find("L4-5", 1, true) ~= nil, "range clamped to file length")
+  check(
+    clamped:find("four\nfive", 1, true) ~= nil and clamped:find("L4-5", 1, true) ~= nil,
+    "range clamped to file length"
+  )
 
   local listed = attach.project_files(50)
   check(type(listed) == "table" and #listed > 0, "project files listed for @completion")
+
+  -- mentions must respect the sandbox: absolute / .. escapes are not inlined
+  local config = require("advantage.config")
+  local parent = vim.fs.dirname(tmp)
+  vim.fn.writefile({ "outside-mention-secret" }, parent .. "/msecret.txt")
+  local esc, efiles = attach.expand_mentions("check @../msecret.txt now", tmp)
+  check(#efiles == 0 and not esc:find("outside-mention-secret", 1, true), "@mention traversal is blocked")
+  config.options.tools.allow_outside_root = true
+  local esc2, efiles2 = attach.expand_mentions("check @../msecret.txt now", tmp)
+  check(
+    #efiles2 == 1 and esc2:find("outside-mention-secret", 1, true),
+    "@mention traversal allowed under allow_outside_root"
+  )
+  config.options.tools.allow_outside_root = false
 end
 
 -- 10. usage ledger + dashboard ------------------------------------------------------
@@ -751,15 +905,19 @@ do
   local ag = agent_mod.new({ model = { provider = "fakeyolo", id = "m", label = "m" } })
   ag.ctx.cwd = tmp -- targets live in tmp; containment scopes tools to ctx.cwd
   ag:send("write it")
-  vim.wait(5000, function() return ag.status == "idle" end, 10)
+  vim.wait(5000, function()
+    return ag.status == "idle"
+  end, 10)
   check(not confirm_called, "yolo skips the permission card")
   check(vim.fn.filereadable(tmp .. "/yolo.txt") == 1, "tool executed under yolo")
   check(ag.snapshots[vim.fs.normalize(tmp .. "/yolo.txt")] == false, "new-file snapshot recorded")
   config.options.tools.yolo = false
 
   local items = require("advantage.review")._changes(ag)
-  check(#items == 1 and items[1].new and items[1].after:find("yolo file", 1, true) ~= nil,
-    "review collects the agent's change")
+  check(
+    #items == 1 and items[1].new and items[1].after:find("yolo file", 1, true) ~= nil,
+    "review collects the agent's change"
+  )
 
   -- deny with comment: feedback must reach the tool_result
   providers.register("fakedeny", file_writer(tmp .. "/deny.txt"))
@@ -769,14 +927,19 @@ do
   local ag2 = agent_mod.new({ model = { provider = "fakedeny", id = "m", label = "m" } })
   ag2.ctx.cwd = tmp
   ag2:send("write it")
-  vim.wait(5000, function() return ag2.status == "idle" end, 10)
+  vim.wait(5000, function()
+    return ag2.status == "idle"
+  end, 10)
   chat.confirm = orig_confirm
   check(vim.fn.filereadable(tmp .. "/deny.txt") == 0, "denied tool did not run")
   local forwarded = false
   for _, msg in ipairs(ag2.messages) do
     for _, b in ipairs(msg.content) do
-      if b.type == "tool_result" and type(b.content) == "string"
-        and b.content:find("use a different name", 1, true) then
+      if
+        b.type == "tool_result"
+        and type(b.content) == "string"
+        and b.content:find("use a different name", 1, true)
+      then
         forwarded = true
       end
     end
@@ -803,19 +966,35 @@ do
   memory.remember("Run tests with nvim -l tests/smoke.lua", "Commands")
 
   local block = memory.render()
-  check(block:find("SSE parser", 1, true) and block:find("nvim -l tests/smoke.lua", 1, true),
-    "learned facts render into the system-prompt block")
+  check(
+    block:find("SSE parser", 1, true) and block:find("nvim -l tests/smoke.lua", 1, true),
+    "learned facts render into the system-prompt block"
+  )
 
   -- skills: index always known, body only on demand
-  check(memory.save_skill("run-tests", "How to run the offline test suite",
-    "1. Run `nvim -l tests/smoke.lua`\n2. Every check must print ok"), "save_skill writes a skill")
+  check(
+    memory.save_skill(
+      "run-tests",
+      "How to run the offline test suite",
+      "1. Run `nvim -l tests/smoke.lua`\n2. Every check must print ok"
+    ),
+    "save_skill writes a skill"
+  )
   local in_index = false
-  for _, s in ipairs(memory.skills_index()) do if s.name == "run-tests" then in_index = true end end
+  for _, s in ipairs(memory.skills_index()) do
+    if s.name == "run-tests" then in_index = true end
+  end
   check(in_index, "skill appears in the index")
   local body, desc = memory.use_skill("run-tests")
-  check(body and body:find("smoke.lua", 1, true) and desc:find("offline", 1, true), "use_skill loads the full body on demand")
+  check(
+    body and body:find("smoke.lua", 1, true) and desc:find("offline", 1, true),
+    "use_skill loads the full body on demand"
+  )
   check(memory.render():find("run-tests:", 1, true) ~= nil, "skill index (name: description) is injected")
-  check(memory.render():find("Every check must print ok", 1, true) == nil, "skill BODY stays out of the always-on context")
+  check(
+    memory.render():find("Every check must print ok", 1, true) == nil,
+    "skill BODY stays out of the always-on context"
+  )
 
   -- verify: flag facts whose path anchor is gone, keep ones that resolve
   vim.fn.writefile({ "x" }, tmp .. "/real_file.lua")
@@ -830,7 +1009,9 @@ do
 
   -- budget: learned block can never bloat context
   config.options.memory.budget_tokens = 30
-  for i = 1, 12 do memory.remember(("Filler note %d about widget subsystem alpha beta gamma"):format(i), "Notes") end
+  for i = 1, 12 do
+    memory.remember(("Filler note %d about widget subsystem alpha beta gamma"):format(i), "Notes")
+  end
   check(#memory.render() < 3000, "token budget keeps the learned block bounded")
 
   -- forget (curation)
@@ -843,7 +1024,9 @@ do
   check(memory.render() == "", "disabled memory injects nothing")
   check(#require("advantage.tools").schemas() > 0, "tool schemas still present with memory off")
   local names = {}
-  for _, t in ipairs(require("advantage.tools").schemas()) do names[t.name] = true end
+  for _, t in ipairs(require("advantage.tools").schemas()) do
+    names[t.name] = true
+  end
   check(not names.remember, "memory tools are hidden from the schema when disabled")
   config.options.memory.enabled = true
   memory._root_override = MEMTMP
@@ -886,7 +1069,9 @@ do
           for _, m in ipairs(req.messages) do
             if m.role == "user" then
               local trs = {}
-              for _, b in ipairs(m.content) do if b.type == "tool_result" then trs[#trs + 1] = b end end
+              for _, b in ipairs(m.content) do
+                if b.type == "tool_result" then trs[#trs + 1] = b end
+              end
               if #trs == 3 then final_results = trs end
             end
           end
@@ -899,14 +1084,77 @@ do
 
   local ag = agent_mod.new({ model = { provider = "fakepar", id = "m", label = "par" } })
   ag:send("fan out")
-  vim.wait(6000, function() return pturn >= 2 and final_results ~= nil end, 10)
+  vim.wait(6000, function()
+    return pturn >= 2 and final_results ~= nil
+  end, 10)
 
   check(sub_started == 3, "all three sub-agents ran")
   check(max_concurrent >= 2, "sub-agents overlapped instead of running one-at-a-time")
   check(final_results and #final_results == 3, "three tool_results merged into one user turn")
   local ids = {}
-  for _, tr in ipairs(final_results or {}) do ids[tr.tool_use_id] = true end
+  for _, tr in ipairs(final_results or {}) do
+    ids[tr.tool_use_id] = true
+  end
   check(ids.s1 and ids.s2 and ids.s3, "each sub_agent call got its matching tool_result")
+
+  -- mixed batch: a leading todo_write must not demote the trailing sub_agents
+  -- to one-at-a-time (plan first, then fan out — the canonical agent pattern)
+  sub_started, concurrent, max_concurrent = 0, 0, 0
+  local mturn, mixed_results = 0, nil
+  providers.register("fakemix", {
+    stream = function(req)
+      mturn = mturn + 1
+      vim.defer_fn(function()
+        if mturn == 1 then
+          req.on.complete({
+            {
+              type = "tool_use",
+              id = "t0",
+              name = "todo_write",
+              input = {
+                items = {
+                  { content = "plan", status = "in_progress" },
+                  { content = "fan out", status = "pending" },
+                },
+              },
+            },
+            { type = "tool_use", id = "m1", name = "sub_agent", input = { prompt = "delta", model = "fakesubpar/m" } },
+            {
+              type = "tool_use",
+              id = "m2",
+              name = "sub_agent",
+              input = { prompt = "epsilon", model = "fakesubpar/m" },
+            },
+          }, "tool_use")
+        else
+          for _, m in ipairs(req.messages) do
+            if m.role == "user" then
+              local trs = {}
+              for _, b in ipairs(m.content) do
+                if b.type == "tool_result" then trs[#trs + 1] = b end
+              end
+              if #trs == 3 then mixed_results = trs end
+            end
+          end
+          req.on.complete({ { type = "text", text = "mixed done" } }, "end_turn")
+        end
+      end, 10)
+      return { stop = function() end }
+    end,
+  })
+
+  local ag2 = agent_mod.new({ model = { provider = "fakemix", id = "m", label = "mix" } })
+  ag2:send("plan then fan out")
+  vim.wait(6000, function()
+    return mturn >= 2 and mixed_results ~= nil
+  end, 10)
+
+  check(sub_started == 2, "mixed batch: both trailing sub-agents ran")
+  check(max_concurrent >= 2, "mixed batch: sub-agents after todo_write still overlap")
+  check(
+    mixed_results ~= nil and #mixed_results == 3 and mixed_results[1].tool_use_id == "t0",
+    "mixed batch: todo_write result leads the merged reply, fan-out results follow"
+  )
 end
 
 -- 14. cache-aware usage reporting ---------------------------------------------
@@ -929,19 +1177,25 @@ do
   local compact = require("advantage.compact")
   local msgs = {}
   for i = 1, 30 do
-    msgs[#msgs + 1] = { role = i % 2 == 0 and "assistant" or "user",
-      content = { { type = "text", text = ("OLDEST-MARKER-%02d "):format(i) .. string.rep("y", 200) } } }
+    msgs[#msgs + 1] = {
+      role = i % 2 == 0 and "assistant" or "user",
+      content = { { type = "text", text = ("OLDEST-MARKER-%02d "):format(i) .. string.rep("y", 200) } },
+    }
   end
   local once = select(1, compact.force(msgs, { keep_recent_messages = 4, summary_max_chars = 4000 }))
   check(once[1].content[1].text:find("OLDEST-MARKER-01", 1, true) ~= nil, "first compaction keeps the oldest marker")
   -- age in more turns and compact again; the oldest marker must survive
   for i = 31, 50 do
-    once[#once + 1] = { role = i % 2 == 0 and "assistant" or "user",
-      content = { { type = "text", text = ("NEW-%02d "):format(i) .. string.rep("z", 200) } } }
+    once[#once + 1] = {
+      role = i % 2 == 0 and "assistant" or "user",
+      content = { { type = "text", text = ("NEW-%02d "):format(i) .. string.rep("z", 200) } },
+    }
   end
   local twice = select(1, compact.force(once, { keep_recent_messages = 4, summary_max_chars = 4000 }))
-  check(twice[1].content[1].text:find("OLDEST-MARKER-01", 1, true) ~= nil,
-    "second compaction still preserves the oldest history (no destructive re-truncation)")
+  check(
+    twice[1].content[1].text:find("OLDEST-MARKER-01", 1, true) ~= nil,
+    "second compaction still preserves the oldest history (no destructive re-truncation)"
+  )
 end
 
 -- 16. project-root containment --------------------------------------------------
@@ -962,7 +1216,9 @@ do
     tools.get(name).run(input, ctx, function(out, err)
       result, is_err, done = out, err, true
     end)
-    vim.wait(5000, function() return done end, 10)
+    vim.wait(5000, function()
+      return done
+    end, 10)
     return result, is_err
   end
 
@@ -987,10 +1243,30 @@ do
   r, e = run("grep", { pattern = "root", path = "/etc" })
   check(e == true, "outside grep is blocked")
 
+  -- a symlink committed inside the repo pointing outside must not be a bypass
+  local link_ok = pcall(function()
+    (vim.uv or vim.loop).fs_symlink(parent .. "/escape.txt", tmp .. "/sub/link.txt")
+  end)
+  if link_ok then
+    r, e = run("read_file", { path = "sub/link.txt" })
+    check(e == true and not tostring(r):find("outside-secret", 1, true), "symlink escaping the root is blocked")
+    r, e = run("write_file", { path = "sub/newlink/file.txt", content = "x" })
+    -- (new path under a real dir still allowed; sanity that realpath check
+    -- doesn't reject legitimate not-yet-existing writes inside the root)
+    r, e = run("write_file", { path = "sub/brandnew.txt", content = "hi" })
+    check(e == false and vim.fn.filereadable(tmp .. "/sub/brandnew.txt") == 1, "new file inside root still writable")
+  else
+    check(true, "symlink escaping the root is blocked (skipped: no symlink support)")
+    check(true, "new file inside root still writable (skipped)")
+  end
+
   -- previews must not leak outside-project contents before approval
   local pv = tools.get("write_file").preview({ path = parent .. "/escape.txt", content = "new" }, ctx)
-  check(table.concat(pv.lines, "\n"):find("blocked", 1, true) ~= nil
-    and not table.concat(pv.lines, "\n"):find("outside-secret", 1, true), "write preview blocked outside root")
+  check(
+    table.concat(pv.lines, "\n"):find("blocked", 1, true) ~= nil
+      and not table.concat(pv.lines, "\n"):find("outside-secret", 1, true),
+    "write preview blocked outside root"
+  )
   local pe = tools.get("edit_file").preview({ path = "../escape.txt", old_string = "outside", new_string = "x" }, ctx)
   check(table.concat(pe.lines, "\n"):find("blocked", 1, true) ~= nil, "edit preview blocked outside root")
 
@@ -1016,35 +1292,48 @@ do
     tools.get(name).run(input, ctx, function(out, err)
       result, is_err, done = out, err, true
     end)
-    vim.wait(5000, function() return done end, 10)
+    vim.wait(5000, function()
+      return done
+    end, 10)
     return result, is_err
   end
 
-  local r, e = run("multi_edit", { path = "m.txt", edits = {
-    { old_string = "alpha", new_string = "ALPHA" },
-    { old_string = "beta", new_string = "B", replace_all = true },
-  } })
+  local r, e = run("multi_edit", {
+    path = "m.txt",
+    edits = {
+      { old_string = "alpha", new_string = "ALPHA" },
+      { old_string = "beta", new_string = "B", replace_all = true },
+    },
+  })
   local after = table.concat(vim.fn.readfile(tmp .. "/m.txt"), "\n")
   check(e == false and after:find("ALPHA B") and after:find("gamma B"), "multi_edit applies edits in order")
 
   -- atomicity: a failing edit must leave the file untouched
-  r, e = run("multi_edit", { path = "m.txt", edits = {
-    { old_string = "ALPHA", new_string = "A2" },
-    { old_string = "does-not-exist", new_string = "x" },
-  } })
+  r, e = run("multi_edit", {
+    path = "m.txt",
+    edits = {
+      { old_string = "ALPHA", new_string = "A2" },
+      { old_string = "does-not-exist", new_string = "x" },
+    },
+  })
   local unchanged = table.concat(vim.fn.readfile(tmp .. "/m.txt"), "\n")
   check(e == true and unchanged:find("ALPHA", 1, true) ~= nil, "multi_edit is atomic — failed batch writes nothing")
 
-  local pv = tools.get("multi_edit").preview({ path = "m.txt", edits = {
-    { old_string = "gamma", new_string = "GAMMA" },
-  } }, ctx)
+  local pv = tools.get("multi_edit").preview(
+    { path = "m.txt", edits = {
+      { old_string = "gamma", new_string = "GAMMA" },
+    } },
+    ctx
+  )
   check(pv.filetype == "diff" and table.concat(pv.lines, "\n"):find("+GAMMA"), "multi_edit preview is a unified diff")
 
-  r, e = run("todo_write", { items = {
-    { content = "step one", status = "completed" },
-    { content = "step two", status = "in_progress" },
-    { content = "step three", status = "pending" },
-  } })
+  r, e = run("todo_write", {
+    items = {
+      { content = "step one", status = "completed" },
+      { content = "step two", status = "in_progress" },
+      { content = "step three", status = "pending" },
+    },
+  })
   check(e == false and r:find("1/3 done", 1, true), "todo_write tracks completion")
   check(type(ctx.todos) == "table" and #ctx.todos == 3, "todo list stored on the agent context")
   r, e = run("todo_write", { items = {} })
@@ -1072,8 +1361,11 @@ do
   config.options.memory = { enabled = true, budget_tokens = 1200, project_budget_tokens = 2000, dedupe_threshold = 0.8 }
   memory.reset_session()
 
-  memory.save_skill("deploy-docs", "How to build and deploy the documentation site",
-    "1. build the site\n2. push to the docs branch\n3. verify the published pages")
+  memory.save_skill(
+    "deploy-docs",
+    "How to build and deploy the documentation site",
+    "1. build the site\n2. push to the docs branch\n3. verify the published pages"
+  )
 
   local h = memory.skill_hints("please deploy the docs site for me")
   check(#h >= 1 and h[1].name == "deploy-docs", "matching prompt surfaces the skill")
@@ -1102,10 +1394,14 @@ do
   local ag = agent_mod.new({ model = { provider = "fakehint", id = "m", label = "m" } })
   memory.reset_session() -- agent_mod.new resets; keep the hint budget fresh for this test
   ag:send("deploy the docs site")
-  vim.wait(5000, function() return sent ~= nil and ag.status == "idle" end, 10)
+  vim.wait(5000, function()
+    return sent ~= nil and ag.status == "idle"
+  end, 10)
   local sent_text = sent and sent[#sent].text or ""
-  check(sent_text:find("<repo-skill-hint>", 1, true) ~= nil and sent_text:find("deploy-docs", 1, true) ~= nil,
-    "hint is appended to the outgoing user message")
+  check(
+    sent_text:find("<repo-skill-hint>", 1, true) ~= nil and sent_text:find("deploy-docs", 1, true) ~= nil,
+    "hint is appended to the outgoing user message"
+  )
 
   memory._root_override = MEMTMP
 end
@@ -1124,8 +1420,11 @@ do
   memory.reset_session()
 
   memory.remember("Build with make all from the repo root", "Commands")
-  memory.save_skill("cut-release", "How to cut and publish a release",
-    string.rep("1. bump the version and tag the commit\n", 20))
+  memory.save_skill(
+    "cut-release",
+    "How to cut and publish a release",
+    string.rep("1. bump the version and tag the commit\n", 20)
+  )
 
   local st = memory.stats()
   check(st.block_tokens > 0, "stats reports the injected block size")
@@ -1167,8 +1466,12 @@ do
         if turn == 1 then
           req.on.tool_start("mem1", "remember")
           req.on.complete({
-            { type = "tool_use", id = "mem1", name = "remember",
-              input = { fact = "Run make ci before pushing anything", section = "Commands" } },
+            {
+              type = "tool_use",
+              id = "mem1",
+              name = "remember",
+              input = { fact = "Run make ci before pushing anything", section = "Commands" },
+            },
           }, "tool_use")
         else
           req.on.complete({ { type = "text", text = "noted" } }, "end_turn")
@@ -1182,32 +1485,46 @@ do
   local ag = agent_mod.new({ model = { provider = "fakelearn", id = "m", label = "m" } })
   check(vim.fn.filereadable(tmp .. "/.advantage/context.md") == 1, "agent init bootstraps .advantage/context.md")
   local seed = table.concat(vim.fn.readfile(tmp .. "/.advantage/context.md"), "\n")
-  check(seed:find("# Repo memory", 1, true) == 1 and seed:find("Managed by advantage.nvim", 1, true) ~= nil,
-    "bootstrapped file has the managed header")
+  check(
+    seed:find("# Repo memory", 1, true) == 1 and seed:find("Managed by advantage.nvim", 1, true) ~= nil,
+    "bootstrapped file has the managed header"
+  )
   check(memory.render():find("`remember` tool", 1, true) ~= nil, "empty memory nudges the model to start recording")
 
   -- flywheel end-to-end: remember tool → sectioned markdown → next turn's system prompt
   ag:send("teach yourself the ci rule")
-  vim.wait(6000, function() return turn >= 2 and ag.status == "idle" end, 10)
+  vim.wait(6000, function()
+    return turn >= 2 and ag.status == "idle"
+  end, 10)
 
   local file = table.concat(vim.fn.readfile(tmp .. "/.advantage/context.md"), "\n")
-  check(file:find("## Commands", 1, true) ~= nil and file:find("- Run make ci before pushing anything", 1, true) ~= nil,
-    "remember tool writes a clean sectioned markdown file")
+  check(
+    file:find("## Commands", 1, true) ~= nil and file:find("- Run make ci before pushing anything", 1, true) ~= nil,
+    "remember tool writes a clean sectioned markdown file"
+  )
   check(file:find("Nothing recorded yet", 1, true) == nil, "placeholder line is replaced by real content")
-  check(sys2 ~= nil and sys2:find("Run make ci before pushing anything", 1, true) ~= nil,
-    "next turn's system prompt carries the learned fact")
+  check(
+    sys2 ~= nil and sys2:find("Run make ci before pushing anything", 1, true) ~= nil,
+    "next turn's system prompt carries the learned fact"
+  )
 
   -- bootstrap must never clobber an existing file
   check(memory.bootstrap() == false, "bootstrap is idempotent on an existing file")
 
   -- /context init parity prompt: exploration + verified facts + skill extraction
   local ip = memory.init_prompt()
-  check(ip:find("remember", 1, true) ~= nil and ip:find("save_skill", 1, true) ~= nil,
-    "init prompt teaches both memory verbs")
-  check(ip:find("Commands", 1, true) ~= nil and ip:find("Architecture", 1, true)
-    and ip:find("Gotchas", 1, true), "init prompt routes facts to sections")
-  check(ip:find("do not guess", 1, true) ~= nil and ip:find("never record a guess", 1, true) ~= nil,
-    "init prompt forbids recording guesses")
+  check(
+    ip:find("remember", 1, true) ~= nil and ip:find("save_skill", 1, true) ~= nil,
+    "init prompt teaches both memory verbs"
+  )
+  check(
+    ip:find("Commands", 1, true) ~= nil and ip:find("Architecture", 1, true) and ip:find("Gotchas", 1, true),
+    "init prompt routes facts to sections"
+  )
+  check(
+    ip:find("do not guess", 1, true) ~= nil and ip:find("never record a guess", 1, true) ~= nil,
+    "init prompt forbids recording guesses"
+  )
 
   memory._root_override = MEMTMP
 end
@@ -1231,8 +1548,10 @@ do
 
   check(memory.root() == repo, "memory root walks up to the git root from a subdirectory")
   agent_mod.new({ model = { provider = "fake", id = "m", label = "m" } })
-  check(vim.fn.filereadable(repo .. "/.advantage/context.md") == 1,
-    "bootstrap lands at the git root, not the subdirectory")
+  check(
+    vim.fn.filereadable(repo .. "/.advantage/context.md") == 1,
+    "bootstrap lands at the git root, not the subdirectory"
+  )
 
   -- the model is taught the harness, and told the memory is empty
   local sys = agent_mod.system_prompt()
@@ -1242,28 +1561,222 @@ do
   -- every provider gets the memory tools on a fresh repo, no setup required
   local schemas = require("advantage.tools").schemas()
   local names = {}
-  for _, t in ipairs(schemas) do names[t.name] = t end
-  check(names.remember and names.use_skill and names.save_skill,
-    "anthropic-format schemas include all memory tools")
+  for _, t in ipairs(schemas) do
+    names[t.name] = t
+  end
+  check(names.remember and names.use_skill and names.save_skill, "anthropic-format schemas include all memory tools")
   local converted = require("advantage.providers.openai")._to_tools(schemas)
   local oai = {}
-  for _, t in ipairs(converted) do oai[t.name] = t end
-  check(oai.remember and oai.remember.type == "function"
-      and oai.remember.parameters and oai.remember.parameters.properties.fact ~= nil,
-    "openai/codex conversion preserves the memory tools intact")
+  for _, t in ipairs(converted) do
+    oai[t.name] = t
+  end
+  check(
+    oai.remember
+      and oai.remember.type == "function"
+      and oai.remember.parameters
+      and oai.remember.parameters.properties.fact ~= nil,
+    "openai/codex conversion preserves the memory tools intact"
+  )
 
   -- disabled memory: guidance AND tools both disappear together (no orphan instructions)
   config.options.memory.enabled = false
   local sys_off = agent_mod.system_prompt()
-  check(sys_off:find("Persistent repo memory", 1, true) == nil,
-    "memory guide is not injected when memory is disabled")
+  check(sys_off:find("Persistent repo memory", 1, true) == nil, "memory guide is not injected when memory is disabled")
   local off = {}
-  for _, t in ipairs(require("advantage.tools").schemas()) do off[t.name] = true end
+  for _, t in ipairs(require("advantage.tools").schemas()) do
+    off[t.name] = true
+  end
   check(not off.remember and not off.use_skill, "memory tools absent from schemas when disabled")
   config.options.memory.enabled = true
 
   vim.fn.chdir(prev_cwd)
   memory._root_override = MEMTMP
+end
+
+-- 22. memory compression flywheel -------------------------------------------------
+
+section("memory compression flywheel")
+do
+  local memory = require("advantage.memory")
+  local config = require("advantage.config")
+  local tools = require("advantage.tools")
+  local tmp = vim.fn.tempname()
+  vim.fn.mkdir(tmp, "p")
+  memory._root_override = tmp
+  config.options.memory = { enabled = true, budget_tokens = 1200, project_budget_tokens = 2000, dedupe_threshold = 0.8 }
+  memory.reset_session()
+
+  -- procedural facts are steered to skills at the source
+  local proc =
+    memory.remember("Release: 1. bump the version 2. run the tests 3. tag the commit 4. push the tag", "Commands")
+  check(proc.status == "procedural", "numbered runbook is rejected as procedural")
+  local long = memory.remember("This fact " .. string.rep("keeps going and going ", 20), "Notes")
+  check(long.status == "procedural", "oversized bullet is rejected")
+  local out_msg, out_err
+  tools
+    .get("remember")
+    .run({ fact = "Deploy: 1. build 2. upload 3. restart the service" }, { cwd = tmp }, function(o, e)
+      out_msg, out_err = o, e
+    end)
+  check(out_err == true and out_msg:find("save_skill", 1, true) ~= nil, "remember tool steers procedures to save_skill")
+
+  -- eviction reports what fell out so the agent can rescue it
+  -- (budget_chars has a 400-char floor, so facts must be realistically sized)
+  config.options.memory.budget_tokens = 40
+  memory.remember(
+    "The first sacrificial fact describing how module alpha initializes its parser tables during startup and why registration ordering matters for downstream consumers across the whole event pipeline",
+    "Notes"
+  )
+  memory.remember(
+    "Observation on module beta explaining the cache invalidation strategy where entries expire after writes and readers must revalidate handles before reuse or risk stale views of shared buffers",
+    "Notes"
+  )
+  local r = memory.remember(
+    "Details for gamma configuration covering which environment variables override file settings plus the precedence rules applied when both sources define the same key at load time",
+    "Notes"
+  )
+  local evicted_texts = table.concat(r.evicted or {}, " | ")
+  check(
+    #(r.evicted or {}) > 0 and evicted_texts:find("sacrificial", 1, true) ~= nil,
+    "eviction returns the dropped fact texts"
+  )
+  config.options.memory.budget_tokens = 1200
+
+  -- budget pressure (eviction or near-budget) surfaces through the tool result
+  local tmp2 = vim.fn.tempname()
+  vim.fn.mkdir(tmp2, "p")
+  memory._root_override = tmp2
+  config.options.memory.budget_tokens = 60
+  memory.remember(
+    "Alpha subsystem parses inbound events eagerly on load and keeps a resident index of every handler so dispatch avoids scanning the registry on the hot path during interactive editing sessions",
+    "Architecture"
+  )
+  local pressure_msg
+  tools.get("remember").run({
+    fact = "Beta subsystem memoizes expensive lookups between calls and flushes its table whenever the underlying files change so results stay coherent without a manual invalidation step by callers",
+    section = "Architecture",
+  }, { cwd = tmp2 }, function(o)
+    pressure_msg = o
+  end)
+  check(
+    pressure_msg:find("budget", 1, true) ~= nil,
+    "tool reports budget pressure or eviction so curation gets triggered"
+  )
+  config.options.memory.budget_tokens = 1200
+  memory._root_override = tmp
+
+  -- curate prompt: merge, extract to skills, rewrite in place, stay in budget
+  local cp = memory.curate_prompt()
+  check(
+    cp:find("save_skill", 1, true) ~= nil and cp:find("edit_file", 1, true) ~= nil,
+    "curate prompt teaches extraction and in-place rewrite"
+  )
+  check(
+    cp:find(".advantage/context.md", 1, true) ~= nil and cp:find("1200", 1, true) ~= nil,
+    "curate prompt names the file and the budget"
+  )
+
+  memory._root_override = MEMTMP
+  memory.reset_session()
+end
+
+-- 23. language-agnostic harness (polyglot repo) -----------------------------------
+
+section("polyglot repo")
+do
+  local memory = require("advantage.memory")
+  local config = require("advantage.config")
+  local tools = require("advantage.tools")
+  local repo = vim.fn.tempname()
+  vim.fn.mkdir(repo .. "/src", "p")
+  vim.fn.mkdir(repo .. "/pkg", "p")
+  vim.fn.writefile({ "[package]", 'name = "demo"' }, repo .. "/Cargo.toml")
+  vim.fn.writefile({ 'fn main() { println!("hi"); }' }, repo .. "/src/main.rs")
+  vim.fn.writefile({ "def handler(event):", "    return event" }, repo .. "/src/app.py")
+  vim.fn.writefile({ "package pkg", "func Do() int { return 1 }" }, repo .. "/pkg/util.go")
+  local ctx = { cwd = repo }
+  memory._root_override = repo
+  config.options.memory = { enabled = true, budget_tokens = 1200, project_budget_tokens = 2000, dedupe_threshold = 0.8 }
+  memory.reset_session()
+
+  local function run(name, input)
+    local result, is_err, done = nil, nil, false
+    tools.get(name).run(input, ctx, function(out, err)
+      result, is_err, done = out, err, true
+    end)
+    vim.wait(5000, function()
+      return done
+    end, 10)
+    return result, is_err
+  end
+
+  -- file tools are byte-exact on any language
+  local r, e =
+    run("edit_file", { path = "src/app.py", old_string = "return event", new_string = "return process(event)" })
+  check(
+    e == false and table.concat(vim.fn.readfile(repo .. "/src/app.py"), "\n"):find("process(event)", 1, true),
+    "edit_file is byte-exact on python"
+  )
+  r, e = run("multi_edit", { path = "pkg/util.go", edits = { { old_string = "return 1", new_string = "return 2" } } })
+  check(e == false, "multi_edit works on go")
+  r, e = run("grep", { pattern = "fn main", path = "src" })
+  check(e == false and r:find("main.rs", 1, true), "grep finds rust code")
+  local pv = tools.get("write_file").preview({ path = "new.rs", content = "fn x() {}" }, ctx)
+  check(pv.filetype == "rust" or pv.filetype == "", "preview filetype detection handles non-lua files")
+
+  -- memory anchors work on any language's paths
+  memory.remember("Build with cargo build --release; the binary lands in target/release", "Commands")
+  memory.remember("HTTP handler entry point is src/app.py, dispatched from src/main.rs", "Architecture")
+  memory.remember("Legacy shim lived in old/gone.py before the rewrite", "Notes")
+  local stale, ghost, real_ok = memory.verify(), false, true
+  for _, s in ipairs(stale) do
+    if s.missing:find("old/gone.py", 1, true) then ghost = true end
+    if s.missing:find("src/app.py", 1, true) or s.missing:find("src/main.rs", 1, true) then real_ok = false end
+  end
+  check(ghost and real_ok, "verify anchors resolve for rust/python paths alike")
+
+  -- skills + hints are content-agnostic
+  memory.save_skill(
+    "release-crate",
+    "How to build and publish the rust crate to the registry",
+    "1. cargo test\n2. bump version in Cargo.toml\n3. cargo publish"
+  )
+  local h = memory.skill_hints("publish the crate to the registry please")
+  check(#h == 1 and h[1].name == "release-crate", "skill hints trigger on rust-domain vocabulary")
+
+  memory._root_override = MEMTMP
+  memory.reset_session()
+end
+
+-- config: list options replace wholesale (no element-wise merge) -------------
+
+section("config merge + validation")
+do
+  local config = require("advantage.config")
+  local saved = vim.deepcopy(config.options)
+
+  config.setup({ models = { { ref = "openai/gpt-5.5", label = "only one" } } })
+  check(
+    #config.options.models == 1 and config.options.models[1].label == "only one",
+    "user models list replaces defaults wholesale (no leftover entries)"
+  )
+
+  -- map-like options still merge (so partial overrides keep other defaults)
+  config.setup({ tools = { yolo = true } })
+  check(
+    config.options.tools.yolo == true and config.options.tools.bash_timeout_ms == 120000,
+    "map options merge: overriding one tools field keeps the rest"
+  )
+
+  -- validation flags a malformed default_model without throwing
+  local errs = config._validate({
+    default_model = "no-slash",
+    models = { { ref = "anthropic/x" } },
+    providers = {},
+  })
+  check(type(errs) == "table" and #errs >= 1, "validation reports a malformed default_model")
+
+  config.options = saved
 end
 
 print("")

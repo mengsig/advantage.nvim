@@ -17,9 +17,7 @@ local function content_blocks(msg)
 end
 
 local function block_text(block)
-  if type(block) ~= "table" then
-    return tostring(block or "")
-  end
+  if type(block) ~= "table" then return tostring(block or "") end
   if block.type == "text" then
     return block.text or ""
   elseif block.type == "tool_use" then
@@ -31,11 +29,7 @@ local function block_text(block)
       local ok, encoded = pcall(vim.json.encode, c)
       c = ok and encoded or vim.inspect(c)
     end
-    return ("tool_result %s%s: %s"):format(
-      block.tool_use_id or "?",
-      block.is_error and " error" or "",
-      c or ""
-    )
+    return ("tool_result %s%s: %s"):format(block.tool_use_id or "?", block.is_error and " error" or "", c or "")
   elseif block.type == "image" then
     return "[image attachment]"
   elseif block.type == "thinking" then
@@ -52,6 +46,12 @@ local function message_chars(msg)
   local content = content_blocks(msg)
   for _, b in ipairs(content) do
     n = n + #block_text(b)
+    -- Image payloads are sent verbatim (base64) and dominate request size, but
+    -- block_text collapses them to a placeholder. Count the real bytes so a
+    -- conversation carrying images actually triggers compaction/eviction.
+    if type(b) == "table" and b.type == "image" and b.source and type(b.source.data) == "string" then
+      n = n + #b.source.data
+    end
   end
   return n
 end
@@ -113,9 +113,7 @@ local function summarize_messages(messages, max_chars, carry)
   local total = #table.concat(lines, "\n")
   local function add(line)
     if total >= ceiling then return false end
-    if total + #line + 1 > ceiling then
-      line = utf8_safe_sub(line, math.max(0, ceiling - total - 2)) .. "…"
-    end
+    if total + #line + 1 > ceiling then line = utf8_safe_sub(line, math.max(0, ceiling - total - 2)) .. "…" end
     lines[#lines + 1] = line
     total = total + #line + 1
     return total < ceiling
@@ -132,9 +130,7 @@ local function summarize_messages(messages, max_chars, carry)
     end
     if not add(prefix .. table.concat(parts, " | ")) then break end
   end
-  if total >= ceiling then
-    lines[#lines + 1] = "[summary truncated]"
-  end
+  if total >= ceiling then lines[#lines + 1] = "[summary truncated]" end
   return table.concat(lines, "\n")
 end
 
@@ -162,15 +158,11 @@ local function strip_replay_only_blocks(messages)
           -- would require its paired reasoning item (rs_…) to precede it. We just
           -- dropped that reasoning item, so detach the id and replay the call as a
           -- fresh client-provided function_call (Responses API rejects it otherwise).
-          if type(copy) == "table" and copy.type == "tool_use" then
-            copy.openai_item_id = nil
-          end
+          if type(copy) == "table" and copy.type == "tool_use" then copy.openai_item_id = nil end
           content[#content + 1] = copy
         end
       end
-      if #content > 0 then
-        out[#out + 1] = { role = msg.role, content = content }
-      end
+      if #content > 0 then out[#out + 1] = { role = msg.role, content = content } end
     end
   end
   return out
@@ -190,8 +182,12 @@ local function tool_results_missing_uses(messages, start_idx)
     for _, block in ipairs(content_blocks(messages[i])) do
       if type(block) == "table" and block.type == "tool_use" and block.id then
         seen[block.id] = true
-      elseif type(block) == "table" and block.type == "tool_result" and block.tool_use_id
-        and not seen[block.tool_use_id] then
+      elseif
+        type(block) == "table"
+        and block.type == "tool_result"
+        and block.tool_use_id
+        and not seen[block.tool_use_id]
+      then
         return block.tool_use_id
       end
     end
@@ -257,18 +253,21 @@ function M.compact(messages, opts)
     local first = recent[1]
     local content = content_blocks(first)
     local merged = { summary_block }
-    for _, b in ipairs(content) do merged[#merged + 1] = b end
+    for _, b in ipairs(content) do
+      merged[#merged + 1] = b
+    end
     recent[1] = { role = "user", content = merged }
     compacted = recent
   else
     compacted = { { role = "user", content = { summary_block } } }
     vim.list_extend(compacted, recent)
   end
-  return compacted, {
-    before_tokens = before_tokens,
-    after_tokens = M.estimate_tokens(compacted),
-    compacted_messages = #older,
-  }
+  return compacted,
+    {
+      before_tokens = before_tokens,
+      after_tokens = M.estimate_tokens(compacted),
+      compacted_messages = #older,
+    }
 end
 
 function M.force(messages, opts)

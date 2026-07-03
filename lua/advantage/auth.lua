@@ -30,11 +30,19 @@ local function read_json(path)
 end
 
 local function write_json(path, tbl)
-  local f = io.open(path, "w")
+  -- Atomic write with 0600 before the rename: a crash mid-write must never
+  -- corrupt the real `claude`/`codex` credential file (would force a re-login),
+  -- and the plaintext refresh token must never sit at a laxer umask.
+  local tmp = path .. ".tmp"
+  local f = io.open(tmp, "w")
   if not f then return false end
   f:write(vim.json.encode(tbl))
   f:close()
-  pcall(uv.fs_chmod, path, 384) -- 0600
+  pcall(uv.fs_chmod, tmp, 384) -- 0600
+  if not os.rename(tmp, path) then
+    os.remove(tmp)
+    return false
+  end
   return true
 end
 
@@ -58,15 +66,12 @@ local function post_json(url, body, cb)
     { "curl", "-sS", "--max-time", "30", "-H", "content-type: application/json", "--data-binary", "@-", url },
     { stdin = vim.json.encode(body), text = true },
     vim.schedule_wrap(function(res)
-      if res.code ~= 0 then
-        return cb(nil, "network error: " .. (res.stderr or res.code))
-      end
+      if res.code ~= 0 then return cb(nil, "network error: " .. (res.stderr or res.code)) end
       local ok, decoded = pcall(vim.json.decode, res.stdout or "")
-      if not ok or type(decoded) ~= "table" then
-        return cb(nil, "unexpected response from " .. url)
-      end
+      if not ok or type(decoded) ~= "table" then return cb(nil, "unexpected response from " .. url) end
       if decoded.error then
-        local msg = type(decoded.error) == "table" and (decoded.error.message or decoded.error.error) or tostring(decoded.error)
+        local msg = type(decoded.error) == "table" and (decoded.error.message or decoded.error.error)
+          or tostring(decoded.error)
         return cb(nil, msg)
       end
       cb(decoded)
@@ -98,8 +103,12 @@ local function refresh_anthropic(oauth, cb)
     file.claudeAiOauth = vim.tbl_extend("force", file.claudeAiOauth or {}, updated)
     if not write_json(path, file) then
       vim.schedule(function()
-        vim.notify("advantage: could not write refreshed Claude credentials to " .. path
-          .. " — the `claude` CLI may need a re-login later.", vim.log.levels.WARN)
+        vim.notify(
+          "advantage: could not write refreshed Claude credentials to "
+            .. path
+            .. " — the `claude` CLI may need a re-login later.",
+          vim.log.levels.WARN
+        )
       end)
     end
     cb(updated)
@@ -107,12 +116,13 @@ local function refresh_anthropic(oauth, cb)
 end
 
 ---@param cb fun(cred: {mode:string, token?:string, key?:string, badge:string}|nil, err?:string)
-function M.anthropic(cb)
+---@param force boolean|nil force a token refresh even if the cached token looks valid (e.g. after a 401)
+function M.anthropic(cb, force)
   local file = read_json(claude_creds_path())
   local oauth = file and file.claudeAiOauth
   if oauth and oauth.accessToken then
     local expires = (oauth.expiresAt or 0) / 1000
-    if expires > os.time() + 60 then
+    if not force and expires > os.time() + 60 then
       return cb({ mode = "oauth", token = oauth.accessToken, badge = oauth.subscriptionType or "pro" })
     end
     if oauth.refreshToken then
@@ -131,9 +141,7 @@ function M.anthropic(cb)
     end
   end
   local key = require("advantage.config").api_key("anthropic")
-  if key then
-    return cb({ mode = "api_key", key = key, badge = "api" })
-  end
+  if key then return cb({ mode = "api_key", key = key, badge = "api" }) end
   cb(nil, "No Claude credentials. Log in with the `claude` CLI (subscription) or export $ANTHROPIC_API_KEY.")
 end
 
@@ -163,8 +171,12 @@ local function refresh_codex(auth_file, cb)
     auth_file.last_refresh = os.date("!%Y-%m-%dT%H:%M:%S.000Z")
     if not write_json(codex_auth_path(), auth_file) then
       vim.schedule(function()
-        vim.notify("advantage: could not write refreshed Codex credentials to " .. codex_auth_path()
-          .. " — the `codex` CLI may need a re-login later.", vim.log.levels.WARN)
+        vim.notify(
+          "advantage: could not write refreshed Codex credentials to "
+            .. codex_auth_path()
+            .. " — the `codex` CLI may need a re-login later.",
+          vim.log.levels.WARN
+        )
       end)
     end
     cb(auth_file.tokens)
@@ -172,14 +184,15 @@ local function refresh_codex(auth_file, cb)
 end
 
 ---@param cb fun(cred: {mode:string, token?:string, key?:string, account_id?:string, badge:string}|nil, err?:string)
-function M.openai(cb)
+---@param force boolean|nil force a token refresh even if the cached token looks valid (e.g. after a 401)
+function M.openai(cb, force)
   local auth_file = read_json(codex_auth_path())
   local tokens = auth_file and auth_file.tokens
   if tokens and tokens.access_token and tokens.access_token ~= vim.NIL then
     local account = codex_account_id(tokens)
     local claims = jwt_payload(tokens.access_token)
     local exp = claims and claims.exp or 0
-    if exp > os.time() + 60 and account then
+    if not force and exp > os.time() + 60 and account then
       return cb({ mode = "chatgpt", token = tokens.access_token, account_id = account, badge = "chatgpt" })
     end
     if tokens.refresh_token then
@@ -199,11 +212,13 @@ function M.openai(cb)
       end)
     end
   end
-  local key = (auth_file and auth_file.OPENAI_API_KEY and auth_file.OPENAI_API_KEY ~= vim.NIL and auth_file.OPENAI_API_KEY)
-    or require("advantage.config").api_key("openai")
-  if key then
-    return cb({ mode = "api_key", key = key, badge = "api" })
-  end
+  local key = (
+    auth_file
+    and auth_file.OPENAI_API_KEY
+    and auth_file.OPENAI_API_KEY ~= vim.NIL
+    and auth_file.OPENAI_API_KEY
+  ) or require("advantage.config").api_key("openai")
+  if key then return cb({ mode = "api_key", key = key, badge = "api" }) end
   cb(nil, "No Codex credentials. Log in with `codex login` (subscription) or export $OPENAI_API_KEY.")
 end
 

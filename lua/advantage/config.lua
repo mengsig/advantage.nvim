@@ -128,11 +128,56 @@ M.defaults = {
 M.options = vim.deepcopy(M.defaults)
 M._setup_done = false
 
+-- Deep-merge that treats *sequences* (list-like tables) as atomic values rather
+-- than merging them element-wise by index. vim.tbl_deep_extend would otherwise
+-- splice a user's `models` list into the defaults, leaving stale leftover entries.
+local function merge(dst, src)
+  if type(dst) ~= "table" or type(src) ~= "table" then return src end
+  if src[1] ~= nil or dst[1] ~= nil then return vim.deepcopy(src) end
+  local out = vim.deepcopy(dst)
+  for k, v in pairs(src) do
+    out[k] = merge(out[k], v)
+  end
+  return out
+end
+
+local function validate(o)
+  local errs = {}
+  if type(o.default_model) ~= "string" or not o.default_model:match("^[^/]+/.+$") then
+    errs[#errs + 1] = "default_model must be a 'provider/model-id' string"
+  end
+  if type(o.models) ~= "table" or o.models[1] == nil then
+    errs[#errs + 1] = "models must be a non-empty list of { ref = 'provider/model-id' } entries"
+  else
+    for i, m in ipairs(o.models) do
+      if type(m) ~= "table" or type(m.ref) ~= "string" or not m.ref:match("^[^/]+/.+$") then
+        errs[#errs + 1] = ("models[%d].ref must be a 'provider/model-id' string"):format(i)
+      end
+    end
+  end
+  if
+    type(o.ui) == "table"
+    and o.ui.width ~= nil
+    and (type(o.ui.width) ~= "number" or o.ui.width <= 0 or o.ui.width > 1)
+  then
+    errs[#errs + 1] = "ui.width must be a number in (0, 1] (fraction of columns)"
+  end
+  if type(o.providers) ~= "table" then errs[#errs + 1] = "providers must be a table" end
+  return errs
+end
+
+M._validate = validate
+
 function M.setup(opts)
-  M.options = vim.tbl_deep_extend("force", vim.deepcopy(M.defaults), opts or {})
+  opts = opts or {}
+  M.options = merge(vim.deepcopy(M.defaults), opts)
   -- accept the long-form alias for the paranoid-averse
-  if M.options.tools.dangerously_skip_permissions then
-    M.options.tools.yolo = true
+  if M.options.tools.dangerously_skip_permissions then M.options.tools.yolo = true end
+  local errs = validate(M.options)
+  if #errs > 0 then
+    vim.schedule(function()
+      vim.notify("advantage: invalid setup options —\n  " .. table.concat(errs, "\n  "), vim.log.levels.ERROR)
+    end)
   end
   M._setup_done = true
 end
@@ -153,9 +198,7 @@ function M.resolve_model(ref)
     end
   end
   local provider, id = ref:match("^([^/]+)/(.+)$")
-  if provider then
-    return { provider = provider, id = id, label = id }
-  end
+  if provider then return { provider = provider, id = id, label = id } end
   return nil
 end
 

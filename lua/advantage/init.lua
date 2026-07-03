@@ -11,9 +11,7 @@ local agent_mod, ui, current
 local function ensure_init()
   if initialized then return end
   initialized = true
-  if not config._setup_done then
-    config.setup({})
-  end
+  if not config._setup_done then config.setup({}) end
   require("advantage.ui.highlights").setup()
   agent_mod = require("advantage.agent")
   ui = require("advantage.ui.chat")
@@ -85,9 +83,7 @@ end
 ---@param opts? {images?: table[], mode?: "instant"|"queued"}
 function M.ask(text, opts)
   local agent = ensure_agent()
-  if not ui.is_open() then
-    ui.open(false)
-  end
+  if not ui.is_open() then ui.open(false) end
   agent:send(text, opts)
 end
 
@@ -200,12 +196,12 @@ end
 local function netrw_marked_files()
   local raw = {}
 
-  local ok_fn, expose = pcall(function() return vim.fn["netrw#Expose"] end)
+  local ok_fn, expose = pcall(function()
+    return vim.fn["netrw#Expose"]
+  end)
   if ok_fn and expose then
     local ok, global = pcall(expose, "netrwmarkfilelist")
-    if ok and type(global) == "table" then
-      raw = global
-    end
+    if ok and type(global) == "table" then raw = global end
 
     local curdir = netrw_curdir(0)
     if #raw == 0 and curdir then
@@ -262,15 +258,16 @@ function M.add_selection()
   local buf = vim.api.nvim_get_current_buf()
   local from = vim.fn.getpos("v")[2]
   local to = vim.fn.getpos(".")[2]
-  if from > to then from, to = to, from end
+  if from > to then
+    from, to = to, from
+  end
 
   -- leave visual mode synchronously, before switching windows — a queued
   -- <Esc> via feedkeys would land in the prompt window and cancel insert mode
   vim.cmd([[normal! ]] .. vim.api.nvim_replace_termcodes("<Esc>", true, false, true))
   local name = buf_rel_name(buf)
   if not name then return end
-  local mention = from == to and ("%s:L%d"):format(name, from)
-    or ("%s:L%d-%d"):format(name, from, to)
+  local mention = from == to and ("%s:L%d"):format(name, from) or ("%s:L%d-%d"):format(name, from, to)
   ui.add_mention(mention)
 end
 
@@ -305,9 +302,7 @@ end
 ---the current marked file set instead.
 function M.add_file()
   ensure_agent()
-  if is_netrw_buffer(0) then
-    return M.add_netrw_marked_files()
-  end
+  if is_netrw_buffer(0) then return M.add_netrw_marked_files() end
   local name = vim.api.nvim_buf_get_name(0)
   if name == "" or vim.bo.buftype ~= "" then
     ui.notify("current buffer has no file on disk", vim.log.levels.WARN)
@@ -518,9 +513,7 @@ end
 function M.compact()
   local agent = ensure_agent()
   local info = agent:compact()
-  if not info then
-    ui.notify("context is already compact enough")
-  end
+  if not info then ui.notify("context is already compact enough") end
 end
 
 ---View / manage the per-repo learned memory (also `/context`).
@@ -541,6 +534,14 @@ function M.context(arg)
     end
     memory.bootstrap()
     M.ask(memory.init_prompt())
+  elseif action == "curate" then
+    -- compression pass: the agent rewrites its memory tighter and extracts
+    -- procedural bullets into skills (index-only cost)
+    if not memory.enabled() then
+      ui.notify("memory is disabled (config.memory.enabled = false)", vim.log.levels.WARN)
+      return
+    end
+    M.ask(memory.curate_prompt())
   elseif action == "verify" then
     local stale = memory.verify()
     if #stale == 0 then
@@ -560,17 +561,24 @@ function M.context(arg)
       return
     end
     local n = memory.forget(pattern)
-    ui.notify(n > 0 and ("forgot %d fact%s matching %q"):format(n, n == 1 and "" or "s", pattern)
-      or ("no facts matched %q"):format(pattern))
+    ui.notify(
+      n > 0 and ("forgot %d fact%s matching %q"):format(n, n == 1 and "" or "s", pattern)
+        or ("no facts matched %q"):format(pattern)
+    )
   else
     local block = memory.render()
     local lines = (block ~= "" and vim.split(block, "\n", { plain = true }))
-      or { "Repo memory is empty.", "", "Run /context init to have the agent learn this repo now,", "or let it fill in as you work. Stored under " .. memory.root() .. "/.advantage/" }
+      or {
+        "Repo memory is empty.",
+        "",
+        "Run /context init to have the agent learn this repo now,",
+        "or let it fill in as you work. Stored under " .. memory.root() .. "/.advantage/",
+      }
     ui.float({
       title = "advantage · memory",
       lines = lines,
       filetype = "markdown",
-      footer = "q close · /context init · /context verify · /context forget <text>",
+      footer = "q close · /context init · curate · verify · forget <text>",
     })
   end
 end
@@ -631,7 +639,8 @@ function M._command(opts)
         for _, file in ipairs(files) do
           M.attach(file)
         end
-        local extra = skipped > 0 and ("; skipped " .. skipped .. " non-file item" .. (skipped == 1 and "" or "s")) or ""
+        local extra = skipped > 0 and ("; skipped " .. skipped .. " non-file item" .. (skipped == 1 and "" or "s"))
+          or ""
         ui.notify("added " .. #files .. " netrw file" .. (#files == 1 and "" or "s") .. extra)
       else
         -- ranged form: :'<,'>Advantage add → @file:L10-20
@@ -640,8 +649,10 @@ function M._command(opts)
           ui.notify("current buffer has no file on disk", vim.log.levels.WARN)
           return
         end
-        ui.add_mention(opts.line1 == opts.line2 and ("%s:L%d"):format(name, opts.line1)
-          or ("%s:L%d-%d"):format(name, opts.line1, opts.line2))
+        ui.add_mention(
+          opts.line1 == opts.line2 and ("%s:L%d"):format(name, opts.line1)
+            or ("%s:L%d-%d"):format(name, opts.line1, opts.line2)
+        )
       end
     else
       M.add_file()
@@ -660,8 +671,14 @@ function M._command(opts)
     if opts.range and opts.range > 0 then
       local lines = vim.api.nvim_buf_get_lines(0, opts.line1 - 1, opts.line2, false)
       local name = vim.fn.fnamemodify(vim.api.nvim_buf_get_name(0), ":.")
-      text = text .. ("\n\n```%s %s#L%d-L%d\n%s\n```"):format(
-        vim.bo.filetype or "", name, opts.line1, opts.line2, table.concat(lines, "\n"))
+      text = text
+        .. ("\n\n```%s %s#L%d-L%d\n%s\n```"):format(
+          vim.bo.filetype or "",
+          name,
+          opts.line1,
+          opts.line2,
+          table.concat(lines, "\n")
+        )
     end
     if vim.trim(text) ~= "" then M.ask(text) end
   else
@@ -669,7 +686,24 @@ function M._command(opts)
   end
 end
 
-M._subcommands = { "toggle", "new", "model", "resume", "stop", "usage", "compact", "context", "help", "review", "yolo", "effort", "add", "files", "attach", "ask" }
+M._subcommands = {
+  "toggle",
+  "new",
+  "model",
+  "resume",
+  "stop",
+  "usage",
+  "compact",
+  "context",
+  "help",
+  "review",
+  "yolo",
+  "effort",
+  "add",
+  "files",
+  "attach",
+  "ask",
+}
 M._effort_modes = { "minimal", "low", "medium", "high", "adaptive", "off", "1k", "4k", "8k" }
 
 function M._complete(arglead, cmdline)
@@ -682,7 +716,7 @@ function M._complete(arglead, cmdline)
     elseif args[1] == "yolo" then
       pool = { "on", "off" }
     elseif args[1] == "context" or args[1] == "memory" then
-      pool = { "init", "verify", "forget" }
+      pool = { "init", "curate", "verify", "forget" }
     else
       pool = {}
     end

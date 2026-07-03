@@ -1,6 +1,4 @@
-if vim.g.loaded_advantage then
-  return
-end
+if vim.g.loaded_advantage then return end
 vim.g.loaded_advantage = true
 
 if vim.fn.has("nvim-0.10") ~= 1 then

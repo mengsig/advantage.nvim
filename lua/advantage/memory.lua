@@ -25,7 +25,9 @@ local uv = vim.uv or vim.loop
 -- an unknown section is coerced to "Notes" so the file never sprawls.
 local SECTIONS = { "Conventions", "Architecture", "Commands", "Gotchas", "Preferences", "Notes" }
 local SECTION_SET = {}
-for _, s in ipairs(SECTIONS) do SECTION_SET[s] = true end
+for _, s in ipairs(SECTIONS) do
+  SECTION_SET[s] = true
+end
 
 local PREAMBLE = {
   "<!-- Managed by advantage.nvim. Durable, repo-specific facts the agent learns as",
@@ -50,9 +52,15 @@ function M.root()
   return root
 end
 
-local function mem_dir() return M.root() .. "/.advantage" end
-local function context_file() return mem_dir() .. "/context.md" end
-local function skills_dir() return mem_dir() .. "/skills" end
+local function mem_dir()
+  return M.root() .. "/.advantage"
+end
+local function context_file()
+  return mem_dir() .. "/context.md"
+end
+local function skills_dir()
+  return mem_dir() .. "/skills"
+end
 
 local function opts()
   return (config.options and config.options.memory) or {}
@@ -76,15 +84,24 @@ end
 
 local function write_file(path, content)
   vim.fn.mkdir(vim.fs.dirname(path), "p")
-  local f = io.open(path, "w")
+  -- Atomic write: temp file + rename so a crash or a racing writer can't leave
+  -- a half-written context.md behind.
+  local tmp = path .. ".tmp"
+  local f = io.open(tmp, "w")
   if not f then return false end
   f:write(content)
   f:close()
+  if not os.rename(tmp, path) then
+    os.remove(tmp)
+    return false
+  end
   return true
 end
 
 ---Rough token estimate, consistent with compact.lua (chars / 4).
-local function tokens(s) return math.ceil(#(s or "") / 4) end
+local function tokens(s)
+  return math.ceil(#(s or "") / 4)
+end
 
 ---Seed `<root>/.advantage/context.md` the first time this repo is used, so the
 ---memory file is visible, editable and committable from session one instead of
@@ -109,9 +126,20 @@ end
 ---Normalize a fact to a bag of significant words for deterministic dedup.
 -- Only 3+ char words survive the length guard below, so short words need no
 -- entry here; reserved words are quoted because bare `and`/`for` keys won't parse.
-local STOP = { ["the"] = true, ["are"] = true, ["and"] = true, ["for"] = true,
-  ["this"] = true, ["that"] = true, ["with"] = true, ["when"] = true,
-  ["from"] = true, ["into"] = true, ["use"] = true, ["uses"] = true }
+local STOP = {
+  ["the"] = true,
+  ["are"] = true,
+  ["and"] = true,
+  ["for"] = true,
+  ["this"] = true,
+  ["that"] = true,
+  ["with"] = true,
+  ["when"] = true,
+  ["from"] = true,
+  ["into"] = true,
+  ["use"] = true,
+  ["uses"] = true,
+}
 local function word_set(s)
   local set, n = {}, 0
   for w in tostring(s or ""):lower():gmatch("[%w_]+") do
@@ -127,7 +155,9 @@ end
 local function similarity(a, na, b, nb)
   if na == 0 or nb == 0 then return 0 end
   local inter = 0
-  for w in pairs(a) do if b[w] then inter = inter + 1 end end
+  for w in pairs(a) do
+    if b[w] then inter = inter + 1 end
+  end
   return inter / (na + nb - inter)
 end
 
@@ -139,7 +169,10 @@ end
 local function parse_context()
   local data = read_file(context_file())
   local order, bullets = {}, {}
-  for _, s in ipairs(SECTIONS) do order[#order + 1] = s; bullets[s] = {} end
+  for _, s in ipairs(SECTIONS) do
+    order[#order + 1] = s
+    bullets[s] = {}
+  end
   if not data then return bullets, order end
   local current = nil
   for _, line in ipairs(vim.split(data, "\n", { plain = true })) do
@@ -153,9 +186,7 @@ local function parse_context()
       current = header
     else
       local bullet = line:match("^%-%s+(.+)$")
-      if bullet and current then
-        bullets[current][#bullets[current] + 1] = vim.trim(bullet)
-      end
+      if bullet and current then bullets[current][#bullets[current] + 1] = vim.trim(bullet) end
     end
   end
   return bullets, order
@@ -168,7 +199,9 @@ local function render_context(bullets, order)
     local items = bullets[section]
     if items and #items > 0 then
       out[#out + 1] = "## " .. section
-      for _, b in ipairs(items) do out[#out + 1] = "- " .. b end
+      for _, b in ipairs(items) do
+        out[#out + 1] = "- " .. b
+      end
       out[#out + 1] = ""
     end
   end
@@ -187,27 +220,42 @@ local function budget_chars()
   return math.max(400, (opts().budget_tokens or 1200) * 4)
 end
 
----Drop oldest bullets (top of the largest section) until under the char budget.
----Returns how many were evicted so the caller can surface it.
-local function enforce_budget(bullets, order)
-  local function total()
-    local n = 0
-    for _, items in pairs(bullets) do
-      for _, b in ipairs(items) do n = n + #b + 3 end
+local function total_chars(bullets)
+  local n = 0
+  for _, items in pairs(bullets) do
+    for _, b in ipairs(items) do
+      n = n + #b + 3
     end
-    return n
   end
-  local budget, evicted = budget_chars(), 0
-  while total() > budget do
+  return n
+end
+
+---Drop oldest bullets (top of the largest section) until under the char budget.
+---Returns the evicted texts so the agent can rescue anything still valuable —
+---silent eviction would destroy knowledge without anyone noticing.
+local function enforce_budget(bullets, order)
+  local budget, evicted = budget_chars(), {}
+  while total_chars(bullets) > budget do
     local biggest, count = nil, 0
     for _, s in ipairs(order) do
-      if #bullets[s] > count then biggest, count = s, #bullets[s] end
+      if #bullets[s] > count then
+        biggest, count = s, #bullets[s]
+      end
     end
     if not biggest or count == 0 then break end
-    table.remove(bullets[biggest], 1)
-    evicted = evicted + 1
+    evicted[#evicted + 1] = table.remove(bullets[biggest], 1)
   end
   return evicted
+end
+
+---Facts that are really procedures belong in skills (index-only cost), not in
+---the always-loaded memory. Detect numbered runbooks and oversized bullets.
+local function looks_procedural(fact)
+  local steps = 0
+  for _ in fact:gmatch("%f[%d]%d+%.%s") do
+    steps = steps + 1
+  end
+  return steps >= 3 or #fact > 350
 end
 
 --------------------------------------------------------------------------------
@@ -225,6 +273,10 @@ function M.remember(fact, section)
   if fact == "" then return { status = "empty", section = "Notes" } end
   fact = fact:gsub("^%-%s*", "")
   section = (section and SECTION_SET[section]) and section or "Notes"
+
+  -- steer runbooks to skills at the source: a procedure as a memory bullet
+  -- costs its full length every turn; as a skill it costs one index line
+  if looks_procedural(fact) then return { status = "procedural", section = section } end
 
   local bullets, order = parse_context()
   local threshold = opts().dedupe_threshold or 0.8
@@ -248,7 +300,13 @@ function M.remember(fact, section)
   bullets[section][#bullets[section] + 1] = fact
   local evicted = enforce_budget(bullets, order)
   save_context(bullets, order)
-  return { status = "added", section = section, evicted = evicted }
+  return {
+    status = "added",
+    section = section,
+    evicted = evicted,
+    -- budget pressure, so the model knows when curation is due
+    utilization = math.min(1, total_chars(bullets) / budget_chars()),
+  }
 end
 
 ---Remove every bullet whose text matches `pattern` (plain, case-insensitive
@@ -282,8 +340,11 @@ local function parse_skill(text)
     local i = 2
     while i <= #lines and lines[i] ~= "---" do
       local k, v = lines[i]:match("^(%w+):%s*(.*)$")
-      if k == "name" then name = vim.trim(v)
-      elseif k == "description" then desc = vim.trim(v) end
+      if k == "name" then
+        name = vim.trim(v)
+      elseif k == "description" then
+        desc = vim.trim(v)
+      end
       i = i + 1
     end
     body_start = i + 1
@@ -316,11 +377,15 @@ local function scan_skills()
       end
     end
   end
-  table.sort(out, function(a, b) return a.name < b.name end)
+  table.sort(out, function(a, b)
+    return a.name < b.name
+  end)
   return out
 end
 
-function M.skills_index() return scan_skills() end
+function M.skills_index()
+  return scan_skills()
+end
 
 ---Session-lifetime counters for instrumentation and hint throttling. Reset per
 ---conversation (agent.new) so a fresh chat can re-surface skills and the /usage
@@ -369,12 +434,12 @@ function M.skill_hints(text, limit)
       for w in pairs(dw) do
         if pw[w] then score = score + 1 end
       end
-      if score >= 3 then
-        scored[#scored + 1] = { skill = s, score = score }
-      end
+      if score >= 3 then scored[#scored + 1] = { skill = s, score = score } end
     end
   end
-  table.sort(scored, function(a, b) return a.score > b.score end)
+  table.sort(scored, function(a, b)
+    return a.score > b.score
+  end)
   local out = {}
   for i = 1, math.min(limit or 2, #scored) do
     out[#out + 1] = scored[i].skill
@@ -389,10 +454,12 @@ end
 function M.init_prompt()
   return table.concat({
     "Initialize this repo's persistent memory. Explore the codebase the way an expert onboards:",
-    "read the README and docs, the package/build manifests (package.json, Makefile, Cargo.toml,",
-    "pyproject.toml, go.mod, *.rockspec — whatever exists), the directory layout, entry points,",
-    "test setup, CI config, and any existing agent docs (AGENTS.md, CLAUDE.md, .cursorrules,",
-    ".github/copilot-instructions.md). Use sub_agent fan-out for large codebases.",
+    "read the README and docs, then whatever build/package manifests THIS language ecosystem uses",
+    "(package.json, Makefile, CMakeLists.txt, Cargo.toml, pyproject.toml/setup.py, go.mod,",
+    "pom.xml/build.gradle, Gemfile, mix.exs, *.cabal, *.rockspec, Dockerfile — or anything else),",
+    "the directory layout, entry points, test setup, CI config, and any existing agent docs",
+    "(AGENTS.md, CLAUDE.md, .cursorrules, .github/copilot-instructions.md).",
+    "Use sub_agent fan-out for large codebases.",
     "",
     "Then record what future sessions need, one `remember` call per fact:",
     "- Commands: the exact build / test / lint / run commands — verify each against the manifests, do not guess",
@@ -404,6 +471,33 @@ function M.init_prompt()
     "skip anything a quick file read re-derives, and never record a guess. If the test, build or release",
     "flow takes 3+ steps, codify it with save_skill instead of cramming it into facts.",
     "Finish with a short summary of what you recorded.",
+  }, "\n")
+end
+
+---The `/context curate` prompt — the compression pass: the agent rewrites its
+---own memory tighter and extracts procedural content into skills, so the
+---always-loaded block shrinks while nothing valuable is lost.
+function M.curate_prompt()
+  return table.concat({
+    "Curate this repo's memory. The current memory is injected in your context under '# Repo memory';",
+    "the file on disk is .advantage/context.md.",
+    "",
+    "Do a compression pass:",
+    "1. Merge overlapping or redundant bullets into single tighter facts; drop anything stale,",
+    "   session-local, or re-derivable from a quick file read. Verify a fact against the code",
+    "   before dropping it as stale.",
+    "2. Extract any bullet that is really a multi-step procedure into a skill (save_skill) —",
+    "   a procedure costs its full length in every request as a bullet, but only one index line",
+    "   as a skill. Leave at most a one-line pointer behind if needed.",
+    "3. Rewrite .advantage/context.md directly (edit_file/write_file) keeping the exact format:",
+    "   '# Repo memory' header, the managed comment, '## Section' headers",
+    "   (Conventions/Architecture/Commands/Gotchas/Preferences/Notes), one '- fact' per line.",
+    ("4. Keep the whole file under ~%d tokens. Quality over quantity: a handful of sharp facts"):format(
+      opts().budget_tokens or 1200
+    ),
+    "   beats a wall of notes.",
+    "",
+    "Finish with a one-line before/after summary (facts and estimated tokens).",
   }, "\n")
 end
 
@@ -431,7 +525,10 @@ function M.save_skill(name, description, body)
   name = tostring(name or ""):gsub("[^%w._-]", "-")
   if name == "" then return false, "invalid skill name" end
   local text = ("---\nname: %s\ndescription: %s\n---\n\n%s\n"):format(
-    name, tostring(description or ""), vim.trim(tostring(body or "")))
+    name,
+    tostring(description or ""),
+    vim.trim(tostring(body or ""))
+  )
   local ok = write_file(skills_dir() .. "/" .. name .. "/SKILL.md", text)
   return ok, ok and nil or "write failed"
 end
@@ -446,11 +543,17 @@ local function project_memory()
   local root = M.root()
   local pick
   for _, name in ipairs({ "AGENTS.md", "CLAUDE.md" }) do
-    if read_file(root .. "/" .. name) then pick = name; break end
+    if read_file(root .. "/" .. name) then
+      pick = name
+      break
+    end
   end
   if not pick then return nil end
   local text = read_file(root .. "/" .. pick) or ""
   text = text:gsub("@([%w._/-]+)", function(rel)
+    -- Only resolve imports that stay inside the repo: reject absolute paths and
+    -- any `..` escape so a committed AGENTS.md/CLAUDE.md can't exfiltrate files.
+    if rel:sub(1, 1) == "/" or rel:find("%.%.") then return "@" .. rel end
     return read_file(root .. "/" .. rel) or ("@" .. rel)
   end)
   text = text:gsub("<!%-%-.-%-%->", "") -- strip HTML-comment noise (e.g. tool markers)
@@ -495,25 +598,28 @@ function M.render()
   local parts = {}
 
   local proj = project_memory()
-  if proj and proj ~= "" then
-    parts[#parts + 1] = "# Project memory (AGENTS.md/CLAUDE.md)\n" .. proj
-  end
+  if proj and proj ~= "" then parts[#parts + 1] = "# Project memory (AGENTS.md/CLAUDE.md)\n" .. proj end
 
   local bullets, order = parse_context()
   local has_facts = false
-  for _, items in pairs(bullets) do if #items > 0 then has_facts = true end end
+  for _, items in pairs(bullets) do
+    if #items > 0 then has_facts = true end
+  end
   if has_facts then
     parts[#parts + 1] = vim.trim(render_context(bullets, order))
   else
     -- cold start: tell the model the memory exists and is empty, so the
     -- flywheel starts on session one instead of never
-    parts[#parts + 1] = "# Repo memory\nEmpty so far — this repo hasn't been learned yet. As you discover durable, non-obvious facts (build/test commands, architecture invariants, conventions, gotchas, stated preferences), record them with the `remember` tool so future sessions start ahead."
+    parts[#parts + 1] =
+      "# Repo memory\nEmpty so far — this repo hasn't been learned yet. As you discover durable, non-obvious facts (build/test commands, architecture invariants, conventions, gotchas, stated preferences), record them with the `remember` tool so future sessions start ahead."
   end
 
   local skills = scan_skills()
   if #skills > 0 then
-    local lines = { "# Skills — reusable procedures for this repo.",
-      "Call the `use_skill` tool with the name to load a skill's full steps before doing that task." }
+    local lines = {
+      "# Skills — reusable procedures for this repo.",
+      "Call the `use_skill` tool with the name to load a skill's full steps before doing that task.",
+    }
     for _, s in ipairs(skills) do
       -- keep the index lean: one line, description capped so a verbose skill
       -- can't bloat the always-loaded tier (the body loads on demand anyway).

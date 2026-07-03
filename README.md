@@ -193,10 +193,19 @@ per-repo memory so the agent gets *better and cheaper* at your codebase over tim
   plus a skill for any 3+-step flow. Run it once in a new repo and session one
   starts with an analyzed repo map instead of a cold start.
 
+- The memory **compresses itself**: `remember` rejects multi-step procedures at
+  the source (steering them to `save_skill`, where they cost one index line
+  instead of their full length every turn); when the budget forces an eviction
+  the agent is told exactly which facts fell out so it can rescue them into
+  skills or tighter phrasing; and `/context curate` runs a full compression
+  pass — merge duplicates, drop stale facts, extract runbooks into skills,
+  rewrite `context.md` in place (you approve the diff).
+
 `/context` (or `:Advantage context`) shows the current memory; `/context init`
-teaches the agent the repo in one pass; `/context verify` flags facts whose
-referenced files have since moved or vanished; `/context forget <text>` drops
-matching facts. Turn it off with `memory = { enabled = false }`.
+teaches the agent the repo in one pass; `/context curate` compresses it;
+`/context verify` flags facts whose referenced files have since moved or
+vanished; `/context forget <text>` drops matching facts. Turn it off with
+`memory = { enabled = false }`.
 
 Commands: `:Advantage` (toggle) · `new` · `model` · `resume` · `stop` · `usage` ·
 `compact` · `context` · `help` · `review` · `yolo [on|off]` · `effort` · `add` ·

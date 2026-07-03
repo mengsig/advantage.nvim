@@ -39,9 +39,7 @@ local function read_since(since)
   if not f then return out end
   for line in f:lines() do
     local ok, rec = pcall(vim.json.decode, line)
-    if ok and type(rec) == "table" and (rec.t or 0) >= since then
-      out[#out + 1] = rec
-    end
+    if ok and type(rec) == "table" and (rec.t or 0) >= since then out[#out + 1] = rec end
   end
   f:close()
   return out
@@ -91,9 +89,7 @@ function M.stats(now)
   for _, r in ipairs(records) do
     local total = (r.i or 0) + (r.o or 0)
     local day = math.floor((r.t - week_start) / 86400) + 1
-    if day >= 1 and day <= 7 then
-      st.days[day] = st.days[day] + total
-    end
+    if day >= 1 and day <= 7 then st.days[day] = st.days[day] + total end
     if r.t >= today_start then
       st.today.input = st.today.input + (r.i or 0)
       st.today.output = st.today.output + (r.o or 0)
@@ -103,9 +99,7 @@ function M.stats(now)
       st.by_model[r.m or "?"] = (st.by_model[r.m or "?"] or 0) + total
       st.first_today = math.min(st.first_today or r.t, r.t)
     end
-    if r.t >= now - 3600 then
-      st.last_hour = st.last_hour + total
-    end
+    if r.t >= now - 3600 then st.last_hour = st.last_hour + total end
   end
 
   local week_total = 0
@@ -143,9 +137,16 @@ function M.dashboard_lines(session_usage)
   if session_usage then
     add("session", ("↑%s ↓%s"):format(fmt(session_usage.input or 0), fmt(session_usage.output or 0)))
   end
-  add("today", ("↑%s ↓%s · %s total · %d request%s"):format(
-    fmt(st.today.input), fmt(st.today.output), fmt(st.today.total),
-    st.today.requests, st.today.requests == 1 and "" or "s"))
+  add(
+    "today",
+    ("↑%s ↓%s · %s total · %d request%s"):format(
+      fmt(st.today.input),
+      fmt(st.today.output),
+      fmt(st.today.total),
+      st.today.requests,
+      st.today.requests == 1 and "" or "s"
+    )
+  )
   if (st.today.cached or 0) > 0 then
     -- cache reads bill at ~10%, so ~90% of cached input tokens are money saved
     local saved = math.floor(st.today.cached * 0.9)
@@ -160,7 +161,9 @@ function M.dashboard_lines(session_usage)
   for m, total in pairs(st.by_model) do
     models[#models + 1] = { m, total }
   end
-  table.sort(models, function(a, b) return a[2] > b[2] end)
+  table.sort(models, function(a, b)
+    return a[2] > b[2]
+  end)
   for i, m in ipairs(models) do
     add(i == 1 and "by model" or "", ("%s  %s"):format(fmt(m[2]), m[1]))
   end
@@ -176,18 +179,22 @@ function M.dashboard_lines(session_usage)
       if hs.skills > 0 then
         local turns = (session_usage and session_usage.turns) or 0
         local saved = turns > 0 and math.max(0, turns * hs.bodies_tokens - hs.loaded_tokens) or 0
-        add("", ("%d skill%s indexed · %d load%s on demand%s"):format(
-          hs.skills, hs.skills == 1 and "" or "s",
-          hs.loads, hs.loads == 1 and "" or "s",
-          saved > 0 and (" · ~%s tok saved vs inlining bodies"):format(fmt(saved)) or ""))
+        add(
+          "",
+          ("%d skill%s indexed · %d load%s on demand%s"):format(
+            hs.skills,
+            hs.skills == 1 and "" or "s",
+            hs.loads,
+            hs.loads == 1 and "" or "s",
+            saved > 0 and (" · ~%s tok saved vs inlining bodies"):format(fmt(saved)) or ""
+          )
+        )
       end
     end
   end
 
   lines[#lines + 1] = ""
-  if st.pace > 0 then
-    add("projection", ("~%s by midnight at today's pace"):format(fmt(st.projected_today)))
-  end
+  if st.pace > 0 then add("projection", ("~%s by midnight at today's pace"):format(fmt(st.projected_today))) end
 
   local budget = cfg.daily_budget
   if budget and budget > 0 then

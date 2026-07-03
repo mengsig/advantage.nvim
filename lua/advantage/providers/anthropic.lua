@@ -20,8 +20,14 @@ local function sanitize_messages(messages)
   for _, msg in ipairs(messages) do
     local content = {}
     for _, block in ipairs(msg.content) do
-      if block.type == "text" or block.type == "tool_use" or block.type == "tool_result"
-        or block.type == "thinking" or block.type == "redacted_thinking" or block.type == "image" then
+      if
+        block.type == "text"
+        or block.type == "tool_use"
+        or block.type == "tool_result"
+        or block.type == "thinking"
+        or block.type == "redacted_thinking"
+        or block.type == "image"
+      then
         content[#content + 1] = block
       end
     end
@@ -130,87 +136,97 @@ local function make_handler(on)
     end
   end
 
-  return on_event, function() return completed end
+  return on_event, function()
+    return completed
+  end
 end
 
 M._make_handler = make_handler
 
 function M.stream(req)
   local pcfg = config.options.providers.anthropic
-  local cancelled, inner = false, nil
+  local cancelled, inner, reauthed = false, nil, false
+  local attempt
 
-  auth.anthropic(function(cred, autherr)
-    if cancelled then return end
-    if not cred then
-      return req.on.error(autherr)
-    end
-    if req.on.auth then req.on.auth(cred.badge) end
+  attempt = function(force)
+    auth.anthropic(function(cred, autherr)
+      if cancelled then return end
+      if not cred then return req.on.error(autherr) end
+      if req.on.auth then req.on.auth(cred.badge) end
 
-    local headers = {
-      "content-type: application/json",
-      "anthropic-version: " .. pcfg.version,
-    }
-    -- A cache breakpoint on the last system block caches the whole static
-    -- prefix (tools, then system, in Anthropic's cache ordering) so it is read
-    -- from cache on every turn instead of re-billed.
-    local betas = {}
-    local system
-    if cred.mode == "oauth" then
-      headers[#headers + 1] = "authorization: Bearer " .. cred.token
-      betas[#betas + 1] = "oauth-2025-04-20"
-      system = {
-        { type = "text", text = OAUTH_IDENTITY },
-        { type = "text", text = req.system, cache_control = CACHE_CONTROL },
+      local headers = {
+        "content-type: application/json",
+        "anthropic-version: " .. pcfg.version,
       }
-    else
-      headers[#headers + 1] = "x-api-key: " .. cred.key
-      system = { { type = "text", text = req.system, cache_control = CACHE_CONTROL } }
-    end
-    -- Parity with the real CLI: keep thinking blocks flowing between tool calls
-    -- so multi-tool turns stay reasoned end-to-end instead of resetting.
-    if req.model.thinking ~= false and pcfg.interleaved_thinking ~= false then
-      betas[#betas + 1] = "interleaved-thinking-2025-05-14"
-    end
-    if #betas > 0 then
-      headers[#headers + 1] = "anthropic-beta: " .. table.concat(betas, ",")
-    end
-
-    local messages = sanitize_messages(req.messages)
-    apply_message_cache(messages)
-
-    local body = {
-      model = req.model.id,
-      max_tokens = pcfg.max_tokens,
-      stream = true,
-      system = system,
-      messages = messages,
-      tools = req.tools,
-    }
-    if req.model.thinking ~= false then
-      if type(req.model.thinking) == "table" then
-        body.thinking = req.model.thinking
-      elseif req.model.thinking_budget then
-        body.thinking = { type = "enabled", budget_tokens = req.model.thinking_budget }
+      -- A cache breakpoint on the last system block caches the whole static
+      -- prefix (tools, then system, in Anthropic's cache ordering) so it is read
+      -- from cache on every turn instead of re-billed.
+      local betas = {}
+      local system
+      if cred.mode == "oauth" then
+        headers[#headers + 1] = "authorization: Bearer " .. cred.token
+        betas[#betas + 1] = "oauth-2025-04-20"
+        system = {
+          { type = "text", text = OAUTH_IDENTITY },
+          { type = "text", text = req.system, cache_control = CACHE_CONTROL },
+        }
       else
-        body.thinking = { type = "adaptive", display = "summarized" }
+        headers[#headers + 1] = "x-api-key: " .. cred.key
+        system = { { type = "text", text = req.system, cache_control = CACHE_CONTROL } }
       end
-    end
+      -- Parity with the real CLI: keep thinking blocks flowing between tool calls
+      -- so multi-tool turns stay reasoned end-to-end instead of resetting.
+      if req.model.thinking ~= false and pcfg.interleaved_thinking ~= false then
+        betas[#betas + 1] = "interleaved-thinking-2025-05-14"
+      end
+      if #betas > 0 then headers[#headers + 1] = "anthropic-beta: " .. table.concat(betas, ",") end
 
-    local on_event, is_completed = make_handler(req.on)
+      local messages = sanitize_messages(req.messages)
+      apply_message_cache(messages)
 
-    inner = util.request_sse({
-      url = pcfg.base_url .. "/v1/messages",
-      headers = headers,
-      body = vim.json.encode(body),
-      on_event = vim.schedule_wrap(on_event),
-      on_error = vim.schedule_wrap(function(msg)
-        if not is_completed() then req.on.error(msg) end
-      end),
-      on_done = vim.schedule_wrap(function()
-        if not is_completed() then req.on.error("stream ended unexpectedly") end
-      end),
-    })
-  end)
+      local body = {
+        model = req.model.id,
+        max_tokens = pcfg.max_tokens,
+        stream = true,
+        system = system,
+        messages = messages,
+        tools = req.tools,
+      }
+      if req.model.thinking ~= false then
+        if type(req.model.thinking) == "table" then
+          body.thinking = req.model.thinking
+        elseif req.model.thinking_budget then
+          body.thinking = { type = "enabled", budget_tokens = req.model.thinking_budget }
+        else
+          body.thinking = { type = "adaptive", display = "summarized" }
+        end
+      end
+
+      local on_event, is_completed = make_handler(req.on)
+
+      inner = util.request_sse({
+        url = pcfg.base_url .. "/v1/messages",
+        headers = headers,
+        body = vim.json.encode(body),
+        on_event = vim.schedule_wrap(on_event),
+        on_error = vim.schedule_wrap(function(msg, status)
+          if is_completed() then return end
+          -- A mid-flight 401 means the token was rotated/revoked server-side:
+          -- force a fresh token once and retry before surfacing an error.
+          if status == 401 and not reauthed and not cancelled then
+            reauthed = true
+            return attempt(true)
+          end
+          req.on.error(msg)
+        end),
+        on_done = vim.schedule_wrap(function()
+          if not is_completed() then req.on.error("stream ended unexpectedly") end
+        end),
+      })
+    end, force)
+  end
+
+  attempt(false)
 
   return {
     stop = function()

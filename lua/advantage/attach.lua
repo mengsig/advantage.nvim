@@ -12,6 +12,17 @@ M.IMAGE_TYPES = {
   webp = "image/webp",
 }
 
+-- Providers cap inline images around 5 MB; base64 inflates ~4/3, so cap the raw
+-- bytes so an accidental multi-MB screenshot is rejected up front instead of
+-- bloating every request/session and getting 400'd by the API.
+local MAX_IMAGE_BYTES = 5 * 1024 * 1024
+
+local function too_big(data)
+  if #data > MAX_IMAGE_BYTES then
+    return ("image is too large (%.1f MB, max %d MB)"):format(#data / 1048576, MAX_IMAGE_BYTES / 1048576)
+  end
+end
+
 local function has(bin)
   return vim.fn.executable(bin) == 1
 end
@@ -47,12 +58,8 @@ function M.clipboard_image()
       get = { "xclip", "-selection", "clipboard", "-t", "image/png", "-o" },
     }
   end
-  if vim.fn.has("mac") == 1 and has("pngpaste") then
-    grabbers[#grabbers + 1] = { get = { "pngpaste", "-" } }
-  end
-  if #grabbers == 0 then
-    return nil, "no clipboard tool found (need wl-paste, xclip or pngpaste)"
-  end
+  if vim.fn.has("mac") == 1 and has("pngpaste") then grabbers[#grabbers + 1] = { get = { "pngpaste", "-" } } end
+  if #grabbers == 0 then return nil, "no clipboard tool found (need wl-paste, xclip or pngpaste)" end
   for _, g in ipairs(grabbers) do
     local available = true
     if g.types then
@@ -61,6 +68,7 @@ function M.clipboard_image()
     end
     if available then
       local data = run(g.get)
+      if data and too_big(data) then return nil, too_big(data) end
       if data and #data > 0 then
         local name = os.date("paste-%H%M%S") .. ".png"
         local path = cache_dir() .. "/" .. name
@@ -81,13 +89,13 @@ end
 function M.load_image(path)
   local ext = path:match("%.(%w+)$")
   local media = ext and M.IMAGE_TYPES[ext:lower()]
-  if not media then
-    return nil, "not a supported image (png/jpg/jpeg/gif/webp)"
-  end
+  if not media then return nil, "not a supported image (png/jpg/jpeg/gif/webp)" end
   local f = io.open(path, "rb")
   if not f then return nil, "cannot read " .. path end
   local data = f:read("*a")
   f:close()
+  local err = too_big(data)
+  if err then return nil, err end
   return {
     name = vim.fn.fnamemodify(path, ":t"),
     path = path,
@@ -105,7 +113,9 @@ local function parse_token(token)
   if p and p ~= "" then
     local lo = tonumber(l1)
     local hi = l2 ~= "" and tonumber(l2) or lo
-    if hi < lo then lo, hi = hi, lo end
+    if hi < lo then
+      lo, hi = hi, lo
+    end
     return p, lo, hi
   end
   return token, nil, nil
@@ -118,14 +128,18 @@ M._parse_token = parse_token
 ---@return string, {name:string, path:string, size:integer, lo?:integer, hi?:integer}[]
 function M.expand_mentions(text, cwd)
   cwd = cwd or uv.cwd()
+  local allow_outside = ((require("advantage.config").options or {}).tools or {}).allow_outside_root
   local seen, files = {}, {}
   for raw in text:gmatch("@([%w%._%-/:#]+)") do
     local token = raw:gsub("[.,;:!?]+$", "")
     if token ~= "" and not seen[token] then
       seen[token] = true
       local rel, lo, hi = parse_token(token)
+      -- Keep mentions inside the project root unless explicitly opted out, so
+      -- `@/etc/passwd` / `@../secret` don't get inlined into the prompt.
+      local escapes = rel:sub(1, 1) == "/" or rel:find("%.%.") ~= nil
       local path = rel:sub(1, 1) == "/" and rel or (cwd .. "/" .. rel)
-      local stat = uv.fs_stat(path)
+      local stat = (allow_outside or not escapes) and uv.fs_stat(path) or nil
       if stat and stat.type == "file" then
         files[#files + 1] = { name = token, rel = rel, path = path, size = stat.size, lo = lo, hi = hi }
       end
@@ -150,7 +164,10 @@ function M.expand_mentions(text, cwd)
       local chunk = table.concat(vim.list_slice(lines, lo, hi), "\n")
       if #chunk > MAX_INLINE then
         out[#out + 1] = ("`%s` is too large to inline — read it with the read_file tool (offset=%d, limit=%d)."):format(
-          file.name, lo, hi - lo + 1)
+          file.name,
+          lo,
+          hi - lo + 1
+        )
       else
         out[#out + 1] = ("```%s %s:L%d-%d (of %d lines)"):format(ft, file.rel, lo, hi, total)
         out[#out + 1] = chunk
@@ -159,7 +176,9 @@ function M.expand_mentions(text, cwd)
       end
     elseif file.size > MAX_INLINE then
       out[#out + 1] = ("`%s` (%.1f KB) is too large to inline — read it with the read_file tool."):format(
-        file.name, file.size / 1024)
+        file.name,
+        file.size / 1024
+      )
     else
       local f = io.open(file.path, "r")
       local content = f and f:read("*a") or ""

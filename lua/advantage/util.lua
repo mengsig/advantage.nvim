@@ -60,13 +60,14 @@ end
 
 ---POST `body` to `url` and stream SSE events back.
 ---Uses a curl config file so the API key never appears in the process list.
----@param opts {url:string, headers:string[], body:string, on_event:fun(name:string,data:any), on_error:fun(msg:string), on_done:fun()}
+---@param opts {url:string, headers:string[], body:string, on_event:fun(name:string,data:any), on_error:fun(msg:string, status?:integer), on_done:fun(), on_retry?:fun(attempt:integer, reason:any)}
 ---@return {stop: fun()}
 function M.request_sse(opts)
   local tmp = vim.fn.tempname()
   vim.fn.mkdir(tmp, "p", "0700")
   local body_file = tmp .. "/b.json"
   local cfg_file = tmp .. "/c.cfg"
+  local hdr_file = tmp .. "/h.txt"
 
   local f = assert(io.open(body_file, "w"))
   f:write(opts.body)
@@ -83,6 +84,7 @@ function M.request_sse(opts)
     "no-buffer",
     "http1.1",
     "connect-timeout = 15",
+    "dump-header = " .. q(hdr_file),
     "data-binary = " .. q("@" .. body_file),
   }
   for _, h in ipairs(opts.headers) do
@@ -97,18 +99,45 @@ function M.request_sse(opts)
   -- under provider load and are safe to retry *only before any SSE event has
   -- been dispatched* — otherwise a retry would duplicate streamed content.
   local RETRIABLE = {
-    [6] = true, [7] = true, [16] = true, [28] = true,
-    [35] = true, [52] = true, [55] = true, [56] = true, [92] = true,
+    [6] = true,
+    [7] = true,
+    [16] = true,
+    [28] = true,
+    [35] = true,
+    [52] = true,
+    [55] = true,
+    [56] = true,
+    [92] = true,
   }
   local max_attempts = opts.max_attempts or 3
 
   local finished, dispatched, stopped = false, 0, false
   local current_job = nil
+  local cleaned = false
 
   local function cleanup()
+    if cleaned then return end
+    cleaned = true
     os.remove(body_file)
     os.remove(cfg_file)
+    os.remove(hdr_file)
     uv.fs_rmdir(tmp)
+  end
+
+  -- Parse the dumped response headers for the final HTTP status and Retry-After.
+  -- Under redirects/100-continue there can be several status lines; keep the last.
+  local function response_meta()
+    local fh = io.open(hdr_file, "r")
+    if not fh then return nil, nil end
+    local status, retry_after
+    for line in fh:lines() do
+      local code = line:match("^HTTP/%S+%s+(%d%d%d)")
+      if code then status = tonumber(code) end
+      local ra = line:match("^[Rr]etry%-[Aa]fter:%s*(.-)%s*\r?$")
+      if ra then retry_after = ra end
+    end
+    fh:close()
+    return status, retry_after
   end
 
   local run_attempt
@@ -146,16 +175,40 @@ function M.request_sse(opts)
         end
         if finished then return end
 
-        -- Retry a transient network failure iff nothing has streamed yet.
-        if code ~= 0 and #stray == 0 and dispatched == 0 and not stopped
-          and RETRIABLE[code] and attempt_no < max_attempts then
-          if opts.on_retry then
-            pcall(opts.on_retry, attempt_no, code)
-          end
+        local status, retry_after = response_meta()
+
+        local function retry(delay, reason)
+          if opts.on_retry then pcall(opts.on_retry, attempt_no, reason) end
           vim.defer_fn(function()
             if not finished and not stopped then run_attempt(attempt_no + 1) end
-          end, 400 * attempt_no)
-          return
+          end, delay)
+        end
+
+        -- Retry a transient network failure iff nothing has streamed yet.
+        if
+          code ~= 0
+          and #stray == 0
+          and dispatched == 0
+          and not stopped
+          and RETRIABLE[code]
+          and attempt_no < max_attempts
+        then
+          return retry(400 * attempt_no, code)
+        end
+
+        -- Retry HTTP rate-limits / server errors (429, 5xx) with backoff. These
+        -- exit curl cleanly with a JSON error body, so nothing has streamed yet.
+        if
+          status
+          and dispatched == 0
+          and not stopped
+          and attempt_no < max_attempts
+          and (status == 429 or (status >= 500 and status <= 599))
+        then
+          local delay = math.min(500 * 2 ^ (attempt_no - 1), 8000)
+          local secs = tonumber(retry_after)
+          if secs and secs > 0 and secs <= 60 then delay = secs * 1000 end
+          return retry(delay, status)
         end
 
         finished = true
@@ -169,9 +222,10 @@ function M.request_sse(opts)
           else
             msg = table.concat(stray, " ")
           end
-          opts.on_error(msg)
+          if status and status >= 400 then msg = ("HTTP %d: %s"):format(status, msg) end
+          opts.on_error(msg, status)
         elseif code ~= 0 then
-          opts.on_error(#stderr > 0 and table.concat(stderr, " ") or ("curl exited with code " .. code))
+          opts.on_error(#stderr > 0 and table.concat(stderr, " ") or ("curl exited with code " .. code), status)
         else
           opts.on_done()
         end
@@ -195,6 +249,7 @@ function M.request_sse(opts)
       if not finished then
         finished = true
         pcall(vim.fn.jobstop, current_job)
+        cleanup()
       end
     end,
   }

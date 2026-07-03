@@ -1,0 +1,148 @@
+*advantage.txt*        A coding-agent harness that lives inside Neovim
+
+                              ✦ advantage.nvim ✦
+
+==============================================================================
+CONTENTS                                                  *advantage-contents*
+
+  1. Introduction ............ |advantage-introduction|
+  2. Requirements ............ |advantage-requirements|
+  3. Setup ................... |advantage-setup|
+  4. Commands ................ |advantage-commands|
+  5. Keymaps ................. |advantage-keymaps|
+  6. Configuration ........... |advantage-configuration|
+  7. Tools & security ........ |advantage-tools|
+  8. Memory & skills ......... |advantage-memory|
+
+==============================================================================
+1. INTRODUCTION                                       *advantage-introduction*
+
+advantage.nvim is a coding-agent *harness* that runs its own agent loop inside
+Neovim: it streams from the model, executes tools in your editor, feeds the
+results back, and repeats until the task is done. It is not a wrapper around a
+CLI.
+
+- Runs on your subscription: Claude Code login (Pro/Max) or Codex / ChatGPT
+  login. Environment API keys work as a fallback.
+- Model-agnostic: Anthropic and OpenAI/Codex families out of the box.
+- Editor-native tools executed inside Neovim, all edits reviewable.
+
+==============================================================================
+2. REQUIREMENTS                                       *advantage-requirements*
+
+- Neovim >= 0.10
+- `curl` on your PATH
+- One of: a `claude` CLI login, a `codex` CLI login, or `$ANTHROPIC_API_KEY` /
+  `$OPENAI_API_KEY`.
+- Optional: `rg` (ripgrep) for fast grep/file listing; `wl-paste`/`xclip`/
+  `pngpaste` for clipboard image paste.
+
+==============================================================================
+3. SETUP                                                     *advantage-setup*
+
+Call `setup()` once (options are optional; defaults are sensible): >lua
+
+    require("advantage").setup({
+      default_model = "anthropic/claude-opus-4-8",
+    })
+<
+With lazy.nvim: >lua
+
+    { "mengsig/advantage.nvim", opts = {} }
+<
+==============================================================================
+4. COMMANDS                                               *advantage-commands*
+
+                                                                   *:Advantage*
+:Advantage              Toggle the chat panel.
+:Advantage new          Start a new session.
+:Advantage model        Pick the model.
+:Advantage resume       Resume a saved session for this project.
+:Advantage stop         Cancel the in-flight turn.
+:Advantage usage        Token usage dashboard.
+:Advantage compact      Force conversation compaction.
+:Advantage context      Show/manage per-repo memory (see |advantage-memory|).
+:Advantage review       Review the agent's file changes (diff).
+:Advantage yolo [on|off]
+                        Toggle skip-all-permissions mode.
+:Advantage effort       Tune reasoning effort / thinking.
+:Advantage help         Keybinding & command cheatsheet.
+:Advantage add          Send the current file / selection to the prompt.
+
+==============================================================================
+5. KEYMAPS                                                 *advantage-keymaps*
+
+Defaults (configurable under `keymaps`):
+
+  <leader>cc   toggle the chat panel
+  <leader>cn   new session
+  <leader>cm   pick model
+  <leader>cr   resume session
+  <leader>cs   add visual selection as an @file:L10-20 mention
+  <leader>cf   send current file to the prompt
+  <leader>cl   send @file:L{cursor line}
+  <leader>cp   pick a project file to send
+  <leader>cu   usage dashboard
+  <leader>cd   review file changes (diff)
+  <leader>cy   toggle yolo mode
+  <leader>ce   tune reasoning effort
+  <leader>c?   keybinding cheatsheet
+
+In the prompt: <CR> sends; `@` completes project files; `/` runs a slash
+command; paste inserts clipboard images as attachment chips.
+
+==============================================================================
+6. CONFIGURATION                                     *advantage-configuration*
+
+Full defaults live in `lua/advantage/config.lua`. Key options: >lua
+
+    require("advantage").setup({
+      default_model = "anthropic/claude-opus-4-8",
+      models = { { ref = "anthropic/claude-opus-4-8", label = "opus 4.8" } },
+      ui = { width = 0.42, input_height = 4, border = "rounded" },
+      tools = {
+        auto_approve = {},        -- e.g. { bash = true } (at your own risk)
+        allow_outside_root = false,
+        yolo = false,
+        bash_timeout_ms = 120000,
+      },
+      context = {
+        auto_compact = true,
+        compact_at_tokens = 120000,
+        keep_recent_messages = 16,
+      },
+      subagents = { enabled = true, max_turns = 6, parallel = true },
+      memory = { enabled = true, budget_tokens = 1200 },
+      sessions = { autosave = true },
+    })
+<
+Note: `models` and other list options are replaced wholesale when you supply
+them (not merged element-wise with the defaults).
+
+==============================================================================
+7. TOOLS & SECURITY                                          *advantage-tools*
+
+Tools: `read_file`, `edit_file`, `write_file`, `multi_edit`, `bash`, `grep`,
+`find_files`, `list_dir`, `sub_agent`, plus memory tools.
+
+File tools are confined to the project root: absolute paths, `..` traversal,
+and symlinks that resolve outside the repo are rejected (set
+`tools.allow_outside_root = true` to opt out). Mutating tools (`edit_file`,
+`write_file`, `multi_edit`, `bash`) require an approval card unless auto-approved
+or `yolo` is on. Sub-agents are read-only. See SECURITY_AUDIT.md for the full
+trust-boundary notes.
+
+==============================================================================
+8. MEMORY & SKILLS                                          *advantage-memory*
+
+advantage keeps per-repo memory under `<root>/.advantage/`:
+
+  context.md            durable, human-readable learned facts (one bullet each)
+  skills/<name>/SKILL.md  a named reusable procedure (loaded on demand)
+
+`:Advantage context` shows the memory; `context init` teaches the repo in one
+pass; `context curate` compresses it; `context verify` flags facts whose files
+have moved/vanished; `context forget <text>` drops matching facts. Disable with
+`memory = { enabled = false }`. AGENTS.md / CLAUDE.md are also ingested.
+
+vim:tw=78:ts=8:ft=help:norl:

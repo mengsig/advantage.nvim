@@ -3,7 +3,7 @@ local M = {}
 
 local function dir()
   local d = vim.fn.stdpath("data") .. "/advantage/sessions"
-  vim.fn.mkdir(d, "p")
+  vim.fn.mkdir(d, "p", "0700")
   return d
 end
 
@@ -26,10 +26,15 @@ function M.save(agent)
   }
   local ok, encoded = pcall(vim.json.encode, payload)
   if not ok then return end
-  local f = io.open(path, "w")
+  -- Autosave overwrites the same file every turn; write to a temp file and
+  -- atomically rename so a crash mid-write can't corrupt the only copy.
+  local tmp = path .. ".tmp"
+  local f = io.open(tmp, "w")
   if not f then return end
   f:write(encoded)
   f:close()
+  pcall((vim.uv or vim.loop).fs_chmod, tmp, 384) -- 0600: transcripts can hold secrets
+  if not os.rename(tmp, path) then os.remove(tmp) end
 end
 
 function M.list()
@@ -41,9 +46,7 @@ function M.list()
       if f then
         local ok, data = pcall(vim.json.decode, f:read("*a"))
         f:close()
-        if ok and type(data) == "table" and data.messages then
-          out[#out + 1] = data
-        end
+        if ok and type(data) == "table" and data.messages then out[#out + 1] = data end
       end
     end
   end
