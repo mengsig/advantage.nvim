@@ -416,7 +416,10 @@ function M.summarize_with_llm(messages, opts, on_done)
   local usage = { input = 0, output = 0, cached = 0 }
 
   return provider.stream({
-    model = { id = resolved.id, thinking = false },
+    -- Keep the summarizer cheap/fast regardless of which provider it resolves
+    -- to: `thinking = false` is read by the anthropic provider, `reasoning_effort`
+    -- by the openai one — each ignores the field it doesn't understand.
+    model = { id = resolved.id, thinking = false, reasoning_effort = "minimal" },
     system = SUMMARIZER_SYSTEM_PROMPT,
     messages = { { role = "user", content = { { type = "text", text = transcript } } } },
     tools = nil,

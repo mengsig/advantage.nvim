@@ -770,6 +770,89 @@ do
   vim.env.CODEX_HOME = nil
 end
 
+-- 4a3. LLM-summarized compaction routed through the real openai/codex provider --
+
+section("codex summarizer (real openai provider path)")
+do
+  -- Force the api-key fallback deterministically: point CODEX_HOME at an empty
+  -- temp dir so no real ~/.codex/auth.json (and no real token refresh) is ever
+  -- touched, matching the isolation the "auth null handling" section above uses.
+  local tmp = vim.fn.tempname()
+  vim.fn.mkdir(tmp, "p")
+  vim.env.CODEX_HOME = tmp
+  vim.env.OPENAI_API_KEY = "test-key"
+
+  local util = require("advantage.util")
+  local config = require("advantage.config")
+  local compact = require("advantage.compact")
+
+  config.options.context.keep_recent_messages = 4
+  config.options.context.summarizer_model = "openai/gpt-5.1-codex-mini"
+
+  local captured_body
+  local orig_request_sse = util.request_sse
+  util.request_sse = function(opts)
+    captured_body = vim.json.decode(opts.body)
+    vim.schedule(function()
+      opts.on_event("response.output_item.done", {
+        type = "response.output_item.done",
+        item = {
+          type = "message",
+          content = { { type = "output_text", text = "Primary Request and Intent: ship the widget." } },
+        },
+      })
+      opts.on_event("response.completed", {
+        type = "response.completed",
+        response = { usage = { input_tokens = 400, output_tokens = 60 } },
+      })
+    end)
+    return { stop = function() end }
+  end
+
+  local function make_messages(n)
+    local out = {}
+    for i = 1, n do
+      out[#out + 1] = {
+        role = i % 2 == 1 and "user" or "assistant",
+        content = { { type = "text", text = ("turn %d content"):format(i) } },
+      }
+    end
+    return out
+  end
+
+  local done, next_messages, info, err = false, nil, nil, nil
+  compact.summarize_with_llm(make_messages(10), config.options.context, function(nm, i, e)
+    next_messages, info, err = nm, i, e
+    done = true
+  end)
+  vim.wait(2000, function()
+    return done
+  end, 5)
+
+  util.request_sse = orig_request_sse
+  vim.env.CODEX_HOME = nil
+  vim.env.OPENAI_API_KEY = nil
+
+  check(done, "codex summarizer request completed")
+  check(err == nil, "no error routing summarization through the openai/codex provider")
+  check(
+    captured_body ~= nil and captured_body.model == "gpt-5.1-codex-mini",
+    "request targets the configured codex model"
+  )
+  check(
+    captured_body and captured_body.reasoning and captured_body.reasoning.effort == "minimal",
+    "codex summarizer forces minimal reasoning effort (thinking=false alone does nothing for openai)"
+  )
+  check(
+    next_messages and next_messages[1].content[1].text:find(compact._SUMMARY_PREFIX, 1, true) ~= nil,
+    "codex-produced summary still carries the shared SUMMARY_PREFIX"
+  )
+  check(
+    info and info.mode == "llm" and info.model and info.model.provider == "openai",
+    "info reports the resolved openai/codex summarizer model"
+  )
+end
+
 -- 5. agent e2e with a fake provider + UI ----------------------------------------
 
 -- keep test token usage out of the user's real ledger
