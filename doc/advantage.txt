@@ -124,7 +124,8 @@ Full defaults live in `lua/advantage/config.lua`. Key options: >lua
         auto_compact = true,
         compact_at_tokens = 120000,
         keep_recent_messages = 16,
-        compact_mode = "llm",    -- manual /compact only; auto-compact is always heuristic
+        auto_compact_mode = "heuristic", -- silent auto-compact: "heuristic" | "llm"
+        compact_mode = "llm",    -- manual /compact: "llm" | "heuristic"
         summarizer_model = "anthropic/claude-haiku-4-5",
       },
       subagents = { enabled = true, max_turns = 6, parallel = true },

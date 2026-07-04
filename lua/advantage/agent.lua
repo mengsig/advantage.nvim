@@ -56,12 +56,6 @@ local MEMORY_GUIDE = table.concat({
   "- A skill is a reusable procedure. When a listed skill's description matches the task, call `use_skill` to load its full steps before doing that task. Codify a genuinely reusable multi-step procedure with `save_skill`.",
 }, "\n")
 
----@param memory_block? string a pre-rendered, session-frozen memory block to use
----  verbatim instead of re-rendering. Passing the same bytes every turn keeps the
----  cached system prefix byte-identical, so a mid-session `remember`/`save_skill`
----  write doesn't invalidate the whole prompt cache (a memory write persists to
----  disk and stays in the recent transcript, so the model still has it). Omit
----  (nil) to render fresh — sub-agents and tests do.
 ---The system prompt as an ordered list of labeled parts. Each entry is
 ---`{ label = "<short name>", text = "<bytes>", is_memory? = true }`.
 ---`M.system_prompt` joins the `text` fields with "\n\n"; `/context preview` uses
@@ -90,6 +84,12 @@ function M.system_prompt_parts(memory_block)
   return parts
 end
 
+---@param memory_block? string a pre-rendered, session-frozen memory block to use
+---  verbatim instead of re-rendering. Passing the same bytes every turn keeps the
+---  cached system prefix byte-identical, so a mid-session `remember`/`save_skill`
+---  write doesn't invalidate the whole prompt cache (a memory write persists to
+---  disk and stays in the recent transcript, so the model still has it). Omit
+---  (nil) to render fresh — sub-agents and tests do.
 function M.system_prompt(memory_block)
   local texts = {}
   for _, p in ipairs(M.system_prompt_parts(memory_block)) do
@@ -335,6 +335,14 @@ function Agent:_maybe_compact(force, opts, callback)
     -- identical before/after token counts.
     if self._compacting then return callback(nil) end
 
+    -- Threshold gate: silent auto-compact (heuristic or llm) never fires below
+    -- compact_at_tokens. The heuristic path re-checks this itself, but the llm
+    -- path does not, so without this check here the very first auto-compact of
+    -- a session (before _auto_compact_floor exists) would fire on message count
+    -- alone under auto_compact_mode = "llm", ignoring compact_at_tokens entirely.
+    local threshold = cfg.compact_at_tokens or 120000
+    if compact.estimate_tokens(self.messages) < threshold then return callback(nil) end
+
     -- Hysteresis: once auto-compaction has run, don't fire again until the
     -- transcript has genuinely grown past where it left off. Without this, a
     -- session whose protected "recent" window alone sits near
@@ -344,7 +352,6 @@ function Agent:_maybe_compact(force, opts, callback)
     -- instead of settling. `_auto_compact_floor` is the after_tokens estimate
     -- from the last compaction (manual or auto); require growth of at least
     -- 10% of the threshold beyond it before considering another one.
-    local threshold = cfg.compact_at_tokens or 120000
     local margin = math.max(threshold * 0.1, 2000)
     if self._auto_compact_floor and compact.estimate_tokens(self.messages) < self._auto_compact_floor + margin then
       return callback(nil)
@@ -441,11 +448,37 @@ end
 
 function Agent:_turn_impl()
   self.ctx.model = self.model
-  -- Compaction is best-effort: a failure here must not abort the user's turn,
-  -- so fall through to streaming with un-compacted history rather than erroring.
-  pcall(function()
-    self:_maybe_compact(false)
+  -- Mark busy before compaction (which may be asynchronous in LLM mode) so a
+  -- concurrent send() during the wait is treated as an interrupt/queue instead
+  -- of slipping through as a second top-level turn while status is still "idle".
+  self.status = "streaming"
+
+  local function continue_turn()
+    local ok, err = pcall(function()
+      self:_continue_turn()
+    end)
+    if not ok then
+      self.job = nil
+      self:ui().notice("error starting turn: " .. tostring(err))
+      self:_finish(true)
+    end
+  end
+
+  -- Wait for compaction to finish before building this turn's request: the LLM
+  -- path mutates self.messages asynchronously (self.messages = next_messages),
+  -- so starting the main request in parallel would race a concurrent replacement
+  -- of self.messages (silently dropping messages the turn appends meanwhile) and
+  -- clobber the compaction job's handle in self.job. The heuristic path calls
+  -- back synchronously, so this changes nothing for the default auto-compact mode.
+  -- Compaction is still best-effort: a synchronous failure here must not abort
+  -- the turn, so fall through to streaming with un-compacted history.
+  local ok = pcall(function()
+    self:_maybe_compact(false, nil, continue_turn)
   end)
+  if not ok then continue_turn() end
+end
+
+function Agent:_continue_turn()
   -- provider-request count; /usage uses it for the harness savings math
   self.usage.turns = (self.usage.turns or 0) + 1
 
@@ -824,6 +857,11 @@ function Agent:cancel(opts)
   if not self:busy() then return end
   local was_compacting = self.status == "compacting"
   self.cancelled = true
+  -- job.stop() below never invokes the summarizer's completion callback, which
+  -- is the only place that otherwise clears this flag — reset it here so a
+  -- cancelled compaction (manual /compact, or auto_compact_mode = "llm") can't
+  -- permanently disable silent auto-compact for the rest of the session.
+  self._compacting = false
   -- A cancelled LLM compaction stops the summarizer stream, so its completion
   -- callback (which clears the progress bar) never fires — clear it here.
   if was_compacting then pcall(function()

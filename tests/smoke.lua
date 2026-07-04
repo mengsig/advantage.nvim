@@ -709,6 +709,7 @@ do
     })
     config.options.context.summarizer_model = "fakesummarizerslow/mini"
     config.options.context.auto_compact_mode = "llm"
+    config.options.context.compact_at_tokens = 1
 
     local ag3 = agent_mod.new({ model = { provider = "fakesummarizerslow", id = "mini", label = "mini" } })
     ag3.messages = make_messages(10)
@@ -728,6 +729,100 @@ do
     check(infos[2] == nil, "the re-entrant call's callback receives nil, not a duplicate compaction")
     check(infos[1] ~= nil, "the first call's callback still completes with the compaction info")
     config.options.context.auto_compact_mode = nil
+    config.options.context.compact_at_tokens = nil
+  end
+
+  -- regression: the llm auto-compact path must honor compact_at_tokens even on
+  -- the very first compaction of a session, before _auto_compact_floor exists.
+  -- Previously the hysteresis check only ran once a floor was set, so a fresh
+  -- agent under auto_compact_mode = "llm" would fire on message count alone.
+  do
+    local summarize_calls = 0
+    providers.register("fakesummarizerunused", {
+      stream = function(req)
+        summarize_calls = summarize_calls + 1
+        vim.defer_fn(function()
+          req.on.complete({ { type = "text", text = compact._SUMMARY_PREFIX .. "\nunused" } }, "end_turn")
+        end, 5)
+        return { stop = function() end }
+      end,
+    })
+    config.options.context.summarizer_model = "fakesummarizerunused/mini"
+    config.options.context.auto_compact_mode = "llm"
+    config.options.context.compact_at_tokens = 120000
+
+    local ag4 = agent_mod.new({ model = { provider = "fakesummarizerunused", id = "mini", label = "mini" } })
+    ag4.messages = make_messages(10)
+    local fired = false
+    ag4:_maybe_compact(false, {}, function(info)
+      fired = true
+    end)
+    check(fired == true, "a fresh agent below threshold gets an immediate (nil) callback")
+    check(summarize_calls == 0, "llm auto-compact does not fire below compact_at_tokens on a fresh session")
+
+    config.options.context.auto_compact_mode = nil
+    config.options.context.compact_at_tokens = nil
+  end
+
+  -- regression: cancelling a session must not permanently disable auto-compact.
+  -- self.job:stop() never invokes the summarizer's completion callback, which
+  -- is otherwise the only place _compacting gets cleared.
+  do
+    providers.register("fakesummarizerhang", {
+      stream = function(req)
+        return { stop = function() end }
+      end,
+    })
+    config.options.context.summarizer_model = "fakesummarizerhang/mini"
+
+    local ag5 = agent_mod.new({ model = { provider = "fakesummarizerhang", id = "mini", label = "mini" } })
+    ag5.messages = make_messages(10)
+    ag5:compact({ mode = "llm" }, function() end)
+    check(ag5._compacting == true, "compaction is in flight before cancellation")
+    ag5:cancel()
+    check(ag5._compacting == false, "cancel() resets _compacting so a stuck LLM compaction doesn't wedge auto-compact")
+  end
+
+  -- regression: _turn() must wait for an async auto-compact to finish before
+  -- starting the next request, otherwise the main stream's self.job overwrites
+  -- the compaction job's handle and the summarizer's wholesale self.messages
+  -- replacement can race messages the turn appends in the meantime.
+  do
+    local main_stream_started = false
+    providers.register("fakesummarizerrace", {
+      stream = function(req)
+        if req.system and req.system:find(compact._SUMMARY_PREFIX, 1, true) then return { stop = function() end } end
+        vim.defer_fn(function()
+          main_stream_started = true
+        end, 5)
+        return { stop = function() end }
+      end,
+    })
+    providers.register("fakesummarizerrace_summarizer", {
+      stream = function(req)
+        vim.defer_fn(function()
+          req.on.complete({ { type = "text", text = compact._SUMMARY_PREFIX .. "\nraced summary" } }, "end_turn")
+        end, 30)
+        return { stop = function() end }
+      end,
+    })
+    config.options.context.summarizer_model = "fakesummarizerrace_summarizer/mini"
+    config.options.context.auto_compact_mode = "llm"
+    config.options.context.compact_at_tokens = 1
+
+    local ag6 = agent_mod.new({ model = { provider = "fakesummarizerrace", id = "mini", label = "mini" } })
+    ag6.messages = make_messages(10)
+    ag6.status = "idle"
+    ag6:_turn()
+    check(ag6.status ~= "idle", "status stays busy while an async auto-compact is in flight")
+    check(main_stream_started == false, "the main request has not started yet while compaction is in flight")
+    vim.wait(2000, function()
+      return main_stream_started
+    end, 5)
+    check(main_stream_started == true, "the main request eventually starts once compaction settles")
+
+    config.options.context.auto_compact_mode = nil
+    config.options.context.compact_at_tokens = nil
   end
 end
 
