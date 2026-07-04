@@ -112,7 +112,9 @@ Full defaults live in `lua/advantage/config.lua`. Key options: >lua
 
     require("advantage").setup({
       default_model = "anthropic/claude-opus-4-8",
-      models = { { ref = "anthropic/claude-opus-4-8", label = "opus 4.8" } },
+      -- context_window scales compaction per model (adjust to your tier).
+      models = { { ref = "anthropic/claude-opus-4-8", label = "opus 4.8",
+                   context_window = 1000000 } },
       ui = { width = 0.42, input_height = 4, border = "rounded" },
       tools = {
         auto_approve = {},        -- e.g. { bash = true } (at your own risk)
@@ -122,8 +124,11 @@ Full defaults live in `lua/advantage/config.lua`. Key options: >lua
       },
       context = {
         auto_compact = true,
-        compact_at_tokens = 120000,
-        keep_recent_messages = 16,
+        -- Auto-compact at min(compact_fraction × context_window, compact_at_tokens).
+        compact_fraction = 0.75,   -- % of the model window that triggers compaction
+        compact_at_tokens = 200000, -- absolute cost ceiling on that trigger
+        keep_recent_messages = 16, -- also bounded by keep_recent_fraction (tokens)
+        keep_recent_fraction = 0.4, -- recent window kept, as a % of the threshold
         auto_compact_mode = "heuristic", -- silent auto-compact: "heuristic" | "llm"
         compact_mode = "llm",    -- manual /compact: "llm" | "heuristic"
         summarizer_model = "anthropic/claude-haiku-4-5",

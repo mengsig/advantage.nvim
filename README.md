@@ -151,9 +151,16 @@ inlining every skill body into every request — so the harness's token thesis i
 measured, not asserted.
 
 **Context compaction.** Old transcript history is automatically compacted when
-it crosses `context.compact_at_tokens` (roughly chars/4). The newest messages stay
-verbatim; older user asks, assistant text, tool calls and results become one
-summary message. Compaction runs in one of two modes:
+its estimated size (roughly chars/4) crosses a threshold that **scales to the
+active model's window**: `min(context.compact_fraction × model.context_window,
+context.compact_at_tokens)`. The fraction protects a small-window model (it
+compacts before it overflows) while `compact_at_tokens` is an absolute **cost
+ceiling** so a 1M-context model never carries ~750k raw tokens every turn. The
+newest messages stay verbatim — bounded by both `keep_recent_messages` and a
+token budget (`keep_recent_fraction` of the threshold) so a few huge tool
+outputs can't keep the retained window above the threshold; older user asks,
+assistant text, tool calls and results become one summary message. Compaction
+runs in one of two modes:
 
 - **Silent auto-compact** (a background threshold crossing mid-turn) defaults to
   a free, offline heuristic — a one-line-per-message truncation. No extra model
@@ -271,14 +278,15 @@ approval; if any edit in the batch fails to match, nothing is written.
 ```lua
 require("advantage").setup({
   default_model = "anthropic/claude-opus-4-8",
-  models = {
-    { ref = "anthropic/claude-opus-4-8", label = "opus 4.8" },
-    { ref = "anthropic/claude-sonnet-5", label = "sonnet 5" },
-    { ref = "anthropic/claude-fable-5", label = "fable 5" },
-    { ref = "anthropic/claude-haiku-4-5", label = "haiku 4.5", thinking = false },
-    { ref = "openai/gpt-5.5", label = "gpt-5.5" },
-    { ref = "openai/gpt-5.1-codex", label = "codex 5.1" },
-    { ref = "openai/gpt-5.1-codex-mini", label = "codex mini" },
+  models = {                       -- context_window scales compaction per model;
+                                   -- adjust to your account/tier (confirmed vs floor)
+    { ref = "anthropic/claude-opus-4-8", label = "opus 4.8", context_window = 1000000 },
+    { ref = "anthropic/claude-sonnet-5", label = "sonnet 5", context_window = 1000000 },
+    { ref = "anthropic/claude-fable-5", label = "fable 5", context_window = 200000 },
+    { ref = "anthropic/claude-haiku-4-5", label = "haiku 4.5", thinking = false, context_window = 200000 },
+    { ref = "openai/gpt-5.5", label = "gpt-5.5", context_window = 1000000 },
+    { ref = "openai/gpt-5.1-codex", label = "codex 5.1", context_window = 400000 },
+    { ref = "openai/gpt-5.1-codex-mini", label = "codex mini", context_window = 400000 },
   },
   system_prompt = nil,           -- string to replace, function(default) to extend
   max_agent_turns = 100,         -- safety cap on tool-loop round-trips per user turn
@@ -297,8 +305,10 @@ require("advantage").setup({
   },
   context = {
     auto_compact = true,
-    compact_at_tokens = 120000,  -- rough chars/4 estimate
-    keep_recent_messages = 16,
+    compact_fraction = 0.75,     -- compact at this % of the model's context_window
+    compact_at_tokens = 200000,  -- absolute cost ceiling on that trigger (chars/4)
+    keep_recent_messages = 16,   -- newest kept verbatim, also bounded by:
+    keep_recent_fraction = 0.4,  -- recent window kept, as a % of the threshold
     summary_max_chars = 12000,   -- heuristic-mode summary cap
     auto_compact_mode = "heuristic", -- auto-compact: "heuristic" | "llm"
     compact_mode = "llm",        -- manual /compact: "llm" | "heuristic"

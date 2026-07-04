@@ -213,6 +213,49 @@ local function find_tool_use_message(messages, last_idx, id)
   return nil
 end
 
+---Effective auto-compaction threshold in tokens, resolved from the active model.
+---The trigger is the SMALLER of two bounds:
+---  * a fraction of the model's `context_window` (`compact_fraction`) — so a small
+---    window compacts before it overflows, and a large one isn't compacted at the
+---    same absolute count as a small one; and
+---  * an absolute `compact_at_tokens` ceiling — a cost cap, because holding (say)
+---    0.75 × 1M ≈ 750k tokens of context every turn is ruinously expensive and
+---    would also overflow the cheap summarizer. The cap keeps large-window models
+---    from ever holding an absurd amount of raw context.
+---Falls back to 120000 when neither the window nor the cap is known. Pure and
+---deterministic so the agent can resolve it once and hand the number to the
+---model-agnostic compaction functions (and so it is unit-testable).
+---@param cfg table context config
+---@param model table|nil the active model (may carry `context_window`)
+---@return number tokens
+function M.resolve_threshold(cfg, model)
+  cfg = type(cfg) == "table" and cfg or {}
+  local cap = type(cfg.compact_at_tokens) == "number" and cfg.compact_at_tokens or nil
+  local window = model and model.context_window
+  local by_window = nil
+  if type(window) == "number" and window > 0 then by_window = math.floor(window * (cfg.compact_fraction or 0.75)) end
+  if by_window and cap then return math.min(by_window, cap) end
+  return by_window or cap or 120000
+end
+
+---Token budget for the retained recent window, as a fraction of the *resolved
+---threshold* (not the raw window): the recent window must stay comfortably under
+---the threshold or compaction can never bring the transcript below it and would
+---re-trigger every turn. An explicit `keep_recent_tokens` wins; otherwise
+---`keep_recent_fraction` of the threshold; `nil` when there is no threshold to key
+---off, in which case prepare_split falls back to the message-count cap alone.
+---@param cfg table context config
+---@param threshold number|nil the resolved compaction threshold
+---@return number|nil tokens
+function M.resolve_keep_recent_tokens(cfg, threshold)
+  cfg = type(cfg) == "table" and cfg or {}
+  if type(cfg.keep_recent_tokens) == "number" then return cfg.keep_recent_tokens end
+  if type(threshold) == "number" and threshold > 0 then
+    return math.floor(threshold * (cfg.keep_recent_fraction or 0.4))
+  end
+  return nil
+end
+
 local function adjust_cut_for_tool_pairs(messages, cut)
   -- Responses-style providers reject a function_call_output unless the matching
   -- function_call is also present in the replayed context. Avoid compacting away
@@ -237,7 +280,26 @@ local function prepare_split(messages, opts)
   local keep = math.max(2, opts.keep_recent_messages or 16)
   if #messages <= keep + 1 then return nil end
 
-  local cut = adjust_cut_for_tool_pairs(messages, #messages - keep)
+  local cut = #messages - keep
+
+  -- Also bound the retained recent window by a token budget: the message-count
+  -- cap alone can retain far more than the compaction threshold when recent
+  -- messages are large (e.g. a few big file reads), leaving the transcript above
+  -- threshold and re-triggering compaction every turn. Walk newest→oldest,
+  -- keeping messages while they fit `keep_recent_tokens`, but always retain at
+  -- least 2 for coherence; then take whichever bound (count or tokens) cuts more.
+  local budget = opts.keep_recent_tokens
+  if type(budget) == "number" and budget > 0 then
+    local acc, tok_cut = 0, #messages
+    for i = #messages, 1, -1 do
+      acc = acc + M.estimate_tokens({ messages[i] })
+      if acc > budget and (#messages - i + 1) > 2 then break end
+      tok_cut = i - 1
+    end
+    if tok_cut > cut then cut = tok_cut end
+  end
+
+  cut = adjust_cut_for_tool_pairs(messages, cut)
   if cut <= 0 then return nil end
   local older = vim.deepcopy(vim.list_slice(messages, 1, cut))
   local recent = strip_replay_only_blocks(vim.list_slice(messages, cut + 1, #messages))
@@ -368,8 +430,10 @@ local LLM_BLOCK_CHAR_CAP = 6000
 -- Hard ceiling on the whole serialized transcript handed to the summarizer.
 local LLM_TRANSCRIPT_CHAR_CAP = 400000
 -- Safety net on the model's own output so a misbehaving summarizer can't make
--- "compacted" history bigger than the thing it replaced.
+-- "compacted" history unbounded. A second guard below rejects any still-large
+-- summary that would grow a real transcript instead of shrinking it.
 local LLM_SUMMARY_CHAR_CEILING = 60000
+local LLM_GROWTH_GUARD_MIN_TOKENS = 8000
 
 -- Unlike trim_one_line (used for the heuristic's display-only truncation),
 -- this preserves whitespace/newlines: the summarizer needs real code
@@ -506,9 +570,24 @@ function M.summarize_with_llm(messages, opts, on_done, active_model)
           return
         end
         local compacted = splice_summary(split.recent, frame_llm_summary(summary, resolved.label), split.pinned)
+        local after_tokens = M.estimate_tokens(compacted)
+        if before_tokens >= LLM_GROWTH_GUARD_MIN_TOKENS and after_tokens > before_tokens then
+          local fallback_summary = summarize_messages(split.older, opts.summary_max_chars or 12000, split.carry)
+          local fallback = splice_summary(split.recent, fallback_summary, split.pinned)
+          on_done(fallback, {
+            before_tokens = before_tokens,
+            after_tokens = M.estimate_tokens(fallback),
+            compacted_messages = #split.older,
+            mode = "heuristic",
+            model = resolved,
+            usage = usage,
+            reason = "llm_summary_increased_context",
+          }, nil)
+          return
+        end
         on_done(compacted, {
           before_tokens = before_tokens,
-          after_tokens = M.estimate_tokens(compacted),
+          after_tokens = after_tokens,
           compacted_messages = #split.older,
           mode = "llm",
           model = resolved,

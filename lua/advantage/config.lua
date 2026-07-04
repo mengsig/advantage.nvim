@@ -5,15 +5,19 @@ M.defaults = {
   default_model = "anthropic/claude-opus-4-8",
 
   ---Models offered in the picker. `thinking = false` disables reasoning display
-  ---for models that don't support adaptive thinking.
+  ---for models that don't support adaptive thinking. `context_window` is the
+  ---model's total token budget; it scales auto-compaction (see `context`). Values
+  ---marked "confirmed" are from the provider docs; the rest are a conservative
+  ---floor (erring low is safe — too high risks compacting at ~100% of the real
+  ---window). Adjust any to match your account/tier.
   models = {
-    { ref = "anthropic/claude-opus-4-8", label = "opus 4.8" },
-    { ref = "anthropic/claude-sonnet-5", label = "sonnet 5" },
-    { ref = "anthropic/claude-fable-5", label = "fable 5" },
-    { ref = "anthropic/claude-haiku-4-5", label = "haiku 4.5", thinking = false },
-    { ref = "openai/gpt-5.5", label = "gpt-5.5" },
-    { ref = "openai/gpt-5.1-codex", label = "codex 5.1" },
-    { ref = "openai/gpt-5.1-codex-mini", label = "codex mini" },
+    { ref = "anthropic/claude-opus-4-8", label = "opus 4.8", context_window = 1000000 }, -- confirmed 1M
+    { ref = "anthropic/claude-sonnet-5", label = "sonnet 5", context_window = 1000000 }, -- confirmed 1M
+    { ref = "anthropic/claude-fable-5", label = "fable 5", context_window = 200000 }, -- unconfirmed, floor
+    { ref = "anthropic/claude-haiku-4-5", label = "haiku 4.5", thinking = false, context_window = 200000 }, -- confirmed 200k
+    { ref = "openai/gpt-5.5", label = "gpt-5.5", context_window = 1000000 }, -- confirmed 1M (raw API)
+    { ref = "openai/gpt-5.1-codex", label = "codex 5.1", context_window = 400000 }, -- Codex tier, adjust
+    { ref = "openai/gpt-5.1-codex-mini", label = "codex mini", context_window = 400000 }, -- Codex tier, adjust
   },
 
   providers = {
@@ -71,10 +75,26 @@ M.defaults = {
   context = {
     ---Automatically compact old conversation history before it grows too large.
     auto_compact = true,
-    ---Rough token estimate threshold (chars / 4) that triggers compaction.
-    compact_at_tokens = 120000,
-    ---Keep this many newest messages verbatim; older messages become a summary.
+    ---When to auto-compact, as a fraction of the active model's `context_window`
+    ---(see `models`): 0.75 = compact once the transcript is estimated to fill ~75%
+    ---of the window. Scales the trigger to the model, so a small window compacts
+    ---before it overflows and a large one isn't compacted needlessly early.
+    compact_fraction = 0.75,
+    ---Absolute ceiling (tokens) on that trigger — a COST cap. Even on a 1M-context
+    ---model you rarely want to carry 0.75 × 1M ≈ 750k tokens every turn: it's
+    ---expensive and overflows the cheap summarizer. Effective threshold =
+    ---min(compact_fraction × context_window, compact_at_tokens). Lower it for
+    ---cheaper turns; raise it to exploit a big window. (Token estimate is chars/4;
+    ---falls back to this value alone when a model declares no context_window.)
+    compact_at_tokens = 200000,
+    ---Keep the newest messages verbatim; older messages become a summary. Bounded
+    ---by BOTH this count and a token budget (`keep_recent_fraction`), whichever is
+    ---tighter, so a few huge tool outputs can't retain more than the threshold.
     keep_recent_messages = 16,
+    ---Token budget for that retained recent window, as a fraction of the resolved
+    ---threshold (held under it so compaction can always get the transcript below
+    ---the threshold rather than re-triggering every turn).
+    keep_recent_fraction = 0.4,
     ---Maximum characters in the generated compaction summary.
     summary_max_chars = 12000,
     ---Mode for silent auto-compaction (crossing compact_at_tokens mid-turn):
@@ -216,6 +236,12 @@ local function validate(o)
         errs[#errs + 1] = "context." .. field .. " must be 'llm' or 'heuristic'"
       end
     end
+    for _, field in ipairs({ "compact_fraction", "keep_recent_fraction" }) do
+      local frac = o.context[field]
+      if frac ~= nil and (type(frac) ~= "number" or frac <= 0 or frac > 1) then
+        errs[#errs + 1] = "context." .. field .. " must be a number in (0, 1]"
+      end
+    end
   end
   if o.max_agent_turns ~= nil and (type(o.max_agent_turns) ~= "number" or o.max_agent_turns < 0) then
     errs[#errs + 1] = "max_agent_turns must be a non-negative number"
@@ -257,6 +283,7 @@ function M.resolve_model(ref)
         thinking = m.thinking,
         thinking_budget = m.thinking_budget,
         reasoning_effort = m.reasoning_effort,
+        context_window = m.context_window,
       }
     end
   end

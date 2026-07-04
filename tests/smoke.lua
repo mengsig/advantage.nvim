@@ -555,16 +555,17 @@ do
 
   -- unit path: compact.summarize_with_llm directly
   do
-    local seen_req
+    local seen_req, summarize_calls
+    summarize_calls = 0
     providers.register("fakesummarizer", {
       stream = function(req)
         seen_req = req
+        summarize_calls = summarize_calls + 1
         vim.defer_fn(function()
           req.on.usage(500, 80, 0)
-          req.on.complete(
-            { { type = "text", text = "Primary Request and Intent: build a widget.\nNext Step: ship it." } },
-            "end_turn"
-          )
+          local summary = "Primary Request and Intent: build a widget.\nNext Step: ship it."
+          if summarize_calls > 1 then summary = string.rep("oversized summary ", 4000) end
+          req.on.complete({ { type = "text", text = summary } }, "end_turn")
         end, 5)
         return { stop = function() end }
       end,
@@ -605,14 +606,46 @@ do
     )
     check(info and info.usage and info.usage.input == 500, "info carries summarizer token usage")
     check(seen_req and seen_req.model.thinking == false, "summarizer request disables thinking")
+    local first_seen_req = seen_req
+
+    local long_messages = {}
+    for i = 1, 10 do
+      long_messages[#long_messages + 1] = {
+        role = i % 2 == 1 and "user" or "assistant",
+        content = { { type = "text", text = ("turn %d "):format(i) .. string.rep("x", 5000) } },
+      }
+    end
+    done, next_messages, info, err = false, nil, nil, nil
+    compact.summarize_with_llm(long_messages, config.options.context, function(nm, i, e)
+      next_messages, info, err = nm, i, e
+      done = true
+    end)
+    vim.wait(2000, function()
+      return done
+    end, 5)
+    check(
+      info and info.reason == "llm_summary_increased_context" and info.mode == "heuristic",
+      "oversized LLM summary falls back to heuristic compaction"
+    )
+    check(info and info.after_tokens < info.before_tokens, "growth-guard fallback actually shrinks the transcript")
+    check(next_messages and (function()
+      for _, m in ipairs(next_messages) do
+        for _, b in ipairs(type(m.content) == "table" and m.content or {}) do
+          if type(b) == "table" and type(b.text) == "string" and b.text:find(compact._SUMMARY_PREFIX, 1, true) then
+            return not b.text:find("model summary via", 1, true)
+          end
+        end
+      end
+      return false
+    end)(), "growth-guard fallback stores a plain heuristic summary")
     -- turn 1 is pinned (kept verbatim, not summarized), so the summarizer sees
     -- the raw older transcript starting at turn 2.
     check(
-      seen_req and seen_req.messages[1].content[1].text:find("turn 2 content", 1, true) ~= nil,
+      first_seen_req and first_seen_req.messages[1].content[1].text:find("turn 2 content", 1, true) ~= nil,
       "raw (untruncated) transcript is sent to the summarizer"
     )
     check(
-      seen_req and seen_req.messages[1].content[1].text:find("turn 1 content", 1, true) == nil,
+      first_seen_req and first_seen_req.messages[1].content[1].text:find("turn 1 content", 1, true) == nil,
       "the pinned task is not re-sent to the summarizer"
     )
   end
@@ -762,6 +795,48 @@ do
 
     config.options.context.auto_compact_mode = nil
     config.options.context.compact_at_tokens = nil
+  end
+
+  -- #1/#3: the auto-compact threshold and the retained recent-window budget both
+  -- scale to the active model's context_window, with compact_at_tokens as a cost
+  -- ceiling so a huge window never holds an absurd amount of raw context.
+  do
+    local rt = compact.resolve_threshold
+    local base = { compact_at_tokens = 200000, compact_fraction = 0.75 }
+    check(rt(base, { context_window = 200000 }) == 150000, "threshold = compact_fraction × window under the cap")
+    check(rt(base, { context_window = 1000000 }) == 200000, "threshold capped at compact_at_tokens on a huge window")
+    check(rt(base, { context_window = 32000 }) == 24000, "threshold scales down for a small window")
+    check(rt({ compact_at_tokens = 200000 }, {}) == 200000, "no window falls back to the cap")
+    check(rt({}, {}) == 120000, "no window and no cap falls back to 120000")
+    check(
+      rt({ compact_at_tokens = 120000, compact_fraction = 0.75 }, { context_window = 200000 }) == 120000,
+      "an explicit smaller cap wins over the window fraction"
+    )
+
+    local krt = compact.resolve_keep_recent_tokens
+    check(krt({ keep_recent_fraction = 0.4 }, 200000) == 80000, "recent budget = keep_recent_fraction × threshold")
+    check(krt({ keep_recent_tokens = 5 }, 200000) == 5, "explicit keep_recent_tokens wins")
+    check(krt({}, nil) == nil, "no threshold means message-count only (nil token budget)")
+    check(
+      config.resolve_model("anthropic/claude-opus-4-8").context_window == 1000000,
+      "resolve_model carries context_window"
+    )
+
+    -- With large recent messages the token budget bounds the retained window
+    -- tighter than the 16-message count (which alone would keep 14 older here).
+    local huge = {}
+    for i = 1, 30 do
+      huge[i] = {
+        role = i % 2 == 1 and "user" or "assistant",
+        content = { { type = "text", text = ("m%d %s"):format(i, string.rep("x", 4000)) } },
+      }
+    end
+    local _, hinfo =
+      compact.force(huge, { keep_recent_messages = 16, keep_recent_tokens = 3000, summary_max_chars = 2000 })
+    check(
+      hinfo and hinfo.compacted_messages > 14,
+      "recent-window token budget shrinks the kept window for large messages"
+    )
   end
 
   -- regression: cancelling a session must not permanently disable auto-compact.

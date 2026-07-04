@@ -41,7 +41,7 @@ local function default_system_prompt()
     "- For multi-step work, keep a plan with the todo_write tool and update statuses as you go; several changes to one file go in a single multi_edit call.",
     "- Stay within the project: file tools are confined to the project root. Ask before anything destructive or irreversible.",
     "",
-    "Style: be direct and concise. Lead with what you did or found; skip filler and restating the request. If a task is ambiguous, state your assumption and proceed rather than stalling.",
+    "Style: default to concise, to-the-point user-facing output unless the user asks for detail. Lead with what you did or found; skip filler, hidden reasoning, and restating the request. If a task is ambiguous, state your assumption and proceed rather than stalling.",
   })
   return table.concat(lines, "\n")
 end
@@ -325,6 +325,14 @@ function Agent:_maybe_compact(force, opts, callback)
   local compact = require("advantage.compact")
   local util = require("advantage.util")
 
+  -- Model-relative bounds, resolved once. The auto-compact threshold and the
+  -- retained recent-window token budget both scale to the active model's
+  -- context_window (compact.resolve_*), so a 1M-context model isn't compacted at
+  -- the same token count as a 200k one; both fall back to constants when the
+  -- model declares no window. compact.lua itself stays model-agnostic — it just
+  -- consumes the numbers handed to it below in `eff`.
+  local threshold = compact.resolve_threshold(cfg, self.model)
+
   if not force then
     -- Re-entrancy guard: the LLM path below is async (self.job resolves later),
     -- and _turn_impl calls _maybe_compact(false) on every tool-loop round trip.
@@ -336,11 +344,10 @@ function Agent:_maybe_compact(force, opts, callback)
     if self._compacting then return callback(nil) end
 
     -- Threshold gate: silent auto-compact (heuristic or llm) never fires below
-    -- compact_at_tokens. The heuristic path re-checks this itself, but the llm
-    -- path does not, so without this check here the very first auto-compact of
-    -- a session (before _auto_compact_floor exists) would fire on message count
-    -- alone under auto_compact_mode = "llm", ignoring compact_at_tokens entirely.
-    local threshold = cfg.compact_at_tokens or 120000
+    -- the resolved threshold. The heuristic path re-checks this itself, but the
+    -- llm path does not, so without this check here the very first auto-compact
+    -- of a session (before _auto_compact_floor exists) would fire on message
+    -- count alone under auto_compact_mode = "llm", ignoring the threshold entirely.
     if compact.estimate_tokens(self.messages) < threshold then return callback(nil) end
 
     -- Hysteresis: once auto-compaction has run, don't fire again until the
@@ -359,6 +366,14 @@ function Agent:_maybe_compact(force, opts, callback)
   end
 
   self._compacting = true
+  -- Resolved config for the model-agnostic compaction functions: the
+  -- window-scaled threshold and the recent-window token budget (#3), layered
+  -- over the user's context config. force compaction (M.force) overrides the
+  -- threshold to 0 but keeps the recent-window budget.
+  local eff = vim.tbl_extend("force", cfg, {
+    compact_at_tokens = threshold,
+    keep_recent_tokens = compact.resolve_keep_recent_tokens(cfg, threshold),
+  })
   local function done(info)
     self._compacting = false
     callback(info)
@@ -367,9 +382,9 @@ function Agent:_maybe_compact(force, opts, callback)
   local function finish_heuristic()
     local next_messages, info
     if force then
-      next_messages, info = compact.force(self.messages, cfg)
+      next_messages, info = compact.force(self.messages, eff)
     else
-      next_messages, info = compact.compact(self.messages, cfg)
+      next_messages, info = compact.compact(self.messages, eff)
     end
     if info then
       self.messages = next_messages
@@ -396,7 +411,7 @@ function Agent:_maybe_compact(force, opts, callback)
   local mode = force and (opts.mode or cfg.compact_mode or "heuristic") or (cfg.auto_compact_mode or "heuristic")
   if mode ~= "llm" then return finish_heuristic() end
 
-  self.job = compact.summarize_with_llm(self.messages, cfg, function(next_messages, info, err)
+  self.job = compact.summarize_with_llm(self.messages, eff, function(next_messages, info, err)
     self.job = nil
     self._compacting = false
     -- If the user cancelled mid-summarize, cancel() already cleaned up; never
@@ -423,10 +438,12 @@ function Agent:_maybe_compact(force, opts, callback)
       self:ui().set_usage(self.usage)
       require("advantage.usage").record(info.model, u.input, u.output, u.cached)
     end
+    local label = (info.model and info.model.label) or "llm"
+    if info.reason == "llm_summary_increased_context" then label = label .. " → heuristic fallback" end
     self:ui().notice(
       ("compacted %d old messages with %s (~%s → ~%s tokens)"):format(
         info.compacted_messages,
-        (info.model and info.model.label) or "llm",
+        label,
         util.fmt_tokens(info.before_tokens),
         util.fmt_tokens(info.after_tokens)
       )
