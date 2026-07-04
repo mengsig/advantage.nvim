@@ -187,6 +187,8 @@ function M.stream(req)
 
       local url, headers
       local otools = to_tools(req.tools)
+      local effort = req.model.reasoning_effort
+      if effort == nil then effort = pcfg.reasoning_effort end
       local body = {
         model = req.model.id,
         input = to_input_items(req.messages),
@@ -197,11 +199,11 @@ function M.stream(req)
         tool_choice = #otools > 0 and "auto" or nil,
         stream = true,
         store = false,
-        include = { "reasoning.encrypted_content" },
-        reasoning = {
-          effort = req.model.reasoning_effort or pcfg.reasoning_effort,
+        include = effort ~= false and { "reasoning.encrypted_content" } or nil,
+        reasoning = effort ~= false and {
+          effort = effort,
           summary = "auto",
-        },
+        } or nil,
       }
 
       if cred.mode == "chatgpt" then

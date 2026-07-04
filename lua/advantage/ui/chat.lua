@@ -545,7 +545,7 @@ local function help_lines()
     "  /resume  resume session    /review  diff agent edits",
     "  /context repo memory + skills (verify · forget <text>)",
     "  /yolo    skip permissions",
-    "  /effort [mode]  tune thinking/reasoning (OpenAI: minimal/low/medium/high; Claude: adaptive/off/low/medium/high)",
+    "  /effort [mode]  tune thinking/reasoning (OpenAI: default/off/minimal/low/medium/high; Claude: adaptive/off/1k/4k/8k/10k/16k/32k)",
     "",
     "commands",
     "  :Advantage            toggle panel",

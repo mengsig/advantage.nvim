@@ -134,9 +134,11 @@ skips *all* permission cards. A red `⚡ yolo` badge stays in the winbar while
 it's on. Use at your own risk.
 
 **Effort / thinking.** `/effort` (or `/effort high`, `:Advantage effort [mode]`, `<leader>ce`) tunes the
-active model before the next turn. OpenAI/Codex models get `minimal`/`low`/`medium`/`high`
-`reasoning.effort`; Anthropic models get `adaptive`/`off`/`low`/`medium`/`high`
-(`low`=`1k`, `medium`=`4k`, `high`=`8k` thinking budget).
+active model before the next turn. OpenAI/Codex models get `default`/`off` plus
+`minimal`/`low`/`medium`/`high` `reasoning.effort`; Anthropic models get
+`adaptive`/`off` plus fixed thinking budgets: `low`=`1k`, `medium`=`4k`,
+`high`=`8k`, `higher`=`10k`, `highest`=`16k`, and `max`=`32k` (aliases include
+`think`, `think-hard`, `think-harder`, and `ultrathink`).
 
 **Usage dashboard.** `/usage` (or `:Advantage usage`, `<leader>cu`) shows
 session/today/7-day token totals, cache savings (cached input bills at ~10%, and

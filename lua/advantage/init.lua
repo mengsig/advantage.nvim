@@ -361,25 +361,55 @@ function M.toggle_yolo()
   end
 end
 
-local OPENAI_EFFORTS = {
-  minimal = true,
-  low = true,
-  medium = true,
-  high = true,
+local OPENAI_EFFORT_ITEMS = {
+  { label = "default · config", value = nil, aliases = { "default", "auto", "adaptive" } },
+  { label = "off · omit reasoning", value = false, aliases = { "off", "none", "disabled" } },
+  { label = "minimal", value = "minimal", aliases = { "minimal" } },
+  { label = "low", value = "low", aliases = { "low" } },
+  { label = "medium", value = "medium", aliases = { "medium" } },
+  { label = "high", value = "high", aliases = { "high" } },
 }
 
-local ANTHROPIC_EFFORTS = {
-  adaptive = { label = "adaptive/default", value = "adaptive" },
-  default = { label = "adaptive/default", value = "adaptive" },
-  off = { label = "off", value = false },
-  none = { label = "off", value = false },
-  low = { label = "low · 1k budget", value = { type = "enabled", budget_tokens = 1024 } },
-  ["1k"] = { label = "low · 1k budget", value = { type = "enabled", budget_tokens = 1024 } },
-  medium = { label = "medium · 4k budget", value = { type = "enabled", budget_tokens = 4096 } },
-  ["4k"] = { label = "medium · 4k budget", value = { type = "enabled", budget_tokens = 4096 } },
-  high = { label = "high · 8k budget", value = { type = "enabled", budget_tokens = 8192 } },
-  ["8k"] = { label = "high · 8k budget", value = { type = "enabled", budget_tokens = 8192 } },
+local OPENAI_EFFORTS = {}
+for _, item in ipairs(OPENAI_EFFORT_ITEMS) do
+  for _, alias in ipairs(item.aliases) do
+    OPENAI_EFFORTS[alias] = item
+  end
+end
+
+local ANTHROPIC_EFFORT_ITEMS = {
+  { label = "adaptive/default", value = "adaptive", aliases = { "adaptive", "default", "auto" } },
+  { label = "off", value = false, aliases = { "off", "none", "disabled" } },
+  { label = "low · 1k budget", value = { type = "enabled", budget_tokens = 1024 }, aliases = { "low", "1k" } },
+  {
+    label = "medium · 4k budget",
+    value = { type = "enabled", budget_tokens = 4096 },
+    aliases = { "medium", "4k", "think" },
+  },
+  { label = "high · 8k budget", value = { type = "enabled", budget_tokens = 8192 }, aliases = { "high", "8k" } },
+  {
+    label = "higher · 10k budget",
+    value = { type = "enabled", budget_tokens = 10000 },
+    aliases = { "higher", "10k", "think-hard", "think_hard" },
+  },
+  {
+    label = "highest · 16k budget",
+    value = { type = "enabled", budget_tokens = 16384 },
+    aliases = { "highest", "16k", "think-harder", "think_harder" },
+  },
+  {
+    label = "max · 32k budget",
+    value = { type = "enabled", budget_tokens = 31999 },
+    aliases = { "max", "32k", "ultra", "ultrathink" },
+  },
 }
+
+local ANTHROPIC_EFFORTS = {}
+for _, item in ipairs(ANTHROPIC_EFFORT_ITEMS) do
+  for _, alias in ipairs(item.aliases) do
+    ANTHROPIC_EFFORTS[alias] = item
+  end
+end
 
 local function apply_anthropic_effort(agent, choice)
   if choice.value == "adaptive" then
@@ -396,7 +426,7 @@ local function apply_anthropic_effort(agent, choice)
 end
 
 ---Set reasoning/thinking effort directly.
----OpenAI: minimal|low|medium|high. Anthropic: adaptive|off|low|medium|high (aliases: 1k|4k|8k).
+---OpenAI: default|off|minimal|low|medium|high. Anthropic: adaptive|off|low|medium|high|higher|highest|max (aliases: 1k|4k|8k|10k|16k|32k, think/think-hard/think-harder/ultrathink).
 function M.set_effort(mode)
   local agent = ensure_agent()
   if agent:busy() then
@@ -411,19 +441,23 @@ function M.set_effort(mode)
   end
 
   if agent.model.provider == "openai" then
-    if not OPENAI_EFFORTS[mode] then
-      ui.notify("OpenAI effort must be: minimal, low, medium, or high", vim.log.levels.WARN)
+    local choice = OPENAI_EFFORTS[mode]
+    if not choice then
+      ui.notify("OpenAI effort must be: default, off, minimal, low, medium, or high", vim.log.levels.WARN)
       return false
     end
-    agent.model.reasoning_effort = mode
-    ui.notify("effort → " .. mode)
+    agent.model.reasoning_effort = choice.value
+    ui.notify("effort → " .. choice.label)
     return true
   end
 
   if agent.model.provider == "anthropic" then
     local choice = ANTHROPIC_EFFORTS[mode]
     if not choice then
-      ui.notify("Claude thinking must be: adaptive, off, low/1k, medium/4k, or high/8k", vim.log.levels.WARN)
+      ui.notify(
+        "Claude thinking must be: adaptive, off, low/1k, medium/4k, high/8k, higher/10k, highest/16k, or max/32k",
+        vim.log.levels.WARN
+      )
       return false
     end
     apply_anthropic_effort(agent, choice)
@@ -446,34 +480,24 @@ function M.pick_effort()
   end
 
   if agent.model.provider == "openai" then
-    local items = {
-      { label = "minimal", value = "minimal" },
-      { label = "low", value = "low" },
-      { label = "medium", value = "medium" },
-      { label = "high", value = "high" },
-    }
+    local items = OPENAI_EFFORT_ITEMS
     vim.ui.select(items, {
       prompt = "reasoning effort",
       format_item = function(x)
-        local mark = agent.model.reasoning_effort == x.value and "●" or " "
-        return ("%s %s"):format(mark, x.label)
+        local selected = x.value == nil and agent.model.reasoning_effort == nil
+          or agent.model.reasoning_effort == x.value
+        return ("%s %s"):format(selected and "●" or " ", x.label)
       end,
     }, function(choice)
       if not choice then return end
-      M.set_effort(choice.value)
+      M.set_effort(choice.aliases[1])
     end)
     return
   end
 
   if agent.model.provider == "anthropic" then
     local current = agent.model.thinking
-    local items = {
-      ANTHROPIC_EFFORTS.adaptive,
-      ANTHROPIC_EFFORTS.off,
-      ANTHROPIC_EFFORTS.low,
-      ANTHROPIC_EFFORTS.medium,
-      ANTHROPIC_EFFORTS.high,
-    }
+    local items = ANTHROPIC_EFFORT_ITEMS
     vim.ui.select(items, {
       prompt = "Claude thinking",
       format_item = function(x)
