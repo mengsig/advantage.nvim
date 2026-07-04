@@ -38,6 +38,12 @@ M.defaults = {
   ---Override the built-in system prompt (string), or extend it (function(default) -> string).
   system_prompt = nil,
 
+  ---Safety cap on how many provider round-trips one user message may drive in the
+  ---tool loop (edit→test→re-edit…). Prevents a thrashing/looping model from
+  ---burning tokens unbounded, especially under yolo/auto_approve. On hit, the turn
+  ---stops with a notice; sending another message resumes. Resets each user turn.
+  max_agent_turns = 100,
+
   ui = {
     width = 0.42, -- fraction of columns
     input_height = 4,
@@ -82,12 +88,27 @@ M.defaults = {
     ---Model that performs the LLM summarization call, as "provider/model-id".
     ---Kept separate from the active chat model so compaction stays cheap and
     ---fast even mid-session on an expensive model.
-    summarizer_model = "anthropic/claude-haiku-4-5",
+    ---`nil` (default) = auto: a cheap model in the ACTIVE model's provider family
+    ---(`context.summarizer_models`), so a Codex/OpenAI-only user never triggers a
+    ---Claude request they have no credentials for (and vice-versa). Set a
+    ---"provider/model-id" string to pin one model regardless of the active provider.
+    summarizer_model = nil,
+    ---Per-provider cheap summarizer used when `summarizer_model` is nil. Falls back
+    ---to the active chat model itself if the provider isn't listed here.
+    summarizer_models = {
+      anthropic = "anthropic/claude-haiku-4-5",
+      openai = "openai/gpt-5.1-codex-mini",
+    },
   },
 
   subagents = {
     ---Expose the read-only `sub_agent` tool for delegation / fan-out.
     enabled = true,
+    ---Model for sub-agents, as "provider/model-id". `nil` = use the parent's
+    ---model. Set a fast/cheap model (e.g. "anthropic/claude-haiku-4-5" or
+    ---"openai/gpt-5.1-codex-mini") to make read-only fan-out cheaper and faster;
+    ---the sub_agent tool's `model` arg overrides this per call.
+    model = nil,
     ---Maximum provider turns a sub-agent may take, including tool loops.
     max_turns = 6,
     ---Run a fan-out batch of `sub_agent` calls concurrently (overlapping their
@@ -182,6 +203,18 @@ local function validate(o)
     errs[#errs + 1] = "ui.width must be a number in (0, 1] (fraction of columns)"
   end
   if type(o.providers) ~= "table" then errs[#errs + 1] = "providers must be a table" end
+  for _, key in ipairs({ "tools", "context", "ui", "memory", "subagents", "sessions" }) do
+    if o[key] ~= nil and type(o[key]) ~= "table" then errs[#errs + 1] = key .. " must be a table" end
+  end
+  if type(o.context) == "table" then
+    local cm = o.context.compact_mode
+    if cm ~= nil and cm ~= "llm" and cm ~= "heuristic" then
+      errs[#errs + 1] = "context.compact_mode must be 'llm' or 'heuristic'"
+    end
+  end
+  if o.max_agent_turns ~= nil and (type(o.max_agent_turns) ~= "number" or o.max_agent_turns < 0) then
+    errs[#errs + 1] = "max_agent_turns must be a non-negative number"
+  end
   return errs
 end
 
@@ -190,9 +223,15 @@ M._validate = validate
 function M.setup(opts)
   opts = opts or {}
   M.options = merge(vim.deepcopy(M.defaults), opts)
+  local errs = validate(M.options)
+  -- Structural options must be tables; revert any scalar override (e.g. a
+  -- mistaken `tools = false`) to its default so it can't crash a later
+  -- `config.options.tools.x` access. The mistake is still surfaced via `errs`.
+  for _, key in ipairs({ "tools", "context", "ui", "providers", "memory", "subagents", "sessions", "keymaps", "usage" }) do
+    if M.options[key] ~= nil and type(M.options[key]) ~= "table" then M.options[key] = vim.deepcopy(M.defaults[key]) end
+  end
   -- accept the long-form alias for the paranoid-averse
   if M.options.tools.dangerously_skip_permissions then M.options.tools.yolo = true end
-  local errs = validate(M.options)
   if #errs > 0 then
     vim.schedule(function()
       vim.notify("advantage: invalid setup options —\n  " .. table.concat(errs, "\n  "), vim.log.levels.ERROR)

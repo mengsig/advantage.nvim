@@ -41,7 +41,9 @@ function M.list()
   local out = {}
   local prefix = project_key()
   for name, t in vim.fs.dir(dir()) do
-    if t == "file" and vim.startswith(name, prefix) then
+    -- Require the .json suffix so a crash-leftover "<id>.json.tmp" (atomic-write
+    -- temp) is never decoded as a duplicate/partial session in the resume picker.
+    if t == "file" and vim.startswith(name, prefix) and name:sub(-5) == ".json" then
       local f = io.open(dir() .. "/" .. name, "r")
       if f then
         local ok, data = pcall(vim.json.decode, f:read("*a"))

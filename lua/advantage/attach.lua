@@ -150,7 +150,16 @@ function M.expand_mentions(text, cwd)
   for _, file in ipairs(files) do
     out[#out + 1] = ""
     local ft = vim.filetype.match({ filename = file.path }) or ""
-    if file.lo then
+    if file.lo and file.size > 2 * 1024 * 1024 then
+      -- Guard against slurping a huge file just to inline a few lines: point the
+      -- agent at read_file with the exact offset/limit instead of loading it all.
+      out[#out + 1] = ("`%s` (%.1f MB) is too large to inline a range — read it with read_file (offset=%d, limit=%d)."):format(
+        file.name,
+        file.size / 1048576,
+        file.lo,
+        file.hi - file.lo + 1
+      )
+    elseif file.lo then
       -- inline just the requested line range, with enough metadata for the
       -- agent to edit exactly those lines
       local f = io.open(file.path, "r")

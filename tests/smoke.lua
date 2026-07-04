@@ -427,18 +427,23 @@ do
   end
   local out, info =
     compact.compact(messages, { compact_at_tokens = 100, keep_recent_messages = 6, summary_max_chars = 2000 })
-  check(info and info.compacted_messages == 18, "compacts old messages when threshold is crossed")
-  check(out[1].content[1].text:find(compact._SUMMARY_PREFIX, 1, true), "summary prepended")
+  -- 24 msgs, keep 6 -> older = 18; the first user turn is pinned (kept verbatim,
+  -- not summarized) so 17 messages are compacted.
+  check(info and info.compacted_messages == 17, "compacts old messages when threshold is crossed")
+  -- The original task (message 01) is pinned verbatim at the head, then the summary.
+  check(out[1].pinned == true and out[1].content[1].text:find("message 01", 1, true), "original task pinned verbatim")
+  check(out[2].content[1].text:find(compact._SUMMARY_PREFIX, 1, true), "summary prepended after the pinned task")
   check(out[#out].content[1].text:find("message 24", 1, true), "recent messages kept verbatim")
-  -- Roles must strictly alternate; the summary must never sit directly before
-  -- another user turn (Anthropic 400s on consecutive same-role messages).
+  -- The canonical array may open with two user turns (pin, then summary); the
+  -- Anthropic body must still strictly alternate after same-role coalescing.
+  local sanitized = require("advantage.providers.anthropic")._sanitize_messages(out)
   local prev_role
   local alternates = true
-  for _, m in ipairs(out) do
+  for _, m in ipairs(sanitized) do
     if m.role == prev_role then alternates = false end
     prev_role = m.role
   end
-  check(alternates, "compacted messages keep alternating roles")
+  check(alternates, "compacted messages alternate roles after anthropic sanitize (pin+summary coalesce)")
 
   local ok_empty = pcall(function()
     compact.force(nil, { keep_recent_messages = 6 })
@@ -472,11 +477,21 @@ do
     },
   }
   local paired_out = select(1, compact.force(paired, { keep_recent_messages = 2, summary_max_chars = 1000 }))
-  check(
-    #paired_out == 4 and paired_out[2].content[1].type == "tool_use",
-    "compact does not orphan a recent tool_result from its tool_use"
-  )
-  check(paired_out[4].content[1].type == "text", "compact strips stale OpenAI reasoning from retained messages")
+  -- Locate the tool_use and its tool_result by scanning (positions shift now that
+  -- the first user turn is pinned ahead of the summary).
+  local use_idx, res_idx, has_reasoning = nil, nil, false
+  for i, m in ipairs(paired_out) do
+    for _, b in ipairs(type(m.content) == "table" and m.content or {}) do
+      if type(b) == "table" then
+        if b.type == "tool_use" and b.id == "call_keep" then use_idx = i end
+        if b.type == "tool_result" and b.tool_use_id == "call_keep" then res_idx = i end
+        if b.type == "openai_reasoning" then has_reasoning = true end
+      end
+    end
+  end
+  check(use_idx and res_idx and use_idx < res_idx, "compact does not orphan a recent tool_result from its tool_use")
+  check(not has_reasoning, "compact strips stale OpenAI reasoning from retained messages")
+  check(paired_out[1].pinned == true, "the first user turn is preserved as the pinned task")
 
   local ok_odd, odd_out = pcall(function()
     return compact.force(odd, { keep_recent_messages = 4, summary_max_chars = 2000 })
@@ -496,9 +511,18 @@ do
       { role = i % 2 == 0 and "assistant" or "user", content = { { type = "text", text = string.rep("🎉", 300) } } }
   end
   local emoji_out = select(1, compact.force(emoji, { keep_recent_messages = 4, summary_max_chars = 20000 }))
-  local summary_text = emoji_out[1].content[1].text
+  -- The summary message now sits after the pinned first turn; find it by prefix.
+  local summary_text
+  for _, m in ipairs(emoji_out) do
+    for _, b in ipairs(type(m.content) == "table" and m.content or {}) do
+      if type(b) == "table" and b.type == "text" and b.text and b.text:find(compact._SUMMARY_PREFIX, 1, true) then
+        summary_text = b.text
+      end
+    end
+  end
   -- json_encode rejects invalid UTF-8 exactly like the provider request does, so
   -- a clean encode proves the summary was truncated on a character boundary.
+  check(summary_text ~= nil, "summary message present after the pinned turn")
   check(pcall(vim.fn.json_encode, summary_text), "compact truncates the summary on a UTF-8 character boundary")
 end
 
@@ -557,12 +581,22 @@ do
     check(done, "summarize_with_llm completed")
     check(err == nil, "summarize_with_llm reported no error")
     check(next_messages ~= nil, "summarize_with_llm produced compacted messages")
+    -- turn 1 is pinned verbatim at the head; the summary follows it.
+    local llm_summary_text
+    for _, m in ipairs(next_messages or {}) do
+      for _, b in ipairs(type(m.content) == "table" and m.content or {}) do
+        if type(b) == "table" and b.text and b.text:find(compact._SUMMARY_PREFIX, 1, true) then
+          llm_summary_text = b.text
+        end
+      end
+    end
+    check(next_messages and next_messages[1].pinned == true, "original task pinned verbatim through LLM compaction")
     check(
-      next_messages and next_messages[1].content[1].text:find(compact._SUMMARY_PREFIX, 1, true) ~= nil,
+      llm_summary_text ~= nil,
       "LLM summary still carries the shared SUMMARY_PREFIX (openai reasoning-drop detection depends on it)"
     )
     check(
-      next_messages and next_messages[1].content[1].text:find("build a widget", 1, true) ~= nil,
+      llm_summary_text and llm_summary_text:find("build a widget", 1, true) ~= nil,
       "model-written summary text is preserved"
     )
     check(
@@ -571,9 +605,15 @@ do
     )
     check(info and info.usage and info.usage.input == 500, "info carries summarizer token usage")
     check(seen_req and seen_req.model.thinking == false, "summarizer request disables thinking")
+    -- turn 1 is pinned (kept verbatim, not summarized), so the summarizer sees
+    -- the raw older transcript starting at turn 2.
     check(
-      seen_req and seen_req.messages[1].content[1].text:find("turn 1 content", 1, true) ~= nil,
+      seen_req and seen_req.messages[1].content[1].text:find("turn 2 content", 1, true) ~= nil,
       "raw (untruncated) transcript is sent to the summarizer"
+    )
+    check(
+      seen_req and seen_req.messages[1].content[1].text:find("turn 1 content", 1, true) == nil,
+      "the pinned task is not re-sent to the summarizer"
     )
   end
 
@@ -639,9 +679,14 @@ do
     check(warned, "a failed LLM summarization surfaces a visible WARN notice")
     check(cb_info2 ~= nil, "compaction still succeeds via the heuristic fallback")
     check(#ag2.messages < 10, "heuristic fallback still compacted the conversation")
+    local fb_summary
+    for _, m in ipairs(ag2.messages) do
+      for _, b in ipairs(type(m.content) == "table" and m.content or {}) do
+        if type(b) == "table" and b.text and b.text:find(compact._SUMMARY_PREFIX, 1, true) then fb_summary = b.text end
+      end
+    end
     check(
-      ag2.messages[1].content[1].text:find(compact._SUMMARY_PREFIX, 1, true) ~= nil
-        and not ag2.messages[1].content[1].text:find("model summary via", 1, true),
+      fb_summary ~= nil and not fb_summary:find("model summary via", 1, true),
       "fallback summary is the plain heuristic one, not framed as an LLM summary"
     )
   end
@@ -836,13 +881,35 @@ do
     captured_body and captured_body.reasoning and captured_body.reasoning.effort == "minimal",
     "codex summarizer forces minimal reasoning effort (thinking=false alone does nothing for openai)"
   )
-  check(
-    next_messages and next_messages[1].content[1].text:find(compact._SUMMARY_PREFIX, 1, true) ~= nil,
-    "codex-produced summary still carries the shared SUMMARY_PREFIX"
-  )
+  local codex_summary
+  for _, m in ipairs(next_messages or {}) do
+    for _, b in ipairs(type(m.content) == "table" and m.content or {}) do
+      if type(b) == "table" and b.text and b.text:find(compact._SUMMARY_PREFIX, 1, true) then codex_summary = b.text end
+    end
+  end
+  check(codex_summary ~= nil, "codex-produced summary still carries the shared SUMMARY_PREFIX")
   check(
     info and info.mode == "llm" and info.model and info.model.provider == "openai",
     "info reports the resolved openai/codex summarizer model"
+  )
+
+  -- Provider independence: with no explicit summarizer_model, an OpenAI/Codex
+  -- active model must NOT reach for a Claude (anthropic) summarizer.
+  local auto = compact._resolve_summarizer(
+    { summarizer_models = { anthropic = "anthropic/claude-haiku-4-5", openai = "openai/gpt-5.1-codex-mini" } },
+    { provider = "openai", id = "gpt-5.1-codex", label = "codex" }
+  )
+  check(
+    auto and auto.provider == "openai",
+    "auto summarizer matches the active provider (openai -> openai, not claude)"
+  )
+  local auto_anthropic = compact._resolve_summarizer(
+    { summarizer_models = { anthropic = "anthropic/claude-haiku-4-5", openai = "openai/gpt-5.1-codex-mini" } },
+    { provider = "anthropic", id = "claude-opus-4-8", label = "opus" }
+  )
+  check(
+    auto_anthropic and auto_anthropic.provider == "anthropic",
+    "auto summarizer for an anthropic model stays anthropic"
   )
 end
 
@@ -2075,6 +2142,187 @@ do
   check(type(errs) == "table" and #errs >= 1, "validation reports a malformed default_model")
 
   config.options = saved
+end
+
+section("hardening regressions")
+do
+  local config = require("advantage.config")
+
+  -- setup({tools=false}) must not crash (indexed a boolean before validation),
+  -- and an invalid scalar structural option is coerced back to a table.
+  do
+    local saved = vim.deepcopy(config.options)
+    local ok = pcall(config.setup, { tools = false })
+    check(ok, "setup({tools=false}) does not crash")
+    check(type(config.options.tools) == "table", "invalid scalar tools is coerced back to a table")
+    config.options = saved
+    config._setup_done = true
+  end
+
+  -- session.list() must ignore .json.tmp atomic-write leftovers.
+  do
+    local session = require("advantage.session")
+    local dir = vim.fn.stdpath("data") .. "/advantage/sessions"
+    vim.fn.mkdir(dir, "p", "0700")
+    local key = vim.fn.sha256((vim.uv or vim.loop).cwd()):sub(1, 12)
+    local tmp = dir .. "/" .. key .. "-hardening-bogus.json.tmp"
+    local f = io.open(tmp, "w")
+    f:write('{"title":"HARDENING_BOGUS","messages":[{"role":"user","content":[]}]}')
+    f:close()
+    local ok_list, list = pcall(session.list)
+    os.remove(tmp)
+    local has_bogus = false
+    for _, s in ipairs(ok_list and list or {}) do
+      if s.title == "HARDENING_BOGUS" then has_bogus = true end
+    end
+    check(not has_bogus, "session.list ignores .json.tmp crash-leftovers")
+  end
+
+  -- read_file refuses a binary file instead of streaming raw bytes into the body.
+  do
+    local tools = require("advantage.tools")
+    local tmp = vim.fn.tempname()
+    vim.fn.mkdir(tmp, "p")
+    local f = io.open(tmp .. "/data.bin", "wb")
+    f:write("abc\0def\0binary content")
+    f:close()
+    local got
+    tools.get("read_file").run({ path = "data.bin" }, { cwd = tmp }, function(out)
+      got = out
+    end)
+    check(got and got:find("binary file", 1, true) ~= nil, "read_file refuses a binary file (NUL byte)")
+  end
+
+  -- write_all is atomic: a successful write leaves no .adv.tmp leftover.
+  do
+    local tools = require("advantage.tools")
+    local tmp = vim.fn.tempname()
+    vim.fn.mkdir(tmp, "p")
+    local done
+    tools.get("write_file").run({ path = "out.txt", content = "hello world\n" }, { cwd = tmp }, function(out, err)
+      done = not err
+    end)
+    check(done, "write_file succeeds via the atomic path")
+    check(io.open(tmp .. "/out.txt", "r") ~= nil, "written file exists")
+    check((vim.uv or vim.loop).fs_stat(tmp .. "/out.txt.adv.tmp") == nil, "atomic write leaves no .adv.tmp leftover")
+  end
+
+  -- anthropic sanitize drops a tool_result whose tool_use was compacted away.
+  do
+    local anthropic = require("advantage.providers.anthropic")
+    local out = anthropic._sanitize_messages({
+      {
+        role = "user",
+        content = { { type = "tool_result", tool_use_id = "orphan", content = "x" }, { type = "text", text = "hi" } },
+      },
+      { role = "assistant", content = { { type = "tool_use", id = "real", name = "read_file", input = {} } } },
+      { role = "user", content = { { type = "tool_result", tool_use_id = "real", content = "ok" } } },
+    })
+    local found_orphan, found_real = false, false
+    for _, m in ipairs(out) do
+      for _, b in ipairs(m.content) do
+        if b.type == "tool_result" and b.tool_use_id == "orphan" then found_orphan = true end
+        if b.type == "tool_result" and b.tool_use_id == "real" then found_real = true end
+      end
+    end
+    check(not found_orphan, "sanitize drops a tool_result whose tool_use is absent")
+    check(found_real, "sanitize keeps a tool_result paired with a present tool_use")
+  end
+
+  -- a large thinking budget must leave answer headroom under max_tokens (or the
+  -- reply is empty), and must never push max_tokens past the model's output ceiling.
+  do
+    local anthropic = require("advantage.providers.anthropic")
+    local util = require("advantage.util")
+    local saved_dir, saved_key = vim.env.CLAUDE_CONFIG_DIR, vim.env.ANTHROPIC_API_KEY
+    vim.env.CLAUDE_CONFIG_DIR = vim.fn.tempname() -- no creds -> api-key path (synchronous)
+    vim.env.ANTHROPIC_API_KEY = "test-key"
+    local orig = util.request_sse
+    local function capture_body(model)
+      local captured
+      util.request_sse = function(opts)
+        captured = vim.json.decode(opts.body)
+        return { stop = function() end }
+      end
+      anthropic.stream({
+        model = model,
+        system = "sys",
+        messages = { { role = "user", content = { { type = "text", text = "hi" } } } },
+        tools = {},
+        on = {
+          text = function() end,
+          thinking = function() end,
+          tool_start = function() end,
+          usage = function() end,
+          complete = function() end,
+          error = function() end,
+          auth = function() end,
+        },
+      })
+      vim.wait(500, function()
+        return captured ~= nil
+      end, 5)
+      return captured
+    end
+    local cap = config.defaults.providers.anthropic.max_tokens
+    local model = { id = "claude-opus-4-8", thinking = { type = "enabled", budget_tokens = 31999 } }
+    local big = capture_body(model)
+    check(big and big.max_tokens == cap, "anthropic max_tokens stays at the configured ceiling")
+    check(
+      big and big.thinking.budget_tokens + 8192 <= cap,
+      "a large thinking budget is trimmed to leave answer headroom under max_tokens"
+    )
+    check(model.thinking.budget_tokens == 31999, "the shared model config is not mutated by the trim")
+    local small = capture_body({ id = "claude-opus-4-8", thinking = { type = "enabled", budget_tokens = 4096 } })
+    check(small and small.thinking.budget_tokens == 4096, "a budget that already fits is left untouched")
+    local adaptive = capture_body({ id = "claude-opus-4-8" })
+    check(
+      adaptive and adaptive.max_tokens == config.defaults.providers.anthropic.max_tokens,
+      "adaptive thinking keeps the configured max_tokens"
+    )
+    util.request_sse = orig
+    vim.env.CLAUDE_CONFIG_DIR, vim.env.ANTHROPIC_API_KEY = saved_dir, saved_key
+  end
+
+  -- a sub-agent that never finishes returns its best partial findings at the cap.
+  do
+    local providers = require("advantage.providers")
+    local tools = require("advantage.tools")
+    local n = 0
+    providers.register("fakeloop", {
+      stream = function(req)
+        n = n + 1
+        local id = "call" .. tostring(n)
+        vim.defer_fn(function()
+          req.on.complete({
+            { type = "text", text = "INTERIM_FINDING partial progress" },
+            { type = "tool_use", id = id, name = "list_dir", input = { path = "." } },
+          }, "tool_use")
+        end, 5)
+        return { stop = function() end }
+      end,
+    })
+    local tmp = vim.fn.tempname()
+    vim.fn.mkdir(tmp, "p")
+    local done, result = false, nil
+    tools.get("sub_agent").run({ prompt = "loop", model = "fakeloop/m", max_turns = 2 }, {
+      cwd = tmp,
+      model = { provider = "fakeloop", id = "m", label = "loop" },
+    }, function(out)
+      result, done = out, true
+    end)
+    vim.wait(3000, function()
+      return done
+    end, 10)
+    check(
+      done and result and result:find("INTERIM_FINDING", 1, true) ~= nil,
+      "sub-agent returns best partial findings at its turn cap"
+    )
+    check(
+      done and result and result:find("turn limit", 1, true) ~= nil,
+      "the partial report is flagged as hitting the turn limit"
+    )
+  end
 end
 
 print("")

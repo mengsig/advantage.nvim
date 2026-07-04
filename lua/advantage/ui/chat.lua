@@ -247,19 +247,28 @@ local function spinner_tick()
   end
 end
 
+local function stop_timer()
+  if S.timer then
+    S.timer:stop()
+    S.timer:close()
+    S.timer = nil
+  end
+end
+
 local function ensure_timer()
   if S.timer then return end
+  -- Don't arm the spinner into a hidden/closed panel: it would redraw tool lines
+  -- and the winbar into an invisible buffer every 110ms until idle. M.open
+  -- re-arms it (`if S.status ~= "idle" then ensure_timer()`) when the panel returns.
+  if not util.win_valid(S.win) then return end
   S.timer = uv.new_timer()
   S.timer:start(
     0,
     110,
     vim.schedule_wrap(function()
-      if S.status == "idle" then
-        if S.timer then
-          S.timer:stop()
-          S.timer:close()
-          S.timer = nil
-        end
+      -- Stop once the turn is idle or the panel was closed mid-run.
+      if S.status == "idle" or not util.win_valid(S.win) then
+        stop_timer()
         update_winbar()
         return
       end
@@ -772,11 +781,7 @@ function M.close()
   S.win, S.input_win = nil, nil
   -- Stop the spinner timer: it self-stops only on idle, so closing mid-stream
   -- would otherwise leave it firing every 110ms into a hidden buffer.
-  if S.timer then
-    S.timer:stop()
-    S.timer:close()
-    S.timer = nil
-  end
+  stop_timer()
 end
 
 function M.toggle()
@@ -802,6 +807,8 @@ function M.clear()
   S.welcome_mark = nil
   S.follow = true
   S.queue_count = 0
+  -- a new session must not inherit the previous one's pending attachments/chips
+  S.attachments = {}
   show_welcome()
   update_winbar()
 end
@@ -1208,10 +1215,15 @@ function M.render_transcript(messages, model_label)
             end
           end
           local def = require("advantage.tools").get(block.name)
+          -- summary() runs on persisted (possibly malformed) input during resume;
+          -- a throw here must not abort rendering the rest of the transcript.
+          local ok_detail, detail = pcall(function()
+            return def and def.summary and def.summary(block.input) or nil
+          end)
           M.tool_begin(block.id, block.name)
           M.tool_update(block.id, {
             status = status,
-            detail = def and def.summary and def.summary(block.input) or nil,
+            detail = ok_detail and detail or nil,
           })
         end
       end

@@ -136,6 +136,11 @@ function M.request_sse(opts)
     "no-buffer",
     "http1.1",
     "connect-timeout = 15",
+    -- Idle guard: abort if the transfer stalls below 1 byte/s for this long, so a
+    -- provider that accepts then hangs (no tokens, no heartbeat) can't wedge the
+    -- turn forever. Legit streams send pings/tokens well within the window.
+    "speed-limit = 1",
+    "speed-time = " .. tostring(opts.idle_timeout or 120),
     "dump-header = " .. q(hdr_file),
     "data-binary = " .. q("@" .. body_file),
   }
@@ -222,9 +227,12 @@ function M.request_sse(opts)
       on_exit = function(_, code)
         if pending ~= "" then
           parser.feed_line(pending)
-          parser.feed_line("")
           pending = ""
         end
+        -- Flush a complete-but-unterminated buffered event: if the stream closed
+        -- right after the final `data:` line without the trailing blank line, the
+        -- payload is still buffered — a blank line dispatches it. No-op otherwise.
+        parser.feed_line("")
         if finished then return end
 
         local status, retry_after = response_meta()

@@ -276,7 +276,11 @@ function M.run(input, ctx, cb)
   local prompt = vim.trim(tostring(input.prompt or ""))
   if prompt == "" then return cb("sub_agent prompt is required", true) end
 
-  local model = input.model and config.resolve_model(input.model) or ctx.model
+  -- Model precedence: explicit tool arg → configured subagents.model (a cheap/fast
+  -- model for read-only fan-out) → the parent's model.
+  local model = input.model and config.resolve_model(input.model)
+  if not model and cfg.model then model = config.resolve_model(cfg.model) end
+  model = model or ctx.model
   if not model then return cb("sub_agent has no model", true) end
   local provider = providers.get(model.provider)
   if not provider then return cb("Unknown sub-agent provider: " .. tostring(model.provider), true) end
@@ -287,6 +291,7 @@ function M.run(input, ctx, cb)
   }
   local turn, cancelled, job = 0, false, nil
   local usage = { input = 0, output = 0 }
+  local last_text = "" -- newest interim findings, so a turn-limit stop isn't wasted
 
   local function finish(text, is_error)
     if cancelled then return end
@@ -305,7 +310,10 @@ function M.run(input, ctx, cb)
     if cancelled then return end
     turn = turn + 1
     if turn > max_turns then
-      return finish(("Sub-agent stopped after %d turns without a final answer."):format(max_turns), true)
+      -- Don't throw away the investigation: return the newest interim findings the
+      -- sub-agent produced, flagged incomplete, instead of nothing.
+      local partial = last_text ~= "" and ("\n\nBest partial findings so far:\n" .. last_text) or ""
+      return finish(("Sub-agent hit its %d-turn limit before a final report.%s"):format(max_turns, partial), true)
     end
 
     job = provider.stream({
@@ -327,6 +335,8 @@ function M.run(input, ctx, cb)
           job = nil
           if cancelled then return end
           if #blocks > 0 then messages[#messages + 1] = { role = "assistant", content = blocks } end
+          local interim = text_from_blocks(blocks)
+          if interim ~= "" then last_text = interim end
           local calls = {}
           if stop_reason == "tool_use" then
             for _, b in ipairs(blocks) do

@@ -179,7 +179,12 @@ end
 
 function Agent:_push_user_message(text, opts, show)
   local content = user_content(text, opts, self.ctx.cwd)
-  table.insert(self.messages, { role = "user", content = content })
+  local msg = { role = "user", content = content }
+  -- The first user turn of a session is the original task: pin it so compaction
+  -- keeps it verbatim (never paraphrased/truncated) no matter how long the
+  -- session runs. Compaction reads this flag; providers ignore it.
+  if #self.messages == 0 then msg.pinned = true end
+  table.insert(self.messages, msg)
   if show ~= false then self:ui().user_message(text, opts and opts.images) end
 end
 
@@ -217,6 +222,7 @@ function Agent:send(text, opts)
   self.turn_usage = { input = 0, output = 0, cached = 0 }
   self.turn_open = false
   self.turn_changed = {}
+  self.loop = 0 -- provider round-trips this user turn (runaway guard)
   self:_turn()
 end
 
@@ -244,6 +250,7 @@ function Agent:_drain_interrupts(results, remaining_calls)
     table.insert(self.messages, { role = "user", content = item.content })
   end
   self.interrupts = {}
+  self.loop = 0 -- fresh user input restarts the runaway budget
   return true
 end
 
@@ -253,6 +260,7 @@ function Agent:_drain_interrupts_as_user_messages()
     table.insert(self.messages, { role = "user", content = item.content })
   end
   self.interrupts = {}
+  self.loop = 0 -- fresh user input restarts the runaway budget
   return true
 end
 
@@ -311,6 +319,9 @@ function Agent:_maybe_compact(force, opts, callback)
 
   self.job = compact.summarize_with_llm(self.messages, cfg, function(next_messages, info, err)
     self.job = nil
+    -- If the user cancelled mid-summarize, cancel() already cleaned up; never
+    -- splice a summary into a transcript the user abandoned.
+    if self.cancelled then return end
     if not next_messages then
       if not err then return callback(nil) end
       self
@@ -339,7 +350,7 @@ function Agent:_maybe_compact(force, opts, callback)
       )
     )
     callback(info)
-  end)
+  end, self.model)
 end
 
 function Agent:_turn()
@@ -362,6 +373,16 @@ function Agent:_turn_impl()
   end)
   -- provider-request count; /usage uses it for the harness savings math
   self.usage.turns = (self.usage.turns or 0) + 1
+
+  -- Runaway guard: bound the tool loop (edit→test→re-edit…) per user turn so a
+  -- thrashing model can't burn tokens without end, especially under yolo.
+  self.loop = (self.loop or 0) + 1
+  local cap = config.options.max_agent_turns or 100
+  if cap > 0 and self.loop > cap then
+    self:ui().notice(("stopped after %d tool-loop steps (max_agent_turns) — send a message to continue"):format(cap))
+    self:_finish()
+    return
+  end
 
   local provider = providers.get(self.model.provider)
   if not provider then
@@ -476,6 +497,14 @@ function Agent:_run_tools_parallel(calls, seed)
       if results[i] then dense[#dense + 1] = results[i] end
     end
     table.insert(self.messages, { role = "user", content = dense })
+    -- A message the user sent during the fan-out ("instant" mode) was promised to
+    -- go in before the next turn; the parallel path has no permission card to trip
+    -- it, so drain it here now that every worker has settled.
+    if self:_drain_interrupts_as_user_messages() then
+      self.turn_started = uv.hrtime()
+      self.turn_usage = { input = 0, output = 0, cached = 0 }
+      self.turn_open = false
+    end
     self:_turn()
   end
 
@@ -691,7 +720,10 @@ function Agent:_finish(errored)
   local ui = self:ui()
   ui.finish_turn(self.turn_started and (uv.hrtime() - self.turn_started) or nil)
   ui.set_status("idle")
-  if not errored and config.options.sessions.autosave then require("advantage.session").save(self) end
+  -- Persist even on a cancelled/errored turn: the cancel path already trimmed the
+  -- transcript to a consistent last message, and the errored path never appended a
+  -- partial assistant turn, so the just-sent user message survives a later exit.
+  if config.options.sessions.autosave then require("advantage.session").save(self) end
   local changed = vim.tbl_count(self.turn_changed or {})
   if changed > 0 and not self.cancelled then
     ui.notice(("%d file%s changed — /review to inspect"):format(changed, changed == 1 and "" or "s"))
@@ -715,7 +747,13 @@ end
 function Agent:cancel(opts)
   opts = opts or {}
   if not self:busy() then return end
+  local was_compacting = self.status == "compacting"
   self.cancelled = true
+  -- A cancelled LLM compaction stops the summarizer stream, so its completion
+  -- callback (which clears the progress bar) never fires — clear it here.
+  if was_compacting then pcall(function()
+    self:ui().compaction_done()
+  end) end
   if not opts.keep_queue and #self.queue > 0 then
     self:ui().notice(("dropped %d queued message%s"):format(#self.queue, #self.queue == 1 and "" or "s"))
     self.queue = {}

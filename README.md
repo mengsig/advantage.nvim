@@ -159,11 +159,16 @@ summary message. Compaction runs in one of two modes:
   call, so a turn you didn't ask to pay for never gets a surprise network
   round-trip added to it.
 - **Manual compaction** (`/compact` or `:Advantage compact`) defaults to
-  spending one call on `context.summarizer_model` (a fast/cheap model,
-  independent of your active chat model) so a real model writes a dense,
-  structured summary — primary intent, files touched, decisions, pending work —
-  from the *untruncated* older transcript. If that call fails, it falls back to
-  the offline heuristic automatically and shows a warning. Run
+  spending one call on a fast/cheap summarizer model so a real model writes a
+  dense, structured summary — primary intent, files touched, decisions, pending
+  work — from the *untruncated* older transcript. By default the summarizer is a
+  cheap model **in your active model's provider family** (Haiku for Claude,
+  codex-mini for OpenAI/Codex), so a Codex-only user never triggers a Claude
+  request they have no credentials for; pin one with `context.summarizer_model`.
+  The **original task prompt is preserved verbatim** through every compaction
+  (both modes), so long sessions never drift off what you asked for. If the
+  summarizer call fails, it falls back to the offline heuristic automatically and
+  shows a warning. Run
   `/compact heuristic` (or `:Advantage compact heuristic`) to skip the model
   call and use the free heuristic instead for a single invocation, or set
   `context.compact_mode = "heuristic"` to make that the default everywhere.
@@ -266,6 +271,7 @@ require("advantage").setup({
     { ref = "openai/gpt-5.1-codex-mini", label = "codex mini" },
   },
   system_prompt = nil,           -- string to replace, function(default) to extend
+  max_agent_turns = 100,         -- safety cap on tool-loop round-trips per user turn
   ui = {
     width = 0.42,                -- panel width (fraction of columns)
     input_height = 4,
@@ -285,10 +291,18 @@ require("advantage").setup({
     keep_recent_messages = 16,
     summary_max_chars = 12000,   -- heuristic-mode summary cap
     compact_mode = "llm",        -- manual /compact: "llm" | "heuristic" (auto-compact is always heuristic)
-    summarizer_model = "anthropic/claude-haiku-4-5",
+    summarizer_model = nil,      -- nil = auto: a cheap model in the ACTIVE provider's
+                                 -- family (so a Codex-only user never needs Claude creds
+                                 -- to /compact). Set "provider/model-id" to pin one.
+    summarizer_models = {        -- the per-provider cheap summarizer picked when nil
+      anthropic = "anthropic/claude-haiku-4-5",
+      openai = "openai/gpt-5.1-codex-mini",
+    },
   },
   subagents = {
     enabled = true,              -- exposes the read-only `sub_agent` tool
+    model = nil,                 -- nil = parent's model; set a fast model
+                                 -- (e.g. "anthropic/claude-haiku-4-5") for cheaper fan-out
     max_turns = 6,
     parallel = true,             -- run a fan-out batch of sub_agents concurrently
     bash = false,                -- give sub-agents a read-only bash (see below); or

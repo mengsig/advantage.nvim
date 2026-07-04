@@ -17,13 +17,20 @@ local OAUTH_IDENTITY = "You are Claude Code, Anthropic's official CLI for Claude
 ---by a retained user message, or interrupt-injected messages) would otherwise 400.
 local function sanitize_messages(messages)
   local out = {}
+  local seen_tool_use = {}
   for _, msg in ipairs(messages) do
     local content = {}
     for _, block in ipairs(msg.content) do
-      if
+      if block.type == "tool_use" then
+        if block.id then seen_tool_use[block.id] = true end
+        content[#content + 1] = block
+      elseif block.type == "tool_result" then
+        -- Drop a tool_result whose tool_use was compacted/cut away: Anthropic 400s
+        -- on a tool_result with no matching tool_use in the same request (the
+        -- OpenAI path already guards this via `seen_tool_calls`).
+        if block.tool_use_id and seen_tool_use[block.tool_use_id] then content[#content + 1] = block end
+      elseif
         block.type == "text"
-        or block.type == "tool_use"
-        or block.type == "tool_result"
         or block.type == "thinking"
         or block.type == "redacted_thinking"
         or block.type == "image"
@@ -44,6 +51,7 @@ local function sanitize_messages(messages)
   end
   return out
 end
+M._sanitize_messages = sanitize_messages
 
 ---Place rolling prompt-cache breakpoints on the last content block of the two
 ---most recent messages. Anthropic caches the whole prefix up to each breakpoint,
@@ -194,11 +202,25 @@ function M.stream(req)
       }
       if req.model.thinking ~= false then
         if type(req.model.thinking) == "table" then
-          body.thinking = req.model.thinking
+          -- copy: the trim below may adjust budget_tokens, and req.model.thinking
+          -- is shared config that must not be mutated across turns.
+          body.thinking = vim.deepcopy(req.model.thinking)
         elseif req.model.thinking_budget then
           body.thinking = { type = "enabled", budget_tokens = req.model.thinking_budget }
         else
           body.thinking = { type = "adaptive", display = "summarized" }
+        end
+        -- Thinking tokens count against max_tokens. A fixed budget close to
+        -- max_tokens (e.g. the 32k "ultrathink" preset under a 32k cap) would leave
+        -- ~no room for the actual answer. Guarantee ANSWER_HEADROOM tokens for the
+        -- visible reply by trimming the budget to fit under the configured
+        -- max_tokens, rather than growing max_tokens (which could exceed the
+        -- model's hard output ceiling and 400). Adaptive thinking has no fixed
+        -- budget, so it is untouched.
+        local ANSWER_HEADROOM = 8192
+        local budget = type(body.thinking) == "table" and body.thinking.budget_tokens or nil
+        if budget and budget + ANSWER_HEADROOM > body.max_tokens then
+          body.thinking.budget_tokens = math.max(1024, body.max_tokens - ANSWER_HEADROOM)
         end
       end
 

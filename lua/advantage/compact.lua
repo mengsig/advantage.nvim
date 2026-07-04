@@ -228,10 +228,11 @@ local function adjust_cut_for_tool_pairs(messages, cut)
 end
 
 ---Shared prep for both compaction paths: pick the cut point (respecting
----tool_use/tool_result pairing), split into older/recent, and peel off a prior
----carried-forward summary so repeat compaction extends it instead of nesting or
----re-truncating it. Returns nil if there isn't enough history to bother with.
----@return {older: table[], recent: table[], carry: string|nil}|nil
+---tool_use/tool_result pairing), split into older/recent, peel off any pinned
+---turns (kept verbatim), and peel off a prior carried-forward summary so repeat
+---compaction extends it instead of nesting or re-truncating it. Returns nil if
+---there isn't enough history to bother with.
+---@return {older: table[], recent: table[], carry: string|nil, pinned: table[]}|nil
 local function prepare_split(messages, opts)
   local keep = math.max(2, opts.keep_recent_messages or 16)
   if #messages <= keep + 1 then return nil end
@@ -241,12 +242,39 @@ local function prepare_split(messages, opts)
   local older = vim.deepcopy(vim.list_slice(messages, 1, cut))
   local recent = strip_replay_only_blocks(vim.list_slice(messages, cut + 1, #messages))
 
+  -- Pin the original task (and any explicitly pinned turn) verbatim: it must
+  -- survive compaction unparaphrased and untruncated so the agent never drifts
+  -- from what it was asked to do. Legacy sessions saved before the pin flag
+  -- existed have no marker, so adopt a leading, non-summary user turn as the
+  -- task — old transcripts are protected too.
+  if
+    type(older[1]) == "table"
+    and older[1].role == "user"
+    and older[1].pinned == nil
+    and not is_summary_message(older[1])
+  then
+    older[1].pinned = true
+  end
+  local pinned = {}
+  while type(older[1]) == "table" and older[1].pinned do
+    pinned[#pinned + 1] = table.remove(older, 1)
+  end
+
   local carry = nil
   if is_summary_message(older[1]) then
-    carry = older[1].content[1].text
-    table.remove(older, 1)
+    -- Peel the carried summary. splice_summary folds the summary block into the
+    -- first retained user message, so on re-compaction that message also carries
+    -- its original (post-summary) blocks — keep those as ordinary older content
+    -- to be re-summarized instead of dropping them with the whole message.
+    local first = older[1]
+    carry = first.content[1].text
+    if #first.content > 1 then
+      first.content = vim.list_slice(first.content, 2)
+    else
+      table.remove(older, 1)
+    end
   end
-  return { older = older, recent = recent, carry = carry }
+  return { older = older, recent = recent, carry = carry, pinned = pinned }
 end
 
 ---Splice a finished summary text back in ahead of the retained `recent`
@@ -254,22 +282,33 @@ end
 ---Anthropic require strictly alternating user/assistant roles, so if the first
 ---retained message is also a `user` turn the summary is folded into it rather
 ---than prepended as a second consecutive `user` message (which triggers a 400).
-local function splice_summary(recent, summary_text)
+---@param pinned? table[] verbatim turns to keep ahead of the summary (the original task)
+local function splice_summary(recent, summary_text, pinned)
   local summary_block = { type = "text", text = summary_text }
+  local spliced
   if type(recent[1]) == "table" and recent[1].role == "user" then
     local merged = { summary_block }
     for _, b in ipairs(content_blocks(recent[1])) do
       merged[#merged + 1] = b
     end
-    local out = { { role = "user", content = merged } }
+    spliced = { { role = "user", content = merged } }
     for i = 2, #recent do
-      out[#out + 1] = recent[i]
+      spliced[#spliced + 1] = recent[i]
     end
+  else
+    spliced = { { role = "user", content = { summary_block } } }
+    vim.list_extend(spliced, recent)
+  end
+  -- Prepend pinned turns verbatim. The result may open with two consecutive
+  -- user turns (pin, then the summary user message); Anthropic's sanitize_messages
+  -- coalesces same-role turns and OpenAI accepts consecutive user input items.
+  if pinned and #pinned > 0 then
+    local out = {}
+    vim.list_extend(out, pinned)
+    vim.list_extend(out, spliced)
     return out
   end
-  local out = { { role = "user", content = { summary_block } } }
-  vim.list_extend(out, recent)
-  return out
+  return spliced
 end
 
 ---@param messages table[] canonical messages
@@ -286,7 +325,7 @@ function M.compact(messages, opts)
   if not split then return messages, nil end
 
   local summary = summarize_messages(split.older, opts.summary_max_chars or 12000, split.carry)
-  local compacted = splice_summary(split.recent, summary)
+  local compacted = splice_summary(split.recent, summary, split.pinned)
   return compacted,
     {
       before_tokens = before_tokens,
@@ -383,6 +422,32 @@ local function frame_llm_summary(summary, model_label)
   }, "\n")
 end
 
+local DEFAULT_SUMMARIZERS = {
+  anthropic = "anthropic/claude-haiku-4-5",
+  openai = "openai/gpt-5.1-codex-mini",
+}
+
+---Choose the model that writes the summary. An explicit `summarizer_model` wins;
+---otherwise pick a cheap model in the ACTIVE model's provider family so a
+---Codex/OpenAI-only user (with no Claude credentials) never triggers a Claude
+---request on `/compact`, and vice-versa. Last resort: the active model itself.
+---@return table|nil resolved
+local function resolve_summarizer(opts, active_model)
+  local config = require("advantage.config")
+  if opts.summarizer_model and opts.summarizer_model ~= "" then return config.resolve_model(opts.summarizer_model) end
+  local provider = active_model and active_model.provider
+  local map = opts.summarizer_models or DEFAULT_SUMMARIZERS
+  local ref = provider and map[provider]
+  if ref then
+    local m = config.resolve_model(ref)
+    if m then return m end
+  end
+  -- no cheap same-provider model configured: summarize with the active model so
+  -- compaction still works (just not cheaper) rather than failing on wrong creds.
+  return active_model
+end
+M._resolve_summarizer = resolve_summarizer
+
 ---Spend one model call to write a real semantic summary of the older half of
 ---the transcript, then splice it in exactly like the heuristic path does. Used
 ---only for manual/forced compaction (`context.compact_mode == "llm"`) — silent
@@ -390,8 +455,9 @@ end
 ---@param messages table[] canonical messages
 ---@param opts table context config (keep_recent_messages, summarizer_model, …)
 ---@param on_done fun(next_messages: table[]|nil, info: table|nil, err: string|nil)
+---@param active_model? table the current chat model, used to pick a same-provider summarizer
 ---@return table|nil job a `{stop = fun()}` handle for the in-flight request, or nil if nothing was sent
-function M.summarize_with_llm(messages, opts, on_done)
+function M.summarize_with_llm(messages, opts, on_done, active_model)
   opts = type(opts) == "table" and opts or {}
   messages = type(messages) == "table" and messages or {}
   on_done = on_done or function() end
@@ -403,12 +469,11 @@ function M.summarize_with_llm(messages, opts, on_done)
     return nil
   end
 
-  local config = require("advantage.config")
   local providers = require("advantage.providers")
-  local resolved = config.resolve_model(opts.summarizer_model or "anthropic/claude-haiku-4-5")
+  local resolved = resolve_summarizer(opts, active_model)
   local provider = resolved and providers.get(resolved.provider)
   if not provider then
-    on_done(nil, nil, "unknown summarizer model: " .. tostring(opts.summarizer_model))
+    on_done(nil, nil, "no usable summarizer model (set context.summarizer_model)")
     return nil
   end
 
@@ -440,7 +505,7 @@ function M.summarize_with_llm(messages, opts, on_done)
           on_done(nil, nil, "summarizer returned no text (stop_reason: " .. tostring(stop_reason) .. ")")
           return
         end
-        local compacted = splice_summary(split.recent, frame_llm_summary(summary, resolved.label))
+        local compacted = splice_summary(split.recent, frame_llm_summary(summary, resolved.label), split.pinned)
         on_done(compacted, {
           before_tokens = before_tokens,
           after_tokens = M.estimate_tokens(compacted),

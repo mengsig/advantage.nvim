@@ -31,10 +31,26 @@ end
 
 local function write_all(path, content)
   vim.fn.mkdir(vim.fs.dirname(path), "p")
-  local f, err = io.open(path, "w")
-  if not f then return nil, err end
-  f:write(content)
-  f:close()
+  -- Atomic write: temp file + rename so a crash, a full disk (ENOSPC), or a
+  -- racing reader can never leave a half-written or truncated source file — and
+  -- a failed write is reported, never silently swallowed as success. Preserve the
+  -- existing file's mode when overwriting.
+  local st = uv.fs_stat(path)
+  local tmp = path .. ".adv.tmp"
+  local f, oerr = io.open(tmp, "w")
+  if not f then return nil, oerr end
+  local ok_w, werr = f:write(content)
+  local ok_c = f:close()
+  if not ok_w or not ok_c then
+    os.remove(tmp)
+    return nil, werr or "write failed"
+  end
+  if st and st.mode then pcall(uv.fs_chmod, tmp, st.mode) end
+  local ok_r, rerr = os.rename(tmp, path)
+  if not ok_r then
+    os.remove(tmp)
+    return nil, rerr or "rename failed"
+  end
   return true
 end
 
@@ -122,6 +138,11 @@ tool({
     if not path then return cb(("Cannot read %s: %s"):format(tostring(input.path), perr), true) end
     local content = read_all(path)
     if not content then return cb("File not found: " .. tostring(input.path), true) end
+    -- Binary guard: raw non-text bytes break the request's JSON encoding and burn
+    -- tokens on noise. A NUL byte in the head is a reliable binary signal.
+    if content:sub(1, 8000):find("\0", 1, true) then
+      return cb(("%s appears to be a binary file (%d bytes) — not shown."):format(input.path, #content), false)
+    end
     local lines = vim.split(content, "\n", { plain = true })
     local offset = math.max(1, input.offset or 1)
     local limit = math.min(input.limit or MAX_LINES, MAX_LINES)
@@ -365,6 +386,11 @@ tool({
     local timeout = input.timeout_ms or cfg.tools.bash_timeout_ms
     local stream = input.stream == true or cfg.tools.stream_bash_output == true
     local chunks, finished, timed_out, stopped = {}, false, false, false
+    local total_bytes, capped = 0, false
+    -- Hard cap on captured/streamed output: a runaway producer (`yes`, an infinite
+    -- log tail) would otherwise grow memory and flood the transcript unbounded,
+    -- even in stream mode where the final MAX_OUTPUT truncation doesn't apply live.
+    local BASH_OUTPUT_CAP = 400000
     local job
 
     -- Reconstruct the raw byte stream from Neovim's channel-lines protocol:
@@ -374,11 +400,17 @@ tool({
     -- rebuilds the exact output — preserving internal blank lines and partial
     -- lines without inserting spurious newlines.
     local function add_chunk(data)
-      if not data or type(data) ~= "table" then return end
+      if capped or not data or type(data) ~= "table" then return end
       local text = table.concat(data, "\n")
       if text == "" then return end
       chunks[#chunks + 1] = text
       if stream then cb(text, false, { stream = true }) end
+      total_bytes = total_bytes + #text
+      if total_bytes > BASH_OUTPUT_CAP then
+        capped = true
+        chunks[#chunks + 1] = ("\n… [output exceeded %d bytes — command stopped]"):format(BASH_OUTPUT_CAP)
+        pcall(vim.fn.jobstop, job)
+      end
     end
 
     local timer

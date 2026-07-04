@@ -735,7 +735,31 @@ M._subcommands = {
   "attach",
   "ask",
 }
-M._effort_modes = { "minimal", "low", "medium", "high", "adaptive", "off", "1k", "4k", "8k" }
+-- Union of the aliases set_effort accepts (OpenAI + Anthropic); the picker
+-- validates per-provider, so a completion offered to the wrong provider is a
+-- harmless no-op rather than the old silent gap.
+M._effort_modes = {
+  "default",
+  "off",
+  "minimal",
+  "low",
+  "medium",
+  "high",
+  "higher",
+  "highest",
+  "max",
+  "adaptive",
+  "1k",
+  "4k",
+  "8k",
+  "10k",
+  "16k",
+  "32k",
+  "think",
+  "think-hard",
+  "think-harder",
+  "ultrathink",
+}
 
 function M._complete(arglead, cmdline)
   local body = cmdline:match("^%S+%s*(.*)$") or ""

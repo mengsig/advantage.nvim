@@ -7,8 +7,10 @@ local auth = require("advantage.auth")
 
 local M = {}
 
+-- Seed once at load, not per call: reseeding on every uuid() correlated draws in
+-- the same ns bucket and perturbed the global RNG used elsewhere (session ids).
+math.randomseed((vim.uv or vim.loop).hrtime() % 2 ^ 31)
 local function uuid()
-  math.randomseed((vim.uv or vim.loop).hrtime() % 2 ^ 31)
   return ("xxxxxxxx-xxxx-4xxx-yxxx-xxxxxxxxxxxx"):gsub("[xy]", function(c)
     local v = c == "x" and math.random(0, 15) or math.random(8, 11)
     return ("%x"):format(v)

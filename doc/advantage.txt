@@ -71,7 +71,16 @@ With lazy.nvim: >lua
                         Toggle skip-all-permissions mode.
 :Advantage effort       Tune reasoning effort / thinking.
 :Advantage help         Keybinding & command cheatsheet.
-:Advantage add          Send the current file / selection to the prompt.
+:Advantage add          Send the current file / selection to the prompt
+                        (with a range, e.g. `:'<,'>Advantage add`, sends
+                        `@file:L10-20`).
+:Advantage files        Pick a project file to add to the prompt.
+:Advantage attach {path}
+                        Attach a file (images become attachments, other files
+                        `@mentions`). No path opens the file picker.
+:Advantage ask {prompt} Send a prompt directly. With a visual range
+                        (`:'<,'>Advantage ask why is this slow?`) the selected
+                        lines are appended as a fenced block.
 
 ==============================================================================
 5. KEYMAPS                                                 *advantage-keymaps*
@@ -135,8 +144,7 @@ File tools are confined to the project root: absolute paths, `..` traversal,
 and symlinks that resolve outside the repo are rejected (set
 `tools.allow_outside_root = true` to opt out). Mutating tools (`edit_file`,
 `write_file`, `multi_edit`, `bash`) require an approval card unless auto-approved
-or `yolo` is on. Sub-agents are read-only. See SECURITY_AUDIT.md for the full
-trust-boundary notes.
+or `yolo` is on. Sub-agents are read-only.
 
 ==============================================================================
 8. MEMORY & SKILLS                                          *advantage-memory*

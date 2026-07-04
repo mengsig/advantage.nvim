@@ -103,6 +103,23 @@ local function tokens(s)
   return math.ceil(#(s or "") / 4)
 end
 
+---Truncate to at most `n` bytes without splitting a multi-byte UTF-8 character.
+---This block is spliced into the system prompt, so a dangling continuation byte
+---would make the request body invalid UTF-8. Mirrors compact.lua's helper.
+local function utf8_safe_sub(s, n)
+  if n <= 0 then return "" end
+  if n >= #s then return s end
+  while n > 0 do
+    local b = s:byte(n + 1)
+    if b and b >= 0x80 and b < 0xC0 then
+      n = n - 1
+    else
+      break
+    end
+  end
+  return s:sub(1, n)
+end
+
 ---Seed `<root>/.advantage/context.md` the first time this repo is used, so the
 ---memory file is visible, editable and committable from session one instead of
 ---appearing only after the model's first `remember` call. Idempotent — never
@@ -353,10 +370,40 @@ local function parse_skill(text)
   return name, desc, vim.trim(body)
 end
 
+-- Cache parsed skills across turns. `render()`/`skill_hints()`/`stats()` all scan
+-- on every system-prompt build; without this each turn re-reads and frontmatter-
+-- parses every SKILL.md. Keyed by a cheap stat signature (paths + mtime + size)
+-- so an add/remove/content-edit invalidates it; save_skill clears it explicitly.
+local _skills_cache = { sig = nil, value = nil }
+
+local function skill_roots()
+  return { skills_dir(), M.root() .. "/.claude/skills" }
+end
+
+local function skills_signature()
+  local parts = {}
+  for _, root in ipairs(skill_roots()) do
+    local dir = uv.fs_scandir(root)
+    if dir then
+      while true do
+        local entry = uv.fs_scandir_next(dir)
+        if not entry then break end
+        local p = root .. "/" .. entry .. "/SKILL.md"
+        local st = uv.fs_stat(p)
+        if st then parts[#parts + 1] = ("%s:%d:%d"):format(p, st.mtime and st.mtime.sec or 0, st.size or 0) end
+      end
+    end
+  end
+  table.sort(parts)
+  return table.concat(parts, "|")
+end
+
 ---Scan skill directories (.advantage/skills and, for interop, .claude/skills).
 ---Returns { {name=, description=, path=} } sorted by name, de-duplicated by name.
 local function scan_skills()
-  local roots = { skills_dir(), M.root() .. "/.claude/skills" }
+  local sig = skills_signature()
+  if _skills_cache.sig == sig and _skills_cache.value then return _skills_cache.value end
+  local roots = skill_roots()
   local seen, out = {}, {}
   for _, root in ipairs(roots) do
     local dir = uv.fs_scandir(root)
@@ -380,6 +427,7 @@ local function scan_skills()
   table.sort(out, function(a, b)
     return a.name < b.name
   end)
+  _skills_cache.sig, _skills_cache.value = sig, out
   return out
 end
 
@@ -523,13 +571,16 @@ end
 ---Create or overwrite a skill.
 function M.save_skill(name, description, body)
   name = tostring(name or ""):gsub("[^%w._-]", "-")
-  if name == "" then return false, "invalid skill name" end
+  -- Reject empty and dot-only names ("."/".."): "%w._-" keeps dots, so ".." would
+  -- resolve to `.advantage/skills/../SKILL.md` (outside the skills dir).
+  if name == "" or name:match("^%.+$") then return false, "invalid skill name" end
   local text = ("---\nname: %s\ndescription: %s\n---\n\n%s\n"):format(
     name,
     tostring(description or ""),
     vim.trim(tostring(body or ""))
   )
   local ok = write_file(skills_dir() .. "/" .. name .. "/SKILL.md", text)
+  _skills_cache.sig = nil -- new/updated skill: force a re-scan next time
   return ok, ok and nil or "write failed"
 end
 
@@ -559,7 +610,7 @@ local function project_memory()
   end)
   text = text:gsub("<!%-%-.-%-%->", "") -- strip HTML-comment noise (e.g. tool markers)
   local cap = (opts().project_budget_tokens or 2000) * 4
-  if #text > cap then text = text:sub(1, cap) .. "\n… [project memory truncated]" end
+  if #text > cap then text = utf8_safe_sub(text, cap) .. "\n… [project memory truncated]" end
   return vim.trim(text)
 end
 
@@ -625,7 +676,7 @@ function M.render()
       -- keep the index lean: one line, description capped so a verbose skill
       -- can't bloat the always-loaded tier (the body loads on demand anyway).
       local d = s.description or ""
-      if #d > 200 then d = d:sub(1, 197) .. "…" end
+      if #d > 200 then d = utf8_safe_sub(d, 197) .. "…" end
       lines[#lines + 1] = ("- %s: %s"):format(s.name, d)
     end
     parts[#parts + 1] = table.concat(lines, "\n")
