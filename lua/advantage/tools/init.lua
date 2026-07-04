@@ -745,24 +745,31 @@ tool({
 
 -- memory / skills (the self-learning harness) ---------------------------
 
----Append-only curation steer: when memory carries verbose bullets or nears its
----budget, tell the model (in the tool result — never the cached prefix, so it's
----free of per-turn cost) to route depth into an on-demand skill and keep the
----always-loaded tier crisp. Also fires a once-per-session persistent notice to
----the user. Returns a suffix string to append to the remember result.
+---Append-only curation steer: nudge the model (in the tool result — never the
+---cached prefix, so it's free of per-turn cost) toward the curation that actually
+---matters. Fires on genuine procedural DEPTH (belongs in an on-demand skill),
+---REDUNDANT overlapping facts (merge them), or real BUDGET pressure — never on
+---raw bullet length, which is cheap behind prompt-caching and whose specificity
+---is the point. Also fires a once-per-session persistent notice to the user.
 local function curation_suffix(res)
   local out = ""
-  if res.verbose_count and res.verbose_count > 0 then
+  if res.procedural_count and res.procedural_count > 0 then
     out = out
-      .. (" Curation due: %d memory fact(s) are too verbose for the always-loaded tier — move their detail into a skill (save_skill) with a description rich in the terms you'd search for, then leave a crisp one-line pointer. context.md is signposts; skills hold the depth and load on demand via use_skill."):format(
-        res.verbose_count
+      .. (" %d memory fact(s) read as procedural depth — move each into a skill (save_skill) with a description rich in the terms you'd search for, then leave a crisp one-line pointer; the body loads on demand via use_skill. Don't shorten precise facts, just relocate real depth."):format(
+        res.procedural_count
+      )
+  end
+  if res.redundant_pairs and res.redundant_pairs >= 3 then
+    out = out
+      .. (" Memory has %d overlapping fact pair(s) — merge them so it never says the same thing twice or contradicts itself."):format(
+        res.redundant_pairs
       )
   end
   if res.utilization and res.utilization > 0.85 then
     -- in-band signal to the model (the tool result rides the transcript, not the
     -- cached prefix, so it costs nothing per turn)
     out = out
-      .. (" Memory is at %d%% of its budget — curate soon: tighten facts and extract any depth into skills."):format(
+      .. (" Memory is at %d%% of its budget — curate: merge overlaps, drop stale facts, extract depth into skills (never truncate a load-bearing fact to save space)."):format(
         math.floor(res.utilization * 100 + 0.5)
       )
     -- once-per-session persistent nudge to the user
@@ -770,7 +777,7 @@ local function curation_suffix(res)
     if mem.curation_nudge_due() then
       pcall(function()
         require("advantage.ui.chat").notice(
-          ("⚠ repo memory is ~%d%% full — run /context curate to compress it (extract depth into skills, tighten the rest)"):format(
+          ("⚠ repo memory is ~%d%% full — run /context curate (merge overlaps, extract depth into skills)"):format(
             math.floor(res.utilization * 100 + 0.5)
           )
         )

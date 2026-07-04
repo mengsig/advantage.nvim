@@ -52,7 +52,7 @@ end
 local MEMORY_GUIDE = table.concat({
   "Persistent repo memory (this is your edge — it makes you faster and cheaper over time):",
   "- Repo memory and skills are injected below. Treat repo memory as trusted prior knowledge about THIS codebase; prefer it over re-deriving the same facts.",
-  "- When you learn a durable, non-obvious fact future sessions would want — an architecture invariant, a convention, a build/test command, a gotcha, or a preference the user states — call `remember` to save it (one crisp fact, right section). Don't record trivia or anything a quick file read re-derives.",
+  "- When you learn a durable, non-obvious fact future sessions would want — an architecture invariant, a convention, a build/test command, a gotcha, or a preference the user states — call `remember` to save it (one specific, self-contained fact in the right section). Prefer precision over brevity, but don't duplicate a fact already in memory. Don't record trivia or anything a quick file read re-derives.",
   "- A skill is a reusable procedure. When a listed skill's description matches the task, call `use_skill` to load its full steps before doing that task. Codify a genuinely reusable multi-step procedure with `save_skill`.",
 }, "\n")
 

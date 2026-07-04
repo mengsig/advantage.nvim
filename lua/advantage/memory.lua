@@ -318,6 +318,8 @@ function M.remember(fact, section)
             section = section,
             utilization = advice.utilization,
             verbose_count = advice.verbose_count,
+            procedural_count = advice.procedural_count,
+            redundant_pairs = advice.redundant_pairs,
           }
         end
         return { status = "duplicate", section = section }
@@ -333,23 +335,50 @@ function M.remember(fact, section)
     status = "added",
     section = section,
     evicted = evicted,
-    -- budget pressure + verbose-bullet count, so the model knows when (and what)
-    -- to curate: tighten the always-loaded tier, push depth into skills
+    -- budget pressure + the deterministic curation signals (real depth to push
+    -- into skills, redundant pairs to merge), so the model curates the things
+    -- that actually cost accuracy or tokens — not merely long-but-precise facts
     utilization = advice.utilization,
     verbose_count = advice.verbose_count,
+    procedural_count = advice.procedural_count,
+    redundant_pairs = advice.redundant_pairs,
   }
 end
 
----Deterministic curation signal (no model call): current budget utilization and
----the bullets too verbose to belong in the always-loaded tier (their depth
----belongs in an on-demand skill). Pure — safe to call anywhere.
----@return { utilization: number, over_budget: boolean, used_tokens: integer, budget_tokens: integer, verbose: table[], verbose_count: integer }
+---Deterministic curation signal (no model call). The load-bearing signals are
+---the ones that actually cost accuracy or tokens: budget pressure, genuine
+---procedural depth that belongs in an on-demand skill, and redundant bullets that
+---likely say the same thing twice (paying twice, or worse, contradicting). Raw
+---per-bullet length is reported (`verbose`) for the UI but is deliberately NOT a
+---curation trigger — behind prompt-caching a long, precise fact is cheap and
+---shortening it only sheds the specificity that makes the memory useful. Pure.
+---@return { utilization: number, over_budget: boolean, used_tokens: integer, budget_tokens: integer, verbose: table[], verbose_count: integer, procedural: table[], procedural_count: integer, redundant_pairs: integer }
 function M.curation_advice()
   local bullets, order = parse_context()
-  local verbose = {}
+  local verbose, procedural, flat = {}, {}, {}
   for _, section in ipairs(order) do
     for _, b in ipairs(bullets[section] or {}) do
+      flat[#flat + 1] = b
       if #b >= VERBOSE_BULLET_CHARS then verbose[#verbose + 1] = { section = section, len = #b, text = b } end
+      -- genuine depth (a numbered runbook or a very long multi-clause fact)
+      -- belongs in a skill; this — not length — is what we steer on
+      if looks_procedural(b) then procedural[#procedural + 1] = { section = section, len = #b, text = b } end
+    end
+  end
+  -- Redundancy: pairs that overlap enough to probably duplicate each other but
+  -- fell just below the auto-dedupe cut. This is the real "curate me" signal —
+  -- duplication wastes tokens and risks self-contradiction, both of which hurt.
+  local threshold = opts().dedupe_threshold or 0.8
+  local sets = {}
+  for i, b in ipairs(flat) do
+    local w, n = word_set(b)
+    sets[i] = { w = w, n = n }
+  end
+  local redundant = 0
+  for i = 1, #flat do
+    for j = i + 1, #flat do
+      local s = similarity(sets[i].w, sets[i].n, sets[j].w, sets[j].n)
+      if s >= threshold * 0.7 and s < threshold then redundant = redundant + 1 end
     end
   end
   local used, budget = total_chars(bullets), budget_chars()
@@ -360,6 +389,9 @@ function M.curation_advice()
     budget_tokens = math.ceil(budget / 4),
     verbose = verbose,
     verbose_count = #verbose,
+    procedural = procedural,
+    procedural_count = #procedural,
+    redundant_pairs = redundant,
   }
 end
 
@@ -576,28 +608,32 @@ function M.curate_prompt()
     "Curate this repo's memory for maximum signal per token. The current memory is injected in your",
     "context under '# Repo memory'; the file on disk is .advantage/context.md.",
     "",
-    "Cost model — internalize this: context.md is the ALWAYS-LOADED tier; it rides every single request,",
-    "so it must stay crisp (one-line signposts and load-bearing invariants). DEPTH belongs in SKILLS,",
-    "which cost one index line until the agent loads them on demand with use_skill. So push detail",
-    "DOWN into skills — don't delete it, and don't cram it into a bullet.",
+    "Cost model — internalize this: context.md rides Anthropic's cached system prefix, so after the",
+    "first turn it is billed at ~10%. A long, PRECISE fact is therefore cheap; its specificity (exact",
+    "names, paths, invariants) is what lets a future agent act instead of guess. So DO NOT shorten a",
+    "load-bearing fact to hit a length target — that trades real capability for a token saving caching",
+    "already erased. Optimize for correctness and non-redundancy, not brevity.",
     "",
-    "Do a compression pass:",
-    "1. Merge overlapping or redundant bullets into single tighter facts; drop anything stale,",
-    "   session-local, or re-derivable from a quick file read. Verify a fact against the code",
-    "   before dropping it as stale.",
-    "2. Move any bullet that carries real depth — a multi-step procedure, a subsystem deep-dive, a long",
-    "   multi-clause explanation — into a skill (save_skill). Give that skill a description RICH in the",
-    "   terms someone would use when they need it (the description is how it gets retrieved), then leave",
-    "   behind at most a crisp one-line pointer fact.",
+    "What actually costs you: (a) REDUNDANCY — two bullets saying the same thing wastes tokens and,",
+    "worse, can contradict and mislead; (b) STALENESS — a fact the code no longer supports; (c) DEPTH",
+    "in the wrong tier — a multi-step runbook or subsystem deep-dive belongs in a SKILL (one index line",
+    "until loaded on demand), not inline. Attack those three; leave crisp, accurate single facts alone.",
+    "",
+    "Do the pass:",
+    "1. Merge bullets that overlap into one tighter, still-specific fact. Drop anything stale or",
+    "   re-derivable from a quick file read — but verify a fact against the code before deleting it.",
+    "2. Move any bullet that is genuinely procedural (a 3+ step flow) or a real subsystem deep-dive into",
+    "   a skill (save_skill) with a description RICH in the terms someone would search for, then leave",
+    "   behind at most a crisp one-line pointer. Do not extract an atomic fact just because it is long.",
     "3. Rewrite .advantage/context.md directly (edit_file/write_file) keeping the exact format:",
     "   '# Repo memory' header, the managed comment, '## Section' headers",
     "   (Conventions/Architecture/Commands/Gotchas/Preferences/Notes), one '- fact' per line.",
-    ("4. Keep context.md under ~%d tokens and every bullet to ~1-2 lines. A handful of sharp signposts"):format(
+    ("4. Stay under ~%d tokens if you can, but never sacrifice a load-bearing detail to get there —"):format(
       opts().budget_tokens or 2000
     ),
-    "   plus well-described skills beats a wall of notes.",
+    "   prefer merging duplicates and extracting depth into skills over truncating precise facts.",
     "",
-    "Finish with a one-line before/after summary (facts, skills created, estimated tokens).",
+    "Finish with a one-line before/after summary (facts merged/dropped, skills created, est. tokens).",
   }, "\n")
 end
 
@@ -670,18 +706,47 @@ end
 -- verify: flag facts whose file/path anchors no longer exist (honesty pass)
 --------------------------------------------------------------------------------
 
+---True when `path` (a repo-relative-ish file reference) resolves to a real file.
+---Checks root-relative and cwd-relative first, then — because facts routinely
+---cite a module-relative suffix like `tools/init.lua` (really
+---`lua/advantage/tools/init.lua`) — looks for any file in the tree whose path
+---ends with that suffix. Bounded so a huge tree can't wedge the command.
+local function path_resolves(root, path)
+  if uv.fs_stat(root .. "/" .. path) or uv.fs_stat(path) then return true end
+  local base = path:match("([^/]+)$")
+  if not base then return false end
+  local hits = vim.fs.find(base, { path = root, type = "file", limit = 64 })
+  for _, hit in ipairs(hits) do
+    -- match on a path-segment boundary so `init.lua` doesn't satisfy `xinit.lua`
+    if hit == path or hit:sub(-(#path + 1)) == "/" .. path then return true end
+  end
+  return false
+end
+
+---A candidate token only counts as a file reference if it has a directory
+---separator AND its final segment carries a short file extension. This is what
+---separates a real path from word/word prose like `race/clobber`,
+---`remember/save_skill`, `speed-limit/speed-time` or `0.10/stable/nightly` —
+---which would otherwise be flagged as missing paths (the bug this guards).
+local function looks_like_path(tok)
+  if not tok:find("/", 1, true) then return false end
+  local last = tok:match("([^/]+)$")
+  return last ~= nil and last:match("%.%w[%w]?[%w]?[%w]?[%w]?$") ~= nil
+end
+
 ---Return a list of {section, bullet, missing} for bullets that name a project
 ---path which is no longer readable — cheap staleness detection, no model call.
+---Only genuinely path-shaped, unresolvable references are reported: a false
+---"stale" flag on a good fact is worse than none, so precision beats recall here.
 function M.verify()
   local root = M.root()
   local bullets, order = parse_context()
   local stale = {}
   for _, section in ipairs(order) do
     for _, b in ipairs(bullets[section]) do
-      -- consider tokens that look like project paths (contain a slash or a dot-ext)
       for cand in b:gmatch("[%w._/-]+/[%w._/-]+") do
         local path = cand:gsub("[.,:;)]+$", "")
-        if not path:match("^https?://") and not uv.fs_stat(root .. "/" .. path) and not uv.fs_stat(path) then
+        if not path:match("^https?://") and looks_like_path(path) and not path_resolves(root, path) then
           stale[#stale + 1] = { section = section, bullet = b, missing = path }
           break
         end

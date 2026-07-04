@@ -1665,6 +1665,20 @@ do
   end
   check(ghost_hit and real_ok, "verify flags only facts whose referenced path is missing")
 
+  -- verify precision: word/word prose is not a path, and a module-relative
+  -- suffix that resolves deeper in the tree must not be flagged stale
+  vim.fn.mkdir(tmp .. "/lua/pkg/tools", "p")
+  vim.fn.writefile({ "x" }, tmp .. "/lua/pkg/tools/init.lua")
+  memory.remember("Guarded by tools/init.lua and split on speed-limit/speed-time race/clobber", "Gotchas")
+  local vp_prose, vp_suffix = true, true
+  for _, s in ipairs(memory.verify()) do
+    if s.missing:find("speed", 1, true) or s.missing:find("clobber", 1, true) then vp_prose = false end
+    if s.missing:find("tools/init.lua", 1, true) then vp_suffix = false end
+  end
+  check(vp_prose, "verify ignores word/word prose that isn't a real path")
+  check(vp_suffix, "verify resolves a module-relative path suffix deeper in the tree")
+  memory.forget("Guarded by tools/init.lua")
+
   -- budget: learned block can never bloat context
   config.options.memory.budget_tokens = 30
   for i = 1, 12 do
@@ -1691,6 +1705,12 @@ do
     "curation_advice reports verbose bullets and their length"
   )
   check(type(advice.utilization) == "number" and advice.used_tokens > 0, "curation_advice reports utilization")
+  -- redundancy is the real curate signal: near-duplicate pairs (below the auto-
+  -- dedupe cut) are counted deterministically so curation targets overlap, not length
+  memory.remember("The alpha widget cache warms eagerly on startup for fast dispatch", "Architecture")
+  memory.remember("Alpha widget cache is warmed eagerly at startup so dispatch stays fast", "Architecture")
+  check((memory.curation_advice().redundant_pairs or 0) >= 1, "curation_advice counts near-duplicate (redundant) pairs")
+  memory.forget("alpha widget cache")
   memory.forget("widget rendering pipeline resolves layout")
 
   -- skills index is budgeted: past the cap, skills drop off the always-loaded
