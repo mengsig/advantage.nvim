@@ -219,10 +219,21 @@ per-repo memory so the agent gets *better and cheaper* at your codebase over tim
 - Memory is rendered into the **cached** system prefix, so after the first turn it
   costs ~10% — and it *saves* tokens by sparing the model repeated read/grep loops
   to re-derive what it already learned.
-- **Skills** are reusable named procedures. Only a one-line index (name +
-  description) is always in context; the full steps load on demand when the agent
-  calls `use_skill`, keeping context lean. The agent codifies new ones with
-  `save_skill`. Skills interoperate with `.claude/skills/`.
+- **Two tiers by cost.** `context.md` is the *always-loaded* tier — crisp one-line
+  signposts and load-bearing invariants, held to `memory.budget_tokens`. **Depth**
+  lives in **skills** (below): unbounded storage at ~one index line of always-loaded
+  cost, pulled in full only when needed. This is deliberate: the always-loaded tier
+  is a recurring per-turn tax, so it stays lean while total knowledge grows in the
+  on-demand tier. When a fact gets too verbose, the `remember` tool tells the agent
+  (in the tool result, never the cached prefix) to move its detail into a skill and
+  leave a crisp pointer — and nudges you (persistently) to `/context curate`.
+- **Skills** are reusable named procedures *and* deep-dive knowledge. Only a one-line
+  index (name + description) is always in context — itself budgeted
+  (`memory.skills_index_budget_tokens`) so a big library can't re-bloat the prefix,
+  with deterministic truncation that keeps the cache stable; skills past the cap stay
+  loadable by name. The full body loads on demand when the agent calls `use_skill`.
+  The agent codifies new ones with `save_skill`. Skills interoperate with
+  `.claude/skills/`.
 - Skills are also **auto-surfaced**: a deterministic keyword match against your
   prompt appends a one-line hint to the outgoing message when a skill looks
   relevant ("the deploy-docs skill may apply — load it with use_skill"), at most
@@ -355,7 +366,10 @@ require("advantage").setup({
   },
   memory = {                     -- per-repo self-learning harness (remember/use_skill)
     enabled = true,
-    budget_tokens = 1200,        -- cap on the learned-facts block; oldest evicted past it
+    budget_tokens = 2000,        -- cap on the always-loaded facts block (crisp signposts;
+                                 -- push DEPTH into on-demand skills, not this tier)
+    skills_index_budget_tokens = 1200, -- cap on the always-loaded skills index; skills past
+                                 -- it stay loadable by name (deterministic truncation)
     project_budget_tokens = 2000,-- cap on ingested AGENTS.md / CLAUDE.md
     dedupe_threshold = 0.8,      -- word-overlap ratio above which a fact is a duplicate
   },

@@ -174,9 +174,19 @@ M.defaults = {
   ---and offline — no embeddings, no validator model. Files live under `<root>/.advantage/`.
   memory = {
     enabled = true,
-    ---Rough token cap for the learned-facts block (chars/4). Oldest facts are
-    ---evicted past this so the block can never bloat context.
-    budget_tokens = 1200,
+    ---Rough token cap (chars/4) for the always-loaded learned-facts block. It
+    ---rides the cached system prefix (billed ~10% after turn one), so this is a
+    ---recurring per-turn tax — keep it lean. Oldest facts are evicted past it. The
+    ---always-loaded tier is for CRISP signposts; depth belongs in on-demand skills
+    ---(one index line until loaded), so raising this is rarely the right lever —
+    ---curate depth into skills instead (`/context curate`).
+    budget_tokens = 2000,
+    ---Token cap on the always-loaded SKILLS INDEX (one line per skill). Skills past
+    ---the cap stay fully available — loadable by name with `use_skill` and still
+    ---keyword-hinted — but drop off the always-visible list, so a large skill
+    ---library never re-bloats the cached prefix. Truncation is deterministic
+    ---(alphabetical) to preserve prompt-cache stability.
+    skills_index_budget_tokens = 1200,
     ---Token cap for ingested project memory (AGENTS.md / CLAUDE.md).
     project_budget_tokens = 2000,
     ---Word-overlap ratio above which a new fact counts as a duplicate.

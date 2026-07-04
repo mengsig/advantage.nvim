@@ -745,6 +745,41 @@ tool({
 
 -- memory / skills (the self-learning harness) ---------------------------
 
+---Append-only curation steer: when memory carries verbose bullets or nears its
+---budget, tell the model (in the tool result — never the cached prefix, so it's
+---free of per-turn cost) to route depth into an on-demand skill and keep the
+---always-loaded tier crisp. Also fires a once-per-session persistent notice to
+---the user. Returns a suffix string to append to the remember result.
+local function curation_suffix(res)
+  local out = ""
+  if res.verbose_count and res.verbose_count > 0 then
+    out = out
+      .. (" Curation due: %d memory fact(s) are too verbose for the always-loaded tier — move their detail into a skill (save_skill) with a description rich in the terms you'd search for, then leave a crisp one-line pointer. context.md is signposts; skills hold the depth and load on demand via use_skill."):format(
+        res.verbose_count
+      )
+  end
+  if res.utilization and res.utilization > 0.85 then
+    -- in-band signal to the model (the tool result rides the transcript, not the
+    -- cached prefix, so it costs nothing per turn)
+    out = out
+      .. (" Memory is at %d%% of its budget — curate soon: tighten facts and extract any depth into skills."):format(
+        math.floor(res.utilization * 100 + 0.5)
+      )
+    -- once-per-session persistent nudge to the user
+    local mem = require("advantage.memory")
+    if mem.curation_nudge_due() then
+      pcall(function()
+        require("advantage.ui.chat").notice(
+          ("⚠ repo memory is ~%d%% full — run /context curate to compress it (extract depth into skills, tighten the rest)"):format(
+            math.floor(res.utilization * 100 + 0.5)
+          )
+        )
+      end)
+    end
+  end
+  return out
+end
+
 tool({
   name = "remember",
   safe = true,
@@ -780,7 +815,7 @@ tool({
     elseif res.status == "duplicate" then
       return cb("Already known — a near-identical fact is in memory; not duplicated.", false)
     elseif res.status == "updated" then
-      return cb(("Updated the existing fact under %s."):format(res.section), false)
+      return cb(("Updated the existing fact under %s."):format(res.section) .. curation_suffix(res), false)
     end
     local msg = ("Remembered under %s."):format(res.section)
     if res.evicted and #res.evicted > 0 then
@@ -795,13 +830,8 @@ tool({
           table.concat(shown, ", "),
           #res.evicted > 3 and ", …" or ""
         )
-    elseif res.utilization and res.utilization > 0.85 then
-      msg = msg
-        .. (" Memory is at %d%% of its budget — a curation pass (merge duplicates, extract procedures to skills) is due soon."):format(
-          math.floor(res.utilization * 100 + 0.5)
-        )
     end
-    cb(msg, false)
+    cb(msg .. curation_suffix(res), false)
   end,
 })
 

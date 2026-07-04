@@ -1677,6 +1677,39 @@ do
   memory.remember("A very specific forgettable marker phrase qxz", "Notes")
   check(memory.forget("forgettable marker phrase qxz") >= 1, "forget removes matching facts")
 
+  -- curation signal: a verbose bullet is flagged (depth belongs in a skill), and
+  -- the remember result carries the signal so the model can act on it.
+  config.options.memory.budget_tokens = 2000
+  local long_fact = "The widget rendering pipeline resolves layout in three stages: measure computes intrinsic sizes bottom-up, "
+    .. "arrange positions children top-down within the measured bounds it received, and paint emits draw ops in order while "
+    .. "respecting the active clip stack and the per-node z-order established during arrange"
+  local rv = memory.remember(long_fact, "Architecture")
+  check(rv.status == "added" and (rv.verbose_count or 0) >= 1, "remember flags a verbose bullet in its result")
+  local advice = memory.curation_advice()
+  check(
+    advice.verbose_count >= 1 and advice.verbose[1].len >= 240,
+    "curation_advice reports verbose bullets and their length"
+  )
+  check(type(advice.utilization) == "number" and advice.used_tokens > 0, "curation_advice reports utilization")
+  memory.forget("widget rendering pipeline resolves layout")
+
+  -- skills index is budgeted: past the cap, skills drop off the always-loaded
+  -- list (with a "+N more" note) but stay fully loadable by name.
+  config.options.memory.skills_index_budget_tokens = 1 -- force truncation to 1 shown
+  for _, nm in ipairs({ "alpha-flow", "beta-flow", "gamma-flow" }) do
+    memory.save_skill(nm, "trigger for " .. nm, "step one\nstep two\nstep three")
+  end
+  local idx_block = memory.render()
+  check(idx_block:find("more skill", 1, true) ~= nil, "skills index truncates with a '+N more' note under its budget")
+  local loadable = select(1, memory.use_skill("gamma-flow"))
+  check(loadable and loadable:find("step two", 1, true), "a skill dropped from the index is still loadable by name")
+  local all_indexed = 0
+  for _, s in ipairs(memory.skills_index()) do
+    if s.name:find("-flow") then all_indexed = all_indexed + 1 end
+  end
+  check(all_indexed == 3, "all skills remain in the full index / hintable regardless of the display cap")
+  config.options.memory.skills_index_budget_tokens = 1200
+
   -- gated off injects nothing
   config.options.memory.enabled = false
   check(memory.render() == "", "disabled memory injects nothing")

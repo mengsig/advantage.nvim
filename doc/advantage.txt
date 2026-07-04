@@ -134,7 +134,7 @@ Full defaults live in `lua/advantage/config.lua`. Key options: >lua
         summarizer_model = "anthropic/claude-haiku-4-5",
       },
       subagents = { enabled = true, max_turns = 6, parallel = true },
-      memory = { enabled = true, budget_tokens = 1200 },
+      memory = { enabled = true, budget_tokens = 2000, skills_index_budget_tokens = 1200 },
       sessions = { autosave = true },
     })
 <
@@ -165,13 +165,23 @@ won't miss it if you stepped away. Configure via `tools.diagnostics` (`enabled`,
 ==============================================================================
 8. MEMORY & SKILLS                                          *advantage-memory*
 
-advantage keeps per-repo memory under `<root>/.advantage/`:
+advantage keeps per-repo memory under `<root>/.advantage/` in two tiers by cost:
 
-  context.md            durable, human-readable learned facts (one bullet each)
-  skills/<name>/SKILL.md  a named reusable procedure (loaded on demand)
+  context.md            ALWAYS-LOADED crisp facts, one bullet each — the recurring
+                        per-turn tax (rides the cached prefix), held to
+                        `memory.budget_tokens` (default 2000). Keep it lean.
+  skills/<name>/SKILL.md  DEPTH: a named procedure / deep-dive, index-only in
+                        context until loaded on demand via use_skill. The index is
+                        itself capped (`memory.skills_index_budget_tokens`) so a
+                        large library never re-bloats the prefix.
+
+Because the always-loaded tier is billed every turn, DEPTH belongs in skills, not
+in facts: when a fact grows too verbose the `remember` tool steers the agent to
+extract it into a skill (with a retrieval-rich description) and leave a crisp
+pointer, and persistently nudges you to `/context curate`.
 
 `:Advantage context` shows the memory; `context init` teaches the repo in one
-pass; `context curate` compresses it; `context verify` flags facts whose files
+pass; `context curate` compresses it (tighten facts, push depth into skills); `context verify` flags facts whose files
 have moved/vanished; `context preview` (also `<leader>cP`) shows the exact
 context packet that will be sent — system prompt, tool schemas and transcript —
 with the cache boundary drawn and a per-section token breakdown, so you can see

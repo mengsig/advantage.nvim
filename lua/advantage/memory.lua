@@ -234,8 +234,13 @@ end
 --------------------------------------------------------------------------------
 
 local function budget_chars()
-  return math.max(400, (opts().budget_tokens or 1200) * 4)
+  return math.max(400, (opts().budget_tokens or 2000) * 4)
 end
+
+-- A bullet longer than this carries more depth than the always-loaded tier
+-- should pay for on every turn: its detail belongs in an on-demand skill, with
+-- a crisp one-line pointer left behind. Flagged (not blocked) by curation_advice.
+local VERBOSE_BULLET_CHARS = 240
 
 local function total_chars(bullets)
   local n = 0
@@ -307,7 +312,13 @@ function M.remember(fact, section)
         if #fact > #existing then
           items[idx] = fact
           save_context(bullets, order)
-          return { status = "updated", section = section }
+          local advice = M.curation_advice()
+          return {
+            status = "updated",
+            section = section,
+            utilization = advice.utilization,
+            verbose_count = advice.verbose_count,
+          }
         end
         return { status = "duplicate", section = section }
       end
@@ -317,13 +328,47 @@ function M.remember(fact, section)
   bullets[section][#bullets[section] + 1] = fact
   local evicted = enforce_budget(bullets, order)
   save_context(bullets, order)
+  local advice = M.curation_advice()
   return {
     status = "added",
     section = section,
     evicted = evicted,
-    -- budget pressure, so the model knows when curation is due
-    utilization = math.min(1, total_chars(bullets) / budget_chars()),
+    -- budget pressure + verbose-bullet count, so the model knows when (and what)
+    -- to curate: tighten the always-loaded tier, push depth into skills
+    utilization = advice.utilization,
+    verbose_count = advice.verbose_count,
   }
+end
+
+---Deterministic curation signal (no model call): current budget utilization and
+---the bullets too verbose to belong in the always-loaded tier (their depth
+---belongs in an on-demand skill). Pure — safe to call anywhere.
+---@return { utilization: number, over_budget: boolean, used_tokens: integer, budget_tokens: integer, verbose: table[], verbose_count: integer }
+function M.curation_advice()
+  local bullets, order = parse_context()
+  local verbose = {}
+  for _, section in ipairs(order) do
+    for _, b in ipairs(bullets[section] or {}) do
+      if #b >= VERBOSE_BULLET_CHARS then verbose[#verbose + 1] = { section = section, len = #b, text = b } end
+    end
+  end
+  local used, budget = total_chars(bullets), budget_chars()
+  return {
+    utilization = math.min(1, used / budget),
+    over_budget = used > budget,
+    used_tokens = math.ceil(used / 4),
+    budget_tokens = math.ceil(budget / 4),
+    verbose = verbose,
+    verbose_count = #verbose,
+  }
+end
+
+---Fire the once-per-session persistent curation nudge at most once. Returns true
+---the first time it is called in a session, false thereafter.
+function M.curation_nudge_due()
+  if M._session.curation_nudged then return false end
+  M._session.curation_nudged = true
+  return true
 end
 
 ---Remove every bullet whose text matches `pattern` (plain, case-insensitive
@@ -438,10 +483,10 @@ end
 ---Session-lifetime counters for instrumentation and hint throttling. Reset per
 ---conversation (agent.new) so a fresh chat can re-surface skills and the /usage
 ---savings math starts clean.
-M._session = { skill_loads = 0, skill_load_tokens = 0, loaded = {}, hinted = {} }
+M._session = { skill_loads = 0, skill_load_tokens = 0, loaded = {}, hinted = {}, curation_nudged = false }
 
 function M.reset_session()
-  M._session = { skill_loads = 0, skill_load_tokens = 0, loaded = {}, hinted = {} }
+  M._session = { skill_loads = 0, skill_load_tokens = 0, loaded = {}, hinted = {}, curation_nudged = false }
 end
 
 ---Return the full body of a skill by name, or nil.
@@ -516,9 +561,10 @@ function M.init_prompt()
     "- Gotchas: sharp edges that would trip an agent (non-obvious ordering, footguns, deceptive names)",
     "",
     "Rules: 8-15 facts total, one crisp self-contained sentence each. Only durable, non-obvious facts —",
-    "skip anything a quick file read re-derives, and never record a guess. If the test, build or release",
-    "flow takes 3+ steps, codify it with save_skill instead of cramming it into facts.",
-    "Finish with a short summary of what you recorded.",
+    "skip anything a quick file read re-derives, and never record a guess. Facts are the always-loaded",
+    "tier, so keep them crisp; anything with real depth (a 3+ step build/test/release flow, or a",
+    "subsystem worth a deep-dive) goes in a skill via save_skill with a retrieval-rich description,",
+    "not crammed into a fact. Finish with a short summary of what you recorded.",
   }, "\n")
 end
 
@@ -527,25 +573,31 @@ end
 ---always-loaded block shrinks while nothing valuable is lost.
 function M.curate_prompt()
   return table.concat({
-    "Curate this repo's memory. The current memory is injected in your context under '# Repo memory';",
-    "the file on disk is .advantage/context.md.",
+    "Curate this repo's memory for maximum signal per token. The current memory is injected in your",
+    "context under '# Repo memory'; the file on disk is .advantage/context.md.",
+    "",
+    "Cost model — internalize this: context.md is the ALWAYS-LOADED tier; it rides every single request,",
+    "so it must stay crisp (one-line signposts and load-bearing invariants). DEPTH belongs in SKILLS,",
+    "which cost one index line until the agent loads them on demand with use_skill. So push detail",
+    "DOWN into skills — don't delete it, and don't cram it into a bullet.",
     "",
     "Do a compression pass:",
     "1. Merge overlapping or redundant bullets into single tighter facts; drop anything stale,",
     "   session-local, or re-derivable from a quick file read. Verify a fact against the code",
     "   before dropping it as stale.",
-    "2. Extract any bullet that is really a multi-step procedure into a skill (save_skill) —",
-    "   a procedure costs its full length in every request as a bullet, but only one index line",
-    "   as a skill. Leave at most a one-line pointer behind if needed.",
+    "2. Move any bullet that carries real depth — a multi-step procedure, a subsystem deep-dive, a long",
+    "   multi-clause explanation — into a skill (save_skill). Give that skill a description RICH in the",
+    "   terms someone would use when they need it (the description is how it gets retrieved), then leave",
+    "   behind at most a crisp one-line pointer fact.",
     "3. Rewrite .advantage/context.md directly (edit_file/write_file) keeping the exact format:",
     "   '# Repo memory' header, the managed comment, '## Section' headers",
     "   (Conventions/Architecture/Commands/Gotchas/Preferences/Notes), one '- fact' per line.",
-    ("4. Keep the whole file under ~%d tokens. Quality over quantity: a handful of sharp facts"):format(
-      opts().budget_tokens or 1200
+    ("4. Keep context.md under ~%d tokens and every bullet to ~1-2 lines. A handful of sharp signposts"):format(
+      opts().budget_tokens or 2000
     ),
-    "   beats a wall of notes.",
+    "   plus well-described skills beats a wall of notes.",
     "",
-    "Finish with a one-line before/after summary (facts and estimated tokens).",
+    "Finish with a one-line before/after summary (facts, skills created, estimated tokens).",
   }, "\n")
 end
 
@@ -679,12 +731,30 @@ function M.render_parts()
       "# Skills — reusable procedures for this repo.",
       "Call the `use_skill` tool with the name to load a skill's full steps before doing that task.",
     }
+    -- Budget the always-loaded index so a large skill library can't re-bloat the
+    -- cached prefix. Truncation is deterministic (scan_skills is alphabetical), so
+    -- the frozen block stays prompt-cache-stable; a dropped skill is still fully
+    -- available — loadable by name with use_skill and still keyword-hinted.
+    local budget = math.max(200, (opts().skills_index_budget_tokens or 1200) * 4)
+    local used = #lines[1] + #lines[2] + 2
+    local shown, dropped = 0, 0
     for _, s in ipairs(skills) do
       -- keep the index lean: one line, description capped so a verbose skill
       -- can't bloat the always-loaded tier (the body loads on demand anyway).
       local d = s.description or ""
       if #d > 200 then d = utf8_safe_sub(d, 197) .. "…" end
-      lines[#lines + 1] = ("- %s: %s"):format(s.name, d)
+      local line = ("- %s: %s"):format(s.name, d)
+      -- always keep at least one; otherwise stop once the index budget is spent
+      if shown == 0 or used + #line + 1 <= budget then
+        lines[#lines + 1] = line
+        used = used + #line + 1
+        shown = shown + 1
+      else
+        dropped = dropped + 1
+      end
+    end
+    if dropped > 0 then
+      lines[#lines + 1] = ("- … +%d more skill(s) — load any by name with use_skill"):format(dropped)
     end
     parts[#parts + 1] = { label = ("skills index (%d)"):format(#skills), text = table.concat(lines, "\n") }
   end
