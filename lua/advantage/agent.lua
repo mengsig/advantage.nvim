@@ -427,6 +427,7 @@ function Agent:_maybe_compact(force, opts, callback)
         )
       return finish_heuristic()
     end
+    info = info or {}
     self.messages = next_messages
     self._auto_compact_floor = info.after_tokens
     self._memory_block = nil -- refresh the memory block from disk at the compaction boundary
@@ -843,7 +844,7 @@ end
 function Agent:_finish(errored)
   self.status = "idle"
   local ui = self:ui()
-  ui.finish_turn(self.turn_started and (uv.hrtime() - self.turn_started) or nil)
+  ui.finish_turn()
   ui.set_status("idle")
   -- Persist even on a cancelled/errored turn: the cancel path already trimmed the
   -- transcript to a consistent last message, and the errored path never appended a

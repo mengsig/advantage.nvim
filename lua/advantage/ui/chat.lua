@@ -349,7 +349,9 @@ end
 local function scroll_chat(keys)
   if not util.win_valid(S.win) then return end
   api.nvim_win_call(S.win, function()
-    pcall(vim.cmd, "normal! " .. api.nvim_replace_termcodes(keys, true, false, true))
+    pcall(function()
+      vim.cmd("normal! " .. api.nvim_replace_termcodes(keys, true, false, true))
+    end)
     local lc = api.nvim_buf_line_count(S.buf)
     S.follow = api.nvim_win_get_cursor(S.win)[1] >= lc - 2
   end)
@@ -403,6 +405,24 @@ function M.add_mention(path)
   if util.win_valid(S.input_win) then
     api.nvim_set_current_win(S.input_win)
     api.nvim_win_set_cursor(S.input_win, { #lines, math.max(#lines[#lines] - 1, 0) })
+    vim.cmd.startinsert({ bang = true })
+  end
+end
+
+---Replace the prompt buffer with `text` and focus it in insert mode. Used by
+---resume-rewind to preload the turn you chose to retry.
+function M.set_prompt(text)
+  M.open(false)
+  if not util.buf_valid(S.input_buf) then return end
+  local lines = vim.split(text or "", "\n", { plain = true })
+  api.nvim_buf_set_lines(S.input_buf, 0, -1, false, lines)
+  input_placeholder()
+  update_input_winbar()
+  resize_input()
+  if util.win_valid(S.input_win) then
+    api.nvim_set_current_win(S.input_win)
+    local last = lines[#lines] or ""
+    api.nvim_win_set_cursor(S.input_win, { #lines, #last })
     vim.cmd.startinsert({ bang = true })
   end
 end

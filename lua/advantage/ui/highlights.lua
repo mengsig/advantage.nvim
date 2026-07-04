@@ -37,7 +37,7 @@ function M.setup()
   local fg = get_color({ "Normal" }, "fg") or (dark and 0xd8dae8 or 0x2a2a33)
   local accent
   if cfg.ui.accent then
-    accent = tonumber(cfg.ui.accent:gsub("#", ""), 16)
+    accent = tonumber((cfg.ui.accent --[[@as string]]):gsub("#", ""), 16)
   else
     accent = get_color({ "Function", "Title", "Directory" }, "fg") or (dark and 0x8ec1a8 or 0x3a7a5e)
   end

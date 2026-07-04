@@ -44,7 +44,7 @@ local PREAMBLE = {
 local _root_cache = {}
 function M.root()
   if M._root_override then return M._root_override end
-  local cwd = uv.cwd()
+  local cwd = uv.cwd() or ""
   if _root_cache[cwd] ~= nil then return _root_cache[cwd] end
   local found = vim.fs.find(".git", { path = cwd, upward = true })[1]
   local root = found and vim.fs.dirname(found) or cwd
@@ -289,7 +289,7 @@ end
 ---wins). Returns status: "added" | "duplicate" | "updated".
 ---@param fact string
 ---@param section? string one of SECTIONS (defaults to "Notes")
----@return { status: string, evicted?: integer, section: string }
+---@return { status: string, evicted?: string[], section: string, verbose_count?: integer }
 function M.remember(fact, section)
   fact = vim.trim(tostring(fact or ""):gsub("%s+", " "))
   if fact == "" then return { status = "empty", section = "Notes" } end
@@ -477,6 +477,7 @@ end
 
 ---Scan skill directories (.advantage/skills and, for interop, .claude/skills).
 ---Returns { {name=, description=, path=} } sorted by name, de-duplicated by name.
+---@return {name:string, description:string, path:string}[]
 local function scan_skills()
   local sig = skills_signature()
   if _skills_cache.sig == sig and _skills_cache.value then return _skills_cache.value end

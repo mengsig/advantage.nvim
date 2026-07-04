@@ -46,7 +46,7 @@ local function read_since(since)
 end
 
 local function midnight(offset_days)
-  local d = os.date("*t")
+  local d = os.date("*t") --[[@as osdate]]
   d.hour, d.min, d.sec = 0, 0, 0
   return os.time(d) + (offset_days or 0) * 86400
 end

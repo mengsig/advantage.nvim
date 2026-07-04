@@ -284,13 +284,13 @@ do
     return result, is_err
   end
 
-  local r = run("write_file", { path = "x/hello.txt", content = "alpha\nbeta\ngamma\n" })
+  local r = assert(run("write_file", { path = "x/hello.txt", content = "alpha\nbeta\ngamma\n" }))
   check(r:find("Wrote 4 lines"), "write_file creates nested file")
 
-  r = run("read_file", { path = "x/hello.txt" })
+  r = assert(run("read_file", { path = "x/hello.txt" }))
   check(r:find("1→alpha") and r:find("3→gamma"), "read_file returns numbered lines")
 
-  r = run("edit_file", { path = "x/hello.txt", old_string = "beta", new_string = "BETA" })
+  r = assert(run("edit_file", { path = "x/hello.txt", old_string = "beta", new_string = "BETA" }))
   check(r:find("Applied 1 replacement"), "edit_file replaces unique string")
 
   local _, err = run("edit_file", { path = "x/hello.txt", old_string = "nope", new_string = "x" })
@@ -320,13 +320,13 @@ do
   )
   check(tools.validate_input("read_file", { path = "p" }) == nil, "validate_input passes read_file with path")
 
-  r = run("bash", { command = "echo out; echo err >&2; exit 3" })
+  r = assert(run("bash", { command = "echo out; echo err >&2; exit 3" }))
   check(r:find("out") and r:find("err") and r:find("exit code 3"), "bash merges output + exit code")
 
-  r = run("grep", { pattern = "BETA", path = "." })
+  r = assert(run("grep", { pattern = "BETA", path = "." }))
   check(r:find("hello.txt") ~= nil, "grep finds matches")
 
-  r = run("list_dir", { path = "x" })
+  r = assert(run("list_dir", { path = "x" }))
   check(r:find("hello.txt"), "list_dir lists entries")
 
   local preview = tools.get("edit_file").preview({ path = "x/hello.txt", old_string = "BETA", new_string = "b" }, ctx)
@@ -354,7 +354,11 @@ do
   vim.wait(5000, function()
     return done
   end, 10)
-  check(#streams >= 1 and result:find("one") and result:find("two") and not is_err, "bash can stream partial output")
+  local streamed = assert(result)
+  check(
+    #streams >= 1 and streamed:find("one") and streamed:find("two") and not is_err,
+    "bash can stream partial output"
+  )
 
   -- cancellation stops a running command and reports an error final result
   done, result, is_err = false, nil, nil
@@ -365,7 +369,7 @@ do
   vim.wait(5000, function()
     return done
   end, 10)
-  check(is_err == true and result:find("cancelled", 1, true), "bash cancellation stops the command")
+  check(is_err == true and assert(result):find("cancelled", 1, true), "bash cancellation stops the command")
 end
 
 -- 4-diag. diagnostics feedback loop ----------------------------------------------
@@ -391,9 +395,9 @@ do
     err_only and err_only:find("undefined global") and not err_only:find("unused local"),
     "render at severity=error shows only errors"
   )
-  check(err_only:find("L2:7", 1, true) ~= nil, "render reports 1-based line:col with [source]")
+  check(assert(err_only):find("L2:7", 1, true) ~= nil, "render reports 1-based line:col with [source]")
 
-  local with_warn = diagnostics.render(buf, { severity = "warn", max = 10 })
+  local with_warn = assert(diagnostics.render(buf, { severity = "warn", max = 10 }))
   check(
     with_warn:find("undefined global") and with_warn:find("unused local"),
     "render at severity=warn includes warnings"
@@ -421,7 +425,7 @@ do
     many[i] = { lnum = i, col = 0, message = "err " .. i, severity = vim.diagnostic.severity.ERROR }
   end
   vim.diagnostic.set(ns, buf, many)
-  local capped = diagnostics.render(buf, { severity = "error", max = 3 })
+  local capped = assert(diagnostics.render(buf, { severity = "error", max = 3 }))
   local _, count = capped:gsub("\n", "\n")
   check(capped:find("+27 more", 1, true) ~= nil and count == 3, "render caps at max lines with a +N more note")
   vim.diagnostic.reset(ns, buf)
@@ -450,6 +454,33 @@ do
   check(synced, "after_edit returns synchronously (nil) when no diagnostic provider exists")
 
   vim.api.nvim_buf_delete(buf, { force = true })
+
+  -- ensure_bufnr robustness: bufload reads the file in before firing
+  -- BufReadPost/FileType autocmds, so an unrelated autocmd throwing (an LSP
+  -- client racing to attach while a sibling buffer of the same filetype is
+  -- mid-startup, observed loading several fresh Zig buffers back to back)
+  -- must not make M.report falsely claim the file couldn't be opened.
+  local tmp = vim.fn.tempname() .. ".lua"
+  vim.fn.writefile({ "return 1" }, tmp)
+  local real_bufload = vim.fn.bufload
+  vim.fn.bufload = function(...)
+    real_bufload(...) -- content is read into the buffer first, exactly like real bufload
+    error("simulated autocmd failure during load")
+  end
+  local report_result = nil
+  diagnostics.report(tmp, "warn", function(text)
+    report_result = text
+  end)
+  vim.wait(2000, function()
+    return report_result ~= nil
+  end)
+  vim.fn.bufload = real_bufload
+  check(
+    report_result ~= nil and not report_result:find("Could not open", 1, true),
+    "report tolerates bufload throwing once the buffer's text is already loaded"
+  )
+  pcall(vim.api.nvim_buf_delete, vim.fn.bufnr(tmp), { force = true })
+  vim.fn.delete(tmp)
 end
 
 -- 4-net. transient network retry -------------------------------------------------
@@ -776,6 +807,7 @@ do
     local ui = require("advantage.ui.chat")
     local orig_notify = ui.notify
     local warned = false
+    ---@diagnostic disable-next-line: duplicate-set-field
     ui.notify = function(msg, level)
       if level == vim.log.levels.WARN and tostring(msg):find("LLM compaction failed", 1, true) then warned = true end
       return orig_notify(msg, level)
@@ -1032,7 +1064,7 @@ do
     return done
   end, 10)
   check(turn == 2 and saw_tool_result, "sub-agent can use read-only tools in its own loop")
-  check(err == false and result:find("subagent evidence", 1, true), "sub-agent returns final report")
+  check(err == false and assert(result):find("subagent evidence", 1, true), "sub-agent returns final report")
 end
 
 -- 4b. sub-agent read-only bash validator ---------------------------------------
@@ -1122,6 +1154,7 @@ do
 
   local captured_body
   local orig_request_sse = util.request_sse
+  ---@diagnostic disable-next-line: duplicate-set-field
   util.request_sse = function(opts)
     captured_body = vim.json.decode(opts.body)
     vim.schedule(function()
@@ -1473,6 +1506,10 @@ do
 
   -- mentions must respect the sandbox: absolute / .. escapes are not inlined
   local config = require("advantage.config")
+  check(
+    config.defaults.tools.allow_outside_root == false,
+    "tools.allow_outside_root defaults to false (sandbox on by default)"
+  )
   local parent = vim.fs.dirname(tmp)
   vim.fn.writefile({ "outside-mention-secret" }, parent .. "/msecret.txt")
   local esc, efiles = attach.expand_mentions("check @../msecret.txt now", tmp)
@@ -1552,6 +1589,7 @@ do
 
   local orig_confirm = chat.confirm
   local confirm_called = false
+  ---@diagnostic disable-next-line: duplicate-set-field
   chat.confirm = function(_, cb)
     confirm_called = true
     cb("deny")
@@ -1579,6 +1617,7 @@ do
 
   -- deny with comment: feedback must reach the tool_result
   providers.register("fakedeny", file_writer(tmp .. "/deny.txt"))
+  ---@diagnostic disable-next-line: duplicate-set-field
   chat.confirm = function(_, cb)
     cb("deny", "use a different name")
   end
@@ -1645,7 +1684,7 @@ do
   check(in_index, "skill appears in the index")
   local body, desc = memory.use_skill("run-tests")
   check(
-    body and body:find("smoke.lua", 1, true) and desc:find("offline", 1, true),
+    body and body:find("smoke.lua", 1, true) and desc and desc:find("offline", 1, true),
     "use_skill loads the full body on demand"
   )
   check(memory.render():find("run-tests:", 1, true) ~= nil, "skill index (name: description) is injected")
@@ -1934,10 +1973,10 @@ do
   end
 
   local r, e = run("read_file", { path = "sub/ok.txt" })
-  check(e == false and r:find("inside-content", 1, true), "relative read inside root works")
+  check(e == false and assert(r):find("inside-content", 1, true), "relative read inside root works")
 
   r, e = run("read_file", { path = tmp .. "/sub/ok.txt" })
-  check(e == false and r:find("inside-content", 1, true), "absolute read inside root works")
+  check(e == false and assert(r):find("inside-content", 1, true), "absolute read inside root works")
 
   r, e = run("read_file", { path = "../escape.txt" })
   check(e == true and not tostring(r):find("outside-secret", 1, true), "traversal read is blocked")
@@ -1984,7 +2023,7 @@ do
   -- explicit opt-out restores external access
   config.options.tools.allow_outside_root = true
   r, e = run("read_file", { path = "../escape.txt" })
-  check(e == false and r:find("outside-secret", 1, true), "allow_outside_root opts out of containment")
+  check(e == false and assert(r):find("outside-secret", 1, true), "allow_outside_root opts out of containment")
   config.options.tools.allow_outside_root = false
 end
 
@@ -2045,7 +2084,7 @@ do
       { content = "step three", status = "pending" },
     },
   })
-  check(e == false and r:find("1/3 done", 1, true), "todo_write tracks completion")
+  check(e == false and assert(r):find("1/3 done", 1, true), "todo_write tracks completion")
   check(type(ctx.todos) == "table" and #ctx.todos == 3, "todo list stored on the agent context")
   r, e = run("todo_write", { items = {} })
   check(e == true, "todo_write rejects an empty list")
@@ -2447,7 +2486,7 @@ do
   r, e = run("multi_edit", { path = "pkg/util.go", edits = { { old_string = "return 1", new_string = "return 2" } } })
   check(e == false, "multi_edit works on go")
   r, e = run("grep", { pattern = "fn main", path = "src" })
-  check(e == false and r:find("main.rs", 1, true), "grep finds rust code")
+  check(e == false and assert(r):find("main.rs", 1, true), "grep finds rust code")
   local pv = tools.get("write_file").preview({ path = "new.rs", content = "fn x() {}" }, ctx)
   check(pv.filetype == "rust" or pv.filetype == "", "preview filetype detection handles non-lua files")
 
@@ -2565,9 +2604,9 @@ do
     local session = require("advantage.session")
     local dir = vim.fn.stdpath("data") .. "/advantage/sessions"
     vim.fn.mkdir(dir, "p", "0700")
-    local key = vim.fn.sha256((vim.uv or vim.loop).cwd()):sub(1, 12)
+    local key = vim.fn.sha256((vim.uv or vim.loop).cwd() or ""):sub(1, 12)
     local tmp = dir .. "/" .. key .. "-hardening-bogus.json.tmp"
-    local f = io.open(tmp, "w")
+    local f = assert(io.open(tmp, "w"))
     f:write('{"title":"HARDENING_BOGUS","messages":[{"role":"user","content":[]}]}')
     f:close()
     local ok_list, list = pcall(session.list)
@@ -2584,7 +2623,7 @@ do
     local tools = require("advantage.tools")
     local tmp = vim.fn.tempname()
     vim.fn.mkdir(tmp, "p")
-    local f = io.open(tmp .. "/data.bin", "wb")
+    local f = assert(io.open(tmp .. "/data.bin", "wb"))
     f:write("abc\0def\0binary content")
     f:close()
     local got
@@ -2641,6 +2680,7 @@ do
     local orig = util.request_sse
     local function capture_body(model)
       local captured
+      ---@diagnostic disable-next-line: duplicate-set-field
       util.request_sse = function(opts)
         captured = vim.json.decode(opts.body)
         return { stop = function() end }

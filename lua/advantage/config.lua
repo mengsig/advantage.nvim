@@ -297,7 +297,9 @@ function M.setup(opts)
   -- mistaken `tools = false`) to its default so it can't crash a later
   -- `config.options.tools.x` access. The mistake is still surfaced via `errs`.
   for _, key in ipairs({ "tools", "context", "ui", "providers", "memory", "subagents", "sessions", "keymaps", "usage" }) do
-    if M.options[key] ~= nil and type(M.options[key]) ~= "table" then M.options[key] = vim.deepcopy(M.defaults[key]) end
+    if M.options[key] ~= nil and type(M.options[key]) ~= "table" then
+      M.options[key] = vim.deepcopy(M.defaults[key] --[[@as table]])
+    end
   end
   -- accept the long-form alias for the paranoid-averse
   if M.options.tools.dangerously_skip_permissions then M.options.tools.yolo = true end

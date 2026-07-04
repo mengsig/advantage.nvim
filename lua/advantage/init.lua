@@ -23,7 +23,7 @@ end
 local function ensure_agent()
   ensure_init()
   if not current then
-    local model = config.resolve_model(config.options.default_model)
+    local model = assert(config.resolve_model(config.options.default_model), "unknown default_model")
     current = agent_mod.new({ model = model })
     ui.set_model_label(model.label)
   end
@@ -98,7 +98,8 @@ end
 function M.new_session()
   ensure_init()
   if current and current:busy() then current:cancel() end
-  local model = current and current.model or config.resolve_model(config.options.default_model)
+  local model = current and current.model
+    or assert(config.resolve_model(config.options.default_model), "unknown default_model")
   current = agent_mod.new({ model = model })
   ui.clear()
   ui.set_model_label(model.label)
@@ -115,7 +116,7 @@ function M.pick_model()
     end,
   }, function(choice)
     if not choice then return end
-    local model = config.resolve_model(choice.ref)
+    local model = assert(config.resolve_model(choice.ref), "unknown model")
     if current then
       if current:busy() then
         ui.notify("finish or cancel the running turn first", vim.log.levels.WARN)
@@ -133,7 +134,7 @@ end
 
 function M.resume()
   ensure_init()
-  require("advantage.session").pick(function(data)
+  require("advantage.session").pick(function(data, prefill)
     if not data then return end
     if current and current:busy() then current:cancel() end
     local model = config.resolve_model(
@@ -158,6 +159,7 @@ function M.resume()
     ui.render_transcript(data.messages, model.label)
     ui.set_usage(current.usage)
     ui.open()
+    if prefill and prefill ~= "" then ui.set_prompt(prefill) end
   end)
 end
 

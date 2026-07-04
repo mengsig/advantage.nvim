@@ -47,7 +47,7 @@ end
 M._changes = changes
 
 local function diff_stat(item)
-  local diff = vim.diff(item.before, item.after, { result_type = "unified", ctxlen = 0 }) or ""
+  local diff = vim.text.diff(item.before, item.after, { result_type = "unified", ctxlen = 0 }) --[[@as string]] or ""
   local add, del = 0, 0
   for line in diff:gmatch("[^\n]+") do
     local c = line:sub(1, 1)
@@ -65,7 +65,7 @@ local function unified_lines(items)
     lines[#lines + 1] = ("diff · %s%s"):format(name, item.deleted and " (deleted)" or item.new and " (new file)" or "")
     lines[#lines + 1] = "--- a/" .. name
     lines[#lines + 1] = "+++ b/" .. name
-    local diff = vim.diff(item.before, item.after, { result_type = "unified", ctxlen = 3 }) or ""
+    local diff = vim.text.diff(item.before, item.after, { result_type = "unified", ctxlen = 3 }) --[[@as string]] or ""
     vim.list_extend(lines, vim.split(diff, "\n", { plain = true, trimempty = true }))
   end
   return lines
@@ -111,7 +111,9 @@ local function side_by_side(item)
     end)
   end
   vim.keymap.set("n", "q", function()
-    pcall(vim.cmd, "tabclose")
+    pcall(function()
+      vim.cmd("tabclose")
+    end)
   end, { buffer = scratch, silent = true, nowait = true, desc = "advantage: close review" })
   api.nvim_set_current_win(file_win)
 end

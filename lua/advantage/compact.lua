@@ -275,6 +275,7 @@ end
 ---turns (kept verbatim), and peel off a prior carried-forward summary so repeat
 ---compaction extends it instead of nesting or re-truncating it. Returns nil if
 ---there isn't enough history to bother with.
+---@param messages table[] canonical messages
 ---@return {older: table[], recent: table[], carry: string|nil, pinned: table[]}|nil
 local function prepare_split(messages, opts)
   local keep = math.max(2, opts.keep_recent_messages or 16)
@@ -329,7 +330,7 @@ local function prepare_split(messages, opts)
     -- its original (post-summary) blocks — keep those as ordinary older content
     -- to be re-summarized instead of dropping them with the whole message.
     local first = older[1]
-    carry = first.content[1].text
+    carry = first.content[1].text --[[@as string]]
     if #first.content > 1 then
       first.content = vim.list_slice(first.content, 2)
     else
@@ -536,7 +537,7 @@ function M.summarize_with_llm(messages, opts, on_done, active_model)
   local providers = require("advantage.providers")
   local resolved = resolve_summarizer(opts, active_model)
   local provider = resolved and providers.get(resolved.provider)
-  if not provider then
+  if not provider or not resolved then
     on_done(nil, nil, "no usable summarizer model (set context.summarizer_model)")
     return nil
   end

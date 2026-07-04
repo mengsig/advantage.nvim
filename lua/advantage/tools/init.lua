@@ -92,7 +92,7 @@ local function finish_write(path, msg, cb)
 end
 
 local function unified_diff(old, new, path)
-  local diff = vim.diff(old, new, { result_type = "unified", ctxlen = 3 })
+  local diff = vim.text.diff(old, new, { result_type = "unified", ctxlen = 3 }) --[[@as string?]]
   if not diff or diff == "" then return { "(no changes)" } end
   local lines = { "--- a/" .. path, "+++ b/" .. path }
   vim.list_extend(lines, vim.split(diff, "\n", { plain = true, trimempty = true }))
@@ -471,7 +471,7 @@ tool({
       return nil
     end
 
-    timer = uv.new_timer()
+    timer = assert(uv.new_timer())
     timer:start(
       timeout,
       0,

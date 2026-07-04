@@ -9,7 +9,7 @@ end
 
 ---Sessions are scoped per project so `resume` only offers relevant ones.
 local function project_key()
-  return vim.fn.sha256((vim.uv or vim.loop).cwd()):sub(1, 12)
+  return vim.fn.sha256((vim.uv or vim.loop).cwd() or ""):sub(1, 12)
 end
 
 function M.save(agent)
@@ -58,7 +58,78 @@ function M.list()
   return out
 end
 
----@param cb fun(data: table|nil)
+local function one_line(text, max)
+  local s = tostring(text or ""):gsub("%s+", " "):gsub("^%s+", ""):gsub("%s+$", "")
+  max = max or 56
+  if #s > max then s = s:sub(1, max - 1) .. "…" end
+  return s
+end
+
+---Genuine user turns in a transcript: messages that carry a typed `text` block,
+---not the `tool_result`-only messages the agent loop injects. Each is a point the
+---conversation can be rewound to for a retry.
+---@return {index:integer, preview:string, text:string}[]
+local function checkpoints(messages)
+  local out = {}
+  for i, msg in ipairs(messages or {}) do
+    if msg.role == "user" and type(msg.content) == "table" then
+      local text
+      for _, block in ipairs(msg.content) do
+        if type(block) == "table" and block.type == "text" and block.text and block.text ~= "" then
+          text = block.text
+          break
+        end
+      end
+      if text then out[#out + 1] = { index = i, preview = one_line(text), text = text } end
+    end
+  end
+  return out
+end
+
+---A forked copy of `data` whose transcript is truncated to just before the given
+---checkpoint. `id`/`usage` are dropped so the fork saves to a NEW file — the
+---original conversation is never overwritten when you rewind and continue.
+local function rewound(data, cp)
+  local msgs = {}
+  for i = 1, cp.index - 1 do
+    msgs[i] = data.messages[i]
+  end
+  return {
+    id = nil,
+    title = data.title,
+    model = data.model,
+    messages = msgs,
+    usage = nil,
+    cwd = data.cwd,
+  }
+end
+
+---Second-stage picker: resume `data` at its latest point, or rewind to an earlier
+---user turn to retry from there (as a fork).
+---@param cb fun(data: table|nil, prefill?: string)
+function M.pick_checkpoint(data, cb)
+  local cps = checkpoints(data.messages)
+  -- With one turn or fewer there is nothing meaningful to rewind past.
+  if #cps <= 1 then return cb(data) end
+
+  local items = { { kind = "recent" } }
+  for i = #cps, 1, -1 do
+    items[#items + 1] = { kind = "rewind", cp = cps[i], n = i }
+  end
+  vim.ui.select(items, {
+    prompt = "resume — pick a point (rewind forks a copy)",
+    format_item = function(item)
+      if item.kind == "recent" then return ("▸ most recent  ·  %d messages"):format(#(data.messages or {})) end
+      return ("↶ retry from #%d  ·  %s"):format(item.n, item.cp.preview)
+    end,
+  }, function(item)
+    if not item then return cb(nil) end
+    if item.kind == "recent" then return cb(data) end
+    cb(rewound(data, item.cp), item.cp.text)
+  end)
+end
+
+---@param cb fun(data: table|nil, prefill?: string)
 function M.pick(cb)
   local sessions = M.list()
   if #sessions == 0 then
@@ -75,7 +146,8 @@ function M.pick(cb)
       return ("%s  ·  %s"):format(item.title or "(untitled)", when)
     end,
   }, function(choice)
-    cb(choice)
+    if not choice then return cb(nil) end
+    M.pick_checkpoint(choice, cb)
   end)
 end
 

@@ -77,6 +77,15 @@ end
 
 ---A loaded buffer for `path`, loading it (unlisted) so an LSP can attach. Only
 ---for existing files; returns nil otherwise.
+---
+---`bufload` reads the file into the buffer *before* firing BufReadPost/FileType
+---autocmds, so an unrelated autocmd throwing (most commonly another LSP client
+---racing to attach while a sibling buffer of the same filetype is mid-startup —
+---observed loading several fresh Zig buffers back to back) makes the pcall
+---report failure even though the buffer's text loaded fine. Trust
+---nvim_buf_is_loaded over the pcall result so that transient autocmd noise
+---doesn't permanently fail "could not open" a file that's actually sitting
+---in a valid buffer.
 local function ensure_bufnr(path)
   local b = loaded_bufnr(path)
   if b then return b end
@@ -86,7 +95,7 @@ local function ensure_bufnr(path)
   pcall(function()
     vim.bo[bufnr].buflisted = false
   end)
-  if not pcall(vim.fn.bufload, bufnr) then return nil end
+  if not pcall(vim.fn.bufload, bufnr) and not vim.api.nvim_buf_is_loaded(bufnr) then return nil end
   return bufnr
 end
 
@@ -175,7 +184,8 @@ end
 local function server_available_for_ft(ft)
   if not ft or ft == "" then return false end
   for _, cl in ipairs(vim.lsp.get_clients({})) do
-    if fts_include(cl.config and cl.config.filetypes, ft) then return true end
+    local conf = cl.config --[[@as table?]]
+    if fts_include(conf and conf.filetypes, ft) then return true end
   end
   -- Enabled-but-not-running configs (vim.lsp.enable, Neovim 0.11+).
   local enabled = vim.lsp._enabled_configs
@@ -254,7 +264,7 @@ local function wait_for_diagnostics(bufnr, wait_ms, done)
     done()
   end
   local function bump()
-    if not debounce then debounce = uv.new_timer() end
+    if not debounce then debounce = assert(uv.new_timer()) end
     debounce:stop()
     debounce:start(250, 0, vim.schedule_wrap(finalize))
   end
@@ -262,7 +272,7 @@ local function wait_for_diagnostics(bufnr, wait_ms, done)
     buffer = bufnr,
     callback = bump,
   })
-  hard = uv.new_timer()
+  hard = assert(uv.new_timer())
   hard:start(math.max(200, wait_ms), 0, vim.schedule_wrap(finalize))
 end
 
@@ -277,7 +287,7 @@ local function await_ready(bufnr, c, done)
   end
   if has_clients() then return wait_for_diagnostics(bufnr, wait_ms, done) end
   local elapsed, iv = 0, 50
-  local t = uv.new_timer()
+  local t = assert(uv.new_timer())
   t:start(
     iv,
     iv,

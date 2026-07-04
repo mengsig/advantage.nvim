@@ -112,7 +112,7 @@ end
 
 ---POST `body` to `url` and stream SSE events back.
 ---Uses a curl config file so the API key never appears in the process list.
----@param opts {url:string, headers:string[], body:string, on_event:fun(name:string,data:any), on_error:fun(msg:string, status?:integer), on_done:fun(), on_retry?:fun(attempt:integer, reason:any)}
+---@param opts {url:string, headers:string[], body:string, on_event:fun(name:string,data:any), on_error:fun(msg:string, status?:integer), on_done:fun(), on_retry?:fun(attempt:integer, reason:any), idle_timeout?:integer, max_attempts?:integer}
 ---@return {stop: fun()}
 function M.request_sse(opts)
   local tmp = vim.fn.tempname()
