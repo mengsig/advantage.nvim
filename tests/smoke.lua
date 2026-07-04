@@ -463,6 +463,7 @@ do
   local tmp = vim.fn.tempname() .. ".lua"
   vim.fn.writefile({ "return 1" }, tmp)
   local real_bufload = vim.fn.bufload
+  ---@diagnostic disable-next-line: duplicate-set-field
   vim.fn.bufload = function(...)
     real_bufload(...) -- content is read into the buffer first, exactly like real bufload
     error("simulated autocmd failure during load")
@@ -481,6 +482,123 @@ do
   )
   pcall(vim.api.nvim_buf_delete, vim.fn.bufnr(tmp), { force = true })
   vim.fn.delete(tmp)
+end
+
+-- 4-search. web_search tool ---------------------------------------------------
+
+section("web_search")
+do
+  local tools = require("advantage.tools")
+  local config = require("advantage.config")
+  config.options.tools.web_search = vim.deepcopy(config.defaults.tools.web_search)
+  local wcfg = config.options.tools.web_search
+  local old_env = vim.env.BRAVE_API_KEY
+  vim.env.BRAVE_API_KEY = nil
+
+  local function has_web_search()
+    for _, s in ipairs(tools.schemas()) do
+      if s.name == "web_search" then return true end
+    end
+    return false
+  end
+
+  check(not has_web_search(), "web_search is hidden from the schema without an API key")
+  wcfg.api_key = "test-key"
+  check(has_web_search(), "web_search appears once an API key is configured")
+
+  local function fake_curl(dir, script_lines)
+    vim.fn.mkdir(dir, "p")
+    vim.fn.writefile(script_lines, dir .. "/curl")
+    vim.fn.system({ "chmod", "+x", dir .. "/curl" })
+  end
+
+  local function run_with_path(dir, fn)
+    local old_path = vim.env.PATH
+    vim.env.PATH = dir .. ":" .. old_path
+    local out, is_err, done = nil, nil, false
+    fn(function(o, e)
+      out, is_err, done = o, e, true
+    end)
+    vim.wait(2000, function()
+      return done
+    end)
+    vim.env.PATH = old_path
+    return out, is_err
+  end
+
+  local ctx = { cwd = vim.fn.getcwd() }
+  local run = tools.get("web_search").run
+
+  -- empty query short-circuits before any curl invocation
+  local out0, err0 = run_with_path(vim.fn.tempname(), function(cb)
+    run({ query = "" }, ctx, cb)
+  end)
+  check(
+    err0 == true and assert(out0):find("Empty query", 1, true) ~= nil,
+    "empty query is rejected without shelling out"
+  )
+
+  -- happy path: canned Brave-style JSON, HTML/entities stripped, capped at count
+  local dir1 = vim.fn.tempname()
+  local body = vim.json.encode({
+    web = {
+      results = {
+        {
+          title = "Neovim <strong>0.11</strong> released",
+          url = "https://neovim.io/a",
+          description = "Big &amp; small changes.",
+        },
+        { title = "Second result", url = "https://example.com/b", description = "Another snippet." },
+        { title = "Third result", url = "https://example.com/c", description = "Should be cut off by count." },
+      },
+    },
+  })
+  fake_curl(dir1, { "#!/usr/bin/env bash", "cat <<'JSON'", body, "JSON", "exit 0" })
+  local out1, err1 = run_with_path(dir1, function(cb)
+    run({ query = "neovim release notes", count = 2 }, ctx, cb)
+  end)
+  check(err1 == nil or err1 == false, "happy-path web_search reports success")
+  local out1s = assert(out1)
+  check(out1s:find("Neovim 0.11 released", 1, true) ~= nil, "HTML tags stripped from the title")
+  check(out1s:find("Big & small changes", 1, true) ~= nil, "HTML entities decoded in the description")
+  check(out1s:find("https://neovim.io/a", 1, true) ~= nil, "result URL is included")
+  check(out1s:find("Third result", 1, true) == nil, "results capped at the requested count")
+
+  -- curl failure surfaces as a tool error
+  local dir2 = vim.fn.tempname()
+  fake_curl(dir2, { "#!/usr/bin/env bash", "echo 'curl: (6) Could not resolve host' >&2", "exit 6" })
+  local out2, err2 = run_with_path(dir2, function(cb)
+    run({ query = "anything" }, ctx, cb)
+  end)
+  check(
+    err2 == true and assert(out2):find("Could not resolve host", 1, true) ~= nil,
+    "curl failure is reported as an error"
+  )
+
+  -- malformed JSON is reported rather than crashing
+  local dir3 = vim.fn.tempname()
+  fake_curl(dir3, { "#!/usr/bin/env bash", "echo 'not json'", "exit 0" })
+  local out3, err3 = run_with_path(dir3, function(cb)
+    run({ query = "anything" }, ctx, cb)
+  end)
+  check(
+    err3 == true and assert(out3):find("could not parse", 1, true) ~= nil,
+    "unparseable response is reported, not crashed"
+  )
+
+  -- read-only sub-agents automatically inherit it once enabled (it's `safe`)
+  local subagent = require("advantage.subagent")
+  local sub_tools = subagent._readonly_tools and subagent._readonly_tools() or nil
+  if sub_tools then
+    local sub_has = false
+    for _, s in ipairs(sub_tools) do
+      if s.name == "web_search" then sub_has = true end
+    end
+    check(sub_has, "web_search is available to read-only sub-agents")
+  end
+
+  vim.env.BRAVE_API_KEY = old_env
+  config.options.tools.web_search = vim.deepcopy(config.defaults.tools.web_search)
 end
 
 -- 4-net. transient network retry -------------------------------------------------
@@ -2378,6 +2496,14 @@ do
   check(proc.status == "procedural", "numbered runbook is rejected as procedural")
   local long = memory.remember("This fact " .. string.rep("keeps going and going ", 20), "Notes")
   check(long.status == "procedural", "oversized bullet is rejected")
+
+  -- a data/conversion fact can contain several unrelated "<number>. " matches
+  -- without being a step-by-step procedure — only 3 CONSECUTIVE ascending
+  -- numbers (a real runbook's 1., 2., 3., ...) should trip the heuristic.
+  local scale =
+    memory.remember("Scene scale convention: Earth radius 6371. Moon radius 1737. Sun radius 696000.", "Conventions")
+  check(scale.status == "added", "a data fact with unrelated numbered-looking clauses is not mistaken for a procedure")
+  memory.forget("Scene scale convention") -- keep it out of the eviction test's byte budget below
   local out_msg, out_err
   tools
     .get("remember")

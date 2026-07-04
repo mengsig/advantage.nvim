@@ -145,7 +145,7 @@ them (not merged element-wise with the defaults).
 7. TOOLS & SECURITY                                          *advantage-tools*
 
 Tools: `read_file`, `edit_file`, `write_file`, `multi_edit`, `bash`, `grep`,
-`find_files`, `list_dir`, `diagnostics`, `sub_agent`, plus memory tools.
+`find_files`, `list_dir`, `diagnostics`, `sub_agent`, `web_search`, plus memory tools.
 
 File tools are confined to the project root: absolute paths, `..` traversal,
 and symlinks that resolve outside the repo are rejected (set
@@ -161,6 +161,12 @@ notice — persisted as a line in the chat transcript (plus a WARN toast) so you
 won't miss it if you stepped away. Configure via `tools.diagnostics` (`enabled`, `auto`, `severity`, `max`,
 `wait_ms`, `attach_grace_ms`, `notify_missing`); the model also has an explicit
 `diagnostics` tool.
+
+`web_search` hits the Brave Search API (one GET request, no page-scraping) and
+returns compact title/url/snippet results. It needs an API key — `$BRAVE_API_KEY`
+or `tools.web_search.api_key` — and is entirely hidden from the schema without
+one, so the model never calls a search tool that can't work. It's `safe` (no
+approval prompt) and available to read-only sub-agents.
 
 ==============================================================================
 8. MEMORY & SKILLS                                          *advantage-memory*

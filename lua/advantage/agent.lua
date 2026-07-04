@@ -40,6 +40,7 @@ local function default_system_prompt()
     "- After a code change, verify it when a cheap check exists (build, test, lint, syntax check), and fix what you broke.",
     "- For multi-step work, keep a plan with the todo_write tool and update statuses as you go; several changes to one file go in a single multi_edit call.",
     "- Stay within the project: file tools are confined to the project root. Ask before anything destructive or irreversible.",
+    "- If a tool call errors, don't just move past it: read the error, fix the input (or the fact/skill being saved) and retry before ending your turn — a failed `remember`/`save_skill` silently loses the fact otherwise.",
     "",
     "Style: default to concise, to-the-point user-facing output unless the user asks for detail. Lead with what you did or found; skip filler, hidden reasoning, and restating the request. If a task is ambiguous, state your assumption and proceed rather than stalling.",
   })

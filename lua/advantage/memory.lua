@@ -272,12 +272,20 @@ end
 
 ---Facts that are really procedures belong in skills (index-only cost), not in
 ---the always-loaded memory. Detect numbered runbooks and oversized bullets.
+---A genuine runbook numbers its steps consecutively (1., 2., 3., ...); a
+---data/conversion fact can easily contain 3+ unrelated "<number>. " matches
+---(e.g. "Earth 6371. Moon 1737. Sun 696.") without being a procedure at all —
+---require 3 CONSECUTIVE ascending integers, in order, to tell the two apart.
 local function looks_procedural(fact)
-  local steps = 0
-  for _ in fact:gmatch("%f[%d]%d+%.%s") do
-    steps = steps + 1
+  if #fact > 350 then return true end
+  local nums = {}
+  for n in fact:gmatch("%f[%d](%d+)%.%s") do
+    nums[#nums + 1] = tonumber(n)
   end
-  return steps >= 3 or #fact > 350
+  for i = 1, #nums - 2 do
+    if nums[i + 1] == nums[i] + 1 and nums[i + 2] == nums[i] + 2 then return true end
+  end
+  return false
 end
 
 --------------------------------------------------------------------------------

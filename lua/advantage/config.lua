@@ -92,6 +92,22 @@ M.defaults = {
       ---won't miss it if you stepped away) plus a WARN toast. Set false to silence.
       notify_missing = true,
     },
+
+    ---Web search via the Brave Search API (https://api.search.brave.com) — a
+    ---single lightweight GET request, no page-scraping/fetch step. Needs an API
+    ---key (Brave's free tier covers casual use); the tool is hidden entirely
+    ---from the schema until one is configured, so a model never wastes a turn
+    ---calling a search tool that can't work.
+    web_search = {
+      enabled = true,
+      ---Env var read for the key. Set `api_key` directly instead if you'd rather
+      ---not use an env var.
+      api_key_env = "BRAVE_API_KEY",
+      api_key = nil,
+      base_url = "https://api.search.brave.com/res/v1/web/search",
+      max_results = 5, -- default result count (hard cap: 10)
+      timeout_ms = 15000,
+    },
   },
 
   context = {

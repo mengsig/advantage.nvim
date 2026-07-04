@@ -10,9 +10,9 @@ your editor, feeds results back, and repeats until the task is done.
   OpenAI GPT/Codex (gpt-5.5 and gpt-5.1-codex family) out of the box; the
   provider interface is ~100 lines if you want to add more.
 - **Editor-native tools.** `read_file`, `edit_file`, `write_file`, `bash`, `grep`,
-  `find_files`, `list_dir`, `diagnostics`, `sub_agent` — executed inside Neovim, so
-  edited buffers reload live, edits get an **LSP/linter feedback loop**, and every
-  mutation is gated behind a permission card with a real diff.
+  `find_files`, `list_dir`, `diagnostics`, `sub_agent`, `web_search` — executed
+  inside Neovim, so edited buffers reload live, edits get an **LSP/linter feedback
+  loop**, and every mutation is gated behind a permission card with a real diff.
 - **A UI that respects your colorscheme.** No hardcoded palette: the accent,
   washes and dim tones are derived from *your* theme at runtime. Quiet lowercase
   headers, animated tool cards, dimmed streaming reasoning, token/cost meta per
@@ -208,6 +208,16 @@ substitution and mutating flags are rejected. It is off by default because bash
 isn't path-contained (a sub-agent could read anything your user can, with no
 permission prompt), so enable it only in repos you trust.
 
+**Web search.** A `web_search` tool backed by the [Brave Search
+API](https://api.search.brave.com) — one lightweight GET request, no
+page-scraping step, results returned as compact `title — url` + snippet lines
+(HTML stripped, capped at `max_results`, hard ceiling 10). Needs an API key
+(Brave's free tier covers casual use): set `$BRAVE_API_KEY` or
+`tools.web_search.api_key`. **Without a key the tool is hidden from the schema
+entirely** — the model never wastes a turn calling a search tool that can't
+work. It's `safe` (no permission prompt, like `grep`/`read_file`) and
+automatically available to read-only sub-agents.
+
 **Repo memory & skills (self-learning harness).** advantage keeps a lightweight,
 per-repo memory so the agent gets *better and cheaper* at your codebase over time.
 
@@ -336,6 +346,14 @@ require("advantage").setup({
       wait_ms = 1500,            -- ceiling waiting for the LSP to re-analyze
       attach_grace_ms = 250,     -- wait for a server to attach before giving up
       notify_missing = true,     -- once-per-filetype "install an LSP" nudge to you
+    },
+    web_search = {               -- Brave Search API; hidden from the schema with no key
+      enabled = true,
+      api_key_env = "BRAVE_API_KEY", -- or set api_key directly below
+      api_key = nil,
+      base_url = "https://api.search.brave.com/res/v1/web/search",
+      max_results = 5,            -- default result count (hard cap: 10)
+      timeout_ms = 15000,
     },
   },
   context = {

@@ -185,6 +185,7 @@ local function readonly_tools()
   end
   return out
 end
+M._readonly_tools = readonly_tools
 
 local function text_from_blocks(blocks)
   local out = {}
