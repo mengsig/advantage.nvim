@@ -10,9 +10,9 @@ your editor, feeds results back, and repeats until the task is done.
   OpenAI GPT/Codex (gpt-5.5 and gpt-5.1-codex family) out of the box; the
   provider interface is ~100 lines if you want to add more.
 - **Editor-native tools.** `read_file`, `edit_file`, `write_file`, `bash`, `grep`,
-  `find_files`, `list_dir`, `sub_agent` — executed inside Neovim, so edited
-  buffers reload live and every mutation is gated behind a permission card with
-  a real diff.
+  `find_files`, `list_dir`, `diagnostics`, `sub_agent` — executed inside Neovim, so
+  edited buffers reload live, edits get an **LSP/linter feedback loop**, and every
+  mutation is gated behind a permission card with a real diff.
 - **A UI that respects your colorscheme.** No hardcoded palette: the accent,
   washes and dim tones are derived from *your* theme at runtime. Quiet lowercase
   headers, animated tool cards, dimmed streaming reasoning, token/cost meta per
@@ -182,6 +182,21 @@ runs in one of two modes:
   call and use the free heuristic instead for a single invocation, or set
   `context.compact_mode = "heuristic"` to make that the default everywhere.
 
+**Diagnostics feedback loop.** After the agent edits a file, the **newly-introduced**
+LSP/linter diagnostics are appended straight to that tool's result, so the model
+sees compile/type/lint errors and self-corrects instead of guessing a build
+command. It's context-disciplined by design: only errors are shown by default
+(`tools.diagnostics.severity`), capped at `max` lines, **diffed against the
+pre-edit state** so pre-existing noise is never re-reported, and a clean edit adds
+**nothing**. A no-LSP repo pays **zero** per-edit overhead — when a touched file
+has no server for its filetype the plugin skips the work entirely and instead
+**deterministically tells you** (once per filetype) to install a language server
+— as a **persistent** line in the chat transcript (plus a WARN toast), so you
+won't miss it if you stepped away — rather than routing that through the model. The model also gets an explicit
+`diagnostics` tool to check any file or your open files on demand. Turn it off
+with `tools = { diagnostics = { enabled = false } }` (or just the auto-attach with
+`auto = false`).
+
 **Sub-agents.** The model has a `sub_agent` tool for read-only fan-out: a worker
 gets its own short loop and can use read/search/list tools, then returns a
 concise report to the parent agent. It cannot edit files. When the model fires
@@ -302,6 +317,15 @@ require("advantage").setup({
     yolo = false,                -- skip ALL permission prompts (/yolo toggles)
     bash_timeout_ms = 120000,
     stream_bash_output = false,  -- or per-call: bash { stream = true }
+    diagnostics = {              -- editor-native LSP/linter feedback loop
+      enabled = true,            -- false hides the diagnostics tool + auto-attach
+      auto = true,               -- append new diagnostics to edit results
+      severity = "error",        -- auto-attach floor: "error" | "warn"
+      max = 10,                  -- cap on diagnostic lines appended per edit
+      wait_ms = 1500,            -- ceiling waiting for the LSP to re-analyze
+      attach_grace_ms = 250,     -- wait for a server to attach before giving up
+      notify_missing = true,     -- once-per-filetype "install an LSP" nudge to you
+    },
   },
   context = {
     auto_compact = true,

@@ -172,7 +172,7 @@ M._reject_bash = reject_bash
 local function readonly_tools()
   local out = {}
   for _, def in ipairs(tools.list) do
-    if def.safe and def.name ~= "sub_agent" and not def.memory and not def.parent_only then
+    if def.safe and def.name ~= "sub_agent" and not def.memory and not def.parent_only and tools.enabled(def) then
       out[#out + 1] = {
         name = def.name,
         description = def.description,

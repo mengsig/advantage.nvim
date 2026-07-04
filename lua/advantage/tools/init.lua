@@ -73,6 +73,24 @@ local function refresh_buffers(path)
   end)
 end
 
+---Finish a successful mutating edit: reload any open buffer, then (best-effort)
+---append the newly-introduced LSP/linter diagnostics to the tool result so the
+---model can self-correct. Snapshotting the pre-edit diagnostics happens before
+---the buffer reloads, so the after/before diff only surfaces problems the edit
+---actually introduced. Degrades to a plain success when diagnostics are off or
+---unavailable.
+local function finish_write(path, msg, cb)
+  local ok, diagnostics = pcall(require, "advantage.diagnostics")
+  local dcfg = (require("advantage.config").options.tools or {}).diagnostics
+  local severity = (type(dcfg) == "table" and dcfg.severity) or "error"
+  local before = ok and diagnostics.snapshot(path, severity) or nil
+  refresh_buffers(path)
+  if not ok then return cb(msg, false) end
+  diagnostics.after_edit(path, before, function(extra)
+    cb(msg .. (extra or ""), false)
+  end)
+end
+
 local function unified_diff(old, new, path)
   local diff = vim.diff(old, new, { result_type = "unified", ctxlen = 3 })
   if not diff or diff == "" then return { "(no changes)" } end
@@ -204,9 +222,8 @@ tool({
     if not path then return cb(("Cannot write %s: %s"):format(tostring(input.path), perr), true) end
     local ok, err = write_all(path, input.content)
     if not ok then return cb("Write failed: " .. tostring(err), true) end
-    refresh_buffers(path)
     local n = #vim.split(input.content, "\n", { plain = true })
-    cb(("Wrote %d lines to %s"):format(n, input.path), false)
+    finish_write(path, ("Wrote %d lines to %s"):format(n, input.path), cb)
   end,
 })
 
@@ -268,8 +285,7 @@ tool({
     local new_content, count = replace_plain(content, input.old_string, input.new_string, input.replace_all)
     local ok, err = write_all(path, new_content)
     if not ok then return cb("Write failed: " .. tostring(err), true) end
-    refresh_buffers(path)
-    cb(("Applied %d replacement%s in %s"):format(count, count == 1 and "" or "s", input.path), false)
+    finish_write(path, ("Applied %d replacement%s in %s"):format(count, count == 1 and "" or "s", input.path), cb)
   end,
 })
 
@@ -354,8 +370,7 @@ tool({
     end
     local ok, err = write_all(path, new_content)
     if not ok then return cb("Write failed: " .. tostring(err), true) end
-    refresh_buffers(path)
-    cb(("Applied %d edit%s to %s"):format(#edits, #edits == 1 and "" or "s", input.path), false)
+    finish_write(path, ("Applied %d edit%s to %s"):format(#edits, #edits == 1 and "" or "s", input.path), cb)
   end,
 })
 
@@ -606,6 +621,43 @@ tool({
     table.sort(files)
     vim.list_extend(dirs, files)
     cb(#dirs == 0 and "(empty)" or table.concat(dirs, "\n"), false)
+  end,
+})
+
+-- diagnostics -----------------------------------------------------------
+
+tool({
+  name = "diagnostics",
+  safe = true,
+  feature = "diagnostics",
+  description = "Report LSP/linter diagnostics (compile/type/lint errors and warnings) for a file, or across your open files. Returns compact line:col messages. Use it to verify an edit didn't introduce errors — after a mutating edit the newly-introduced errors are already appended to that tool's result automatically.",
+  input_schema = {
+    type = "object",
+    properties = {
+      path = { type = "string", description = "File to check (default: all currently open files)" },
+      severity = {
+        type = "string",
+        description = "Minimum severity to report (default warn)",
+        enum = { "error", "warn", "all" },
+      },
+    },
+  },
+  summary = function(input)
+    return input.path or "open files"
+  end,
+  run = function(input, ctx, cb)
+    local diagnostics = require("advantage.diagnostics")
+    local severity = input.severity or "warn"
+    if input.path and input.path ~= "" then
+      local path, perr = resolve(input.path, ctx)
+      if not path then return cb(("Cannot check %s: %s"):format(tostring(input.path), perr), true) end
+      return diagnostics.report(path, severity, function(text)
+        cb(text, false)
+      end)
+    end
+    diagnostics.report(nil, severity, function(text)
+      cb(text, false)
+    end)
   end,
 })
 
@@ -862,13 +914,26 @@ end
 ---Resolve a tool path argument against the project root (for snapshots etc).
 M.resolve = resolve
 
+---Whether a tool that is gated on a config-toggled feature is currently enabled.
+---`memory` tools follow config.memory.enabled; `feature = "diagnostics"` tools
+---follow config.tools.diagnostics.enabled. Ungated tools are always enabled.
+function M.enabled(def)
+  if def.memory then
+    local m = require("advantage.config").options.memory
+    return not m or m.enabled ~= false
+  end
+  if def.feature == "diagnostics" then
+    local t = (require("advantage.config").options.tools or {}).diagnostics
+    return not (type(t) == "table" and t.enabled == false)
+  end
+  return true
+end
+
 ---Tool schemas in Anthropic format (providers convert as needed).
 function M.schemas()
-  local memory_on = require("advantage.config").options.memory
-  memory_on = not memory_on or memory_on.enabled ~= false
   local out = {}
   for _, def in ipairs(M.list) do
-    if not (def.memory and not memory_on) then
+    if M.enabled(def) then
       out[#out + 1] = {
         name = def.name,
         description = def.description,

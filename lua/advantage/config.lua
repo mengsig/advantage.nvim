@@ -70,6 +70,28 @@ M.defaults = {
     ---If true, bash stdout/stderr is streamed into the transcript as it arrives.
     ---Individual calls may also pass `{ stream = true }`.
     stream_bash_output = false,
+
+    ---Editor-native diagnostic feedback loop. After the agent edits a file the
+    ---NEWLY-introduced LSP/linter diagnostics are appended to that tool's result
+    ---so the model can self-correct — bounded hard so it never bloats context:
+    ---only `severity`+ is shown, capped at `max` lines, diffed against the
+    ---pre-edit state (pre-existing problems aren't re-reported), and a clean edit
+    ---adds nothing. The model also gets an explicit `diagnostics` tool.
+    diagnostics = {
+      enabled = true, -- false hides the diagnostics tool and disables auto-attach
+      auto = true, -- append new diagnostics to edit results
+      ---Severity floor for the auto-attach: "error" (default, least noise) or
+      ---"warn" (errors + warnings). The explicit tool defaults to "warn".
+      severity = "error",
+      max = 10, -- cap on diagnostic lines appended per edit
+      wait_ms = 1500, -- ceiling on how long to wait for the LSP to re-analyze
+      attach_grace_ms = 250, -- how long to wait for a server to attach before giving up
+      ---Deterministically notify YOU (once per filetype) when a file the agent
+      ---edits has no language server attached — a nudge to install one so the
+      ---feedback loop works. Persisted as a line in the chat transcript (so you
+      ---won't miss it if you stepped away) plus a WARN toast. Set false to silence.
+      notify_missing = true,
+    },
   },
 
   context = {
@@ -245,6 +267,12 @@ local function validate(o)
   end
   if o.max_agent_turns ~= nil and (type(o.max_agent_turns) ~= "number" or o.max_agent_turns < 0) then
     errs[#errs + 1] = "max_agent_turns must be a non-negative number"
+  end
+  if type(o.tools) == "table" and type(o.tools.diagnostics) == "table" then
+    local sev = o.tools.diagnostics.severity
+    if sev ~= nil and sev ~= "error" and sev ~= "warn" and sev ~= "all" then
+      errs[#errs + 1] = "tools.diagnostics.severity must be 'error', 'warn', or 'all'"
+    end
   end
   return errs
 end

@@ -368,6 +368,90 @@ do
   check(is_err == true and result:find("cancelled", 1, true), "bash cancellation stops the command")
 end
 
+-- 4-diag. diagnostics feedback loop ----------------------------------------------
+
+section("diagnostics")
+do
+  local diagnostics = require("advantage.diagnostics")
+  local tools = require("advantage.tools")
+  local config = require("advantage.config")
+  config.options.tools.diagnostics = vim.deepcopy(config.defaults.tools.diagnostics)
+  local ns = vim.api.nvim_create_namespace("advantage.test.diag")
+
+  -- a scratch buffer with an injected error + warning (no LSP needed)
+  local buf = vim.api.nvim_create_buf(false, true)
+  vim.api.nvim_buf_set_lines(buf, 0, -1, false, { "local x", "print(y)", "return z" })
+  vim.diagnostic.set(ns, buf, {
+    { lnum = 1, col = 6, message = "undefined global 'y'", severity = vim.diagnostic.severity.ERROR, source = "luals" },
+    { lnum = 0, col = 0, message = "unused local 'x'", severity = vim.diagnostic.severity.WARN, source = "luals" },
+  })
+
+  local err_only = diagnostics.render(buf, { severity = "error", max = 10 })
+  check(
+    err_only and err_only:find("undefined global") and not err_only:find("unused local"),
+    "render at severity=error shows only errors"
+  )
+  check(err_only:find("L2:7", 1, true) ~= nil, "render reports 1-based line:col with [source]")
+
+  local with_warn = diagnostics.render(buf, { severity = "warn", max = 10 })
+  check(
+    with_warn:find("undefined global") and with_warn:find("unused local"),
+    "render at severity=warn includes warnings"
+  )
+
+  -- before/after diff: a pre-existing signature is not re-reported as new
+  local before = diagnostics.signatures(buf, "error")
+  vim.diagnostic.set(ns, buf, {
+    { lnum = 1, col = 6, message = "undefined global 'y'", severity = vim.diagnostic.severity.ERROR },
+    { lnum = 2, col = 7, message = "undefined global 'z'", severity = vim.diagnostic.severity.ERROR },
+  })
+  local new_only = diagnostics.render(buf, { severity = "error", before = before })
+  check(
+    new_only and new_only:find("'z'", 1, true) and not new_only:find("'y'", 1, true),
+    "render with before= surfaces only newly-introduced diagnostics"
+  )
+
+  -- a clean buffer (no diagnostics at/above the floor) renders nothing
+  vim.diagnostic.reset(ns, buf)
+  check(diagnostics.render(buf, { severity = "error" }) == nil, "a clean edit renders no diagnostic block")
+
+  -- the cap bounds context: 30 errors, max 3 → 3 lines + a "+N more" note
+  local many = {}
+  for i = 1, 30 do
+    many[i] = { lnum = i, col = 0, message = "err " .. i, severity = vim.diagnostic.severity.ERROR }
+  end
+  vim.diagnostic.set(ns, buf, many)
+  local capped = diagnostics.render(buf, { severity = "error", max = 3 })
+  local _, count = capped:gsub("\n", "\n")
+  check(capped:find("+27 more", 1, true) ~= nil and count == 3, "render caps at max lines with a +N more note")
+  vim.diagnostic.reset(ns, buf)
+
+  -- the explicit tool is registered and gated on config
+  check(tools.get("diagnostics") ~= nil, "diagnostics tool is registered")
+  local has_diag = false
+  for _, s in ipairs(tools.schemas()) do
+    if s.name == "diagnostics" then has_diag = true end
+  end
+  check(has_diag, "diagnostics tool appears in the schema when enabled")
+  config.options.tools.diagnostics.enabled = false
+  local still = false
+  for _, s in ipairs(tools.schemas()) do
+    if s.name == "diagnostics" then still = true end
+  end
+  check(not still, "diagnostics tool is hidden when tools.diagnostics.enabled = false")
+  config.options.tools.diagnostics.enabled = true
+
+  -- auto-attach short-circuits synchronously when nothing can produce diagnostics
+  -- (no open buffer, no running server for the filetype) — no per-edit overhead.
+  local synced = false
+  diagnostics.after_edit("/nonexistent/path/thing.unknownft", nil, function(extra)
+    synced = (extra == nil)
+  end)
+  check(synced, "after_edit returns synchronously (nil) when no diagnostic provider exists")
+
+  vim.api.nvim_buf_delete(buf, { force = true })
+end
+
 -- 4-net. transient network retry -------------------------------------------------
 
 section("request_sse retry")

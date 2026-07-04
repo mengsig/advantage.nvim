@@ -145,13 +145,22 @@ them (not merged element-wise with the defaults).
 7. TOOLS & SECURITY                                          *advantage-tools*
 
 Tools: `read_file`, `edit_file`, `write_file`, `multi_edit`, `bash`, `grep`,
-`find_files`, `list_dir`, `sub_agent`, plus memory tools.
+`find_files`, `list_dir`, `diagnostics`, `sub_agent`, plus memory tools.
 
 File tools are confined to the project root: absolute paths, `..` traversal,
 and symlinks that resolve outside the repo are rejected (set
 `tools.allow_outside_root = true` to opt out). Mutating tools (`edit_file`,
 `write_file`, `multi_edit`, `bash`) require an approval card unless auto-approved
 or `yolo` is on. Sub-agents are read-only.
+
+After a mutating edit the newly-introduced LSP/linter diagnostics are appended to
+that tool's result (errors only by default, capped, diffed against the pre-edit
+state, silent on a clean edit) so the model self-corrects. A no-LSP repo pays no
+per-edit cost and instead gets a once-per-filetype "install a language server"
+notice — persisted as a line in the chat transcript (plus a WARN toast) so you
+won't miss it if you stepped away. Configure via `tools.diagnostics` (`enabled`, `auto`, `severity`, `max`,
+`wait_ms`, `attach_grace_ms`, `notify_missing`); the model also has an explicit
+`diagnostics` tool.
 
 ==============================================================================
 8. MEMORY & SKILLS                                          *advantage-memory*
