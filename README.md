@@ -54,6 +54,7 @@ Added the flag and threaded it through the formatter…
     { "<leader>cr", function() require("advantage").resume() end, desc = "advantage: resume" },
     { "<leader>cf", function() require("advantage").add_file() end, desc = "advantage: add current file" },
     { "<leader>cp", function() require("advantage").pick_files() end, desc = "advantage: pick file" },
+    { "<leader>cP", function() require("advantage").context("preview") end, desc = "advantage: preview context packet" },
     { "<leader>cl", function() require("advantage").add_location() end, desc = "advantage: add cursor location" },
     { "<leader>cs", function() require("advantage").add_selection() end, mode = "x", desc = "advantage: add selection" },
     { "<leader>cu", function() require("advantage").usage() end, desc = "advantage: usage" },
@@ -154,10 +155,11 @@ it crosses `context.compact_at_tokens` (roughly chars/4). The newest messages st
 verbatim; older user asks, assistant text, tool calls and results become one
 summary message. Compaction runs in one of two modes:
 
-- **Silent auto-compact** (a background threshold crossing mid-turn) always uses
+- **Silent auto-compact** (a background threshold crossing mid-turn) defaults to
   a free, offline heuristic — a one-line-per-message truncation. No extra model
   call, so a turn you didn't ask to pay for never gets a surprise network
-  round-trip added to it.
+  round-trip added to it. Set `context.auto_compact_mode = "llm"` to opt into the
+  same LLM summarizer for automatic compaction.
 - **Manual compaction** (`/compact` or `:Advantage compact`) defaults to
   spending one call on a fast/cheap summarizer model so a real model writes a
   dense, structured summary — primary intent, files touched, decisions, pending
@@ -233,6 +235,14 @@ teaches the agent the repo in one pass; `/context curate` compresses it;
 vanished; `/context forget <text>` drops matching facts. Turn it off with
 `memory = { enabled = false }`.
 
+**Context preview.** `/context preview` (or `:Advantage context preview`,
+`<leader>cP`) renders the exact packet that goes to the model each turn — the
+system prompt, the tool schemas, and the transcript — with the cache boundary
+drawn and a per-section token breakdown. Nothing is sent: it's pure
+observability, so you can see what each part costs, confirm the memory block is
+frozen for prompt-cache reuse, and catch a bloated `context.md` before it costs
+you (it also shows the exact system-prompt bytes at the bottom).
+
 Commands: `:Advantage` (toggle) · `new` · `model` · `resume` · `stop` · `usage` ·
 `compact` · `context` · `help` · `review` · `yolo [on|off]` · `effort` · `add` ·
 `files` · `attach {path}` · `ask {prompt}` (works with a visual range: `:'<,'>Advantage ask why is this slow?`).
@@ -290,7 +300,8 @@ require("advantage").setup({
     compact_at_tokens = 120000,  -- rough chars/4 estimate
     keep_recent_messages = 16,
     summary_max_chars = 12000,   -- heuristic-mode summary cap
-    compact_mode = "llm",        -- manual /compact: "llm" | "heuristic" (auto-compact is always heuristic)
+    auto_compact_mode = "heuristic", -- auto-compact: "heuristic" | "llm"
+    compact_mode = "llm",        -- manual /compact: "llm" | "heuristic"
     summarizer_model = nil,      -- nil = auto: a cheap model in the ACTIVE provider's
                                  -- family (so a Codex-only user never needs Claude creds
                                  -- to /compact). Set "provider/model-id" to pin one.

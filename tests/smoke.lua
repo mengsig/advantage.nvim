@@ -690,6 +690,45 @@ do
       "fallback summary is the plain heuristic one, not framed as an LLM summary"
     )
   end
+
+  -- re-entrancy: _turn_impl calls _maybe_compact(false) on every tool-loop
+  -- round trip, and the LLM path is async. A second round trip firing before
+  -- the first summarizer call's callback lands must not spawn a concurrent
+  -- second compaction over the same still-unchanged messages.
+  do
+    local summarize_calls = 0
+    providers.register("fakesummarizerslow", {
+      stream = function(req)
+        vim.defer_fn(function()
+          summarize_calls = summarize_calls + 1
+          req.on.usage(10, 5, 0)
+          req.on.complete({ { type = "text", text = compact._SUMMARY_PREFIX .. "\nslow summary" } }, "end_turn")
+        end, 30)
+        return { stop = function() end }
+      end,
+    })
+    config.options.context.summarizer_model = "fakesummarizerslow/mini"
+    config.options.context.auto_compact_mode = "llm"
+
+    local ag3 = agent_mod.new({ model = { provider = "fakesummarizerslow", id = "mini", label = "mini" } })
+    ag3.messages = make_messages(10)
+    local infos = {}
+    ag3:_maybe_compact(false, {}, function(info)
+      infos[#infos + 1] = info
+    end)
+    -- fired while the first summarizer call is still in flight
+    ag3:_maybe_compact(false, {}, function(info)
+      infos[#infos + 1] = info
+    end)
+    vim.wait(2000, function()
+      return #infos >= 2
+    end, 5)
+
+    check(summarize_calls == 1, "a concurrent auto-compact call does not spawn a second summarizer job")
+    check(infos[2] == nil, "the re-entrant call's callback receives nil, not a duplicate compaction")
+    check(infos[1] ~= nil, "the first call's callback still completes with the compaction info")
+    config.options.context.auto_compact_mode = nil
+  end
 end
 
 -- 4b. sub-agent tool -------------------------------------------------------------
@@ -1868,10 +1907,26 @@ do
     "remember tool writes a clean sectioned markdown file"
   )
   check(file:find("Nothing recorded yet", 1, true) == nil, "placeholder line is replaced by real content")
+  -- Cache-stable memory: within a session the frozen system prefix does NOT change
+  -- when the model records a fact mid-turn (so the prompt cache survives). The fact
+  -- is still available this session — it lives in the transcript (the remember call
+  -- + result) — and it re-enters the prompt on a fresh render (next session / at the
+  -- next compaction boundary).
   check(
-    sys2 ~= nil and sys2:find("Run make ci before pushing anything", 1, true) ~= nil,
-    "next turn's system prompt carries the learned fact"
+    sys2 ~= nil and sys2:find("Run make ci before pushing anything", 1, true) == nil,
+    "mid-session the frozen system prefix stays stable (fact not re-injected, cache preserved)"
   )
+  check(
+    agent_mod.system_prompt():find("Run make ci before pushing anything", 1, true) ~= nil,
+    "a fresh render (next session / post-compaction) carries the learned fact (flywheel intact)"
+  )
+  local fact_in_transcript = false
+  for _, m in ipairs(ag.messages) do
+    for _, b in ipairs(type(m.content) == "table" and m.content or {}) do
+      if type(b) == "table" and b.type == "tool_use" and b.name == "remember" then fact_in_transcript = true end
+    end
+  end
+  check(fact_in_transcript, "the remember call stays in the transcript, so the fact is available this session")
 
   -- bootstrap must never clobber an existing file
   check(memory.bootstrap() == false, "bootstrap is idempotent on an existing file")
@@ -2127,10 +2182,13 @@ do
   )
 
   -- map-like options still merge (so partial overrides keep other defaults)
-  config.setup({ tools = { yolo = true } })
+  config.setup({ tools = { yolo = true }, context = { auto_compact_mode = "llm" } })
   check(
-    config.options.tools.yolo == true and config.options.tools.bash_timeout_ms == 120000,
-    "map options merge: overriding one tools field keeps the rest"
+    config.options.tools.yolo == true
+      and config.options.tools.bash_timeout_ms == 120000
+      and config.options.context.auto_compact_mode == "llm"
+      and config.options.context.compact_mode == "llm",
+    "map options merge: overriding one tools/context field keeps the rest"
   )
 
   -- validation flags a malformed default_model without throwing
@@ -2140,6 +2198,13 @@ do
     providers = {},
   })
   check(type(errs) == "table" and #errs >= 1, "validation reports a malformed default_model")
+  errs = config._validate(vim.tbl_extend("force", vim.deepcopy(config.defaults), {
+    context = vim.tbl_extend("force", vim.deepcopy(config.defaults.context), { auto_compact_mode = "paid" }),
+  }))
+  check(
+    vim.tbl_contains(errs, "context.auto_compact_mode must be 'llm' or 'heuristic'"),
+    "validation reports malformed auto_compact_mode"
+  )
 
   config.options = saved
 end
@@ -2147,6 +2212,35 @@ end
 section("hardening regressions")
 do
   local config = require("advantage.config")
+
+  -- memory-write cache stability: the frozen system-prompt memory block stays
+  -- byte-identical across a mid-session remember (so the cached prefix survives),
+  -- and refreshes from disk at a compaction boundary (nil-ing _memory_block).
+  do
+    local agent_mod = require("advantage.agent")
+    local memory = require("advantage.memory")
+    local saved_root = memory._root_override
+    memory._root_override = vim.fn.tempname()
+    vim.fn.mkdir(memory._root_override, "p")
+
+    local ag = agent_mod.new({ model = { provider = "x", id = "y", label = "y" } })
+    local before = agent_mod.system_prompt(ag:_memory_prompt_block())
+    memory.remember("FROZEN_FACT_TEST the widget lives in src/widget.lua", "Architecture")
+    local after = agent_mod.system_prompt(ag:_memory_prompt_block())
+    check(before == after, "frozen memory block is byte-identical across a mid-session remember")
+    check(
+      after:find("FROZEN_FACT_TEST", 1, true) == nil,
+      "a mid-session fact is not re-injected into the frozen prefix"
+    )
+    ag._memory_block = nil -- simulate the compaction-boundary refresh
+    local refreshed = agent_mod.system_prompt(ag:_memory_prompt_block())
+    check(
+      refreshed:find("FROZEN_FACT_TEST", 1, true) ~= nil,
+      "the memory block refreshes from disk after a compaction boundary"
+    )
+
+    memory._root_override = saved_root
+  end
 
   -- setup({tools=false}) must not crash (indexed a boolean before validation),
   -- and an invalid scalar structural option is coerced back to a table.
@@ -2323,6 +2417,64 @@ do
       "the partial report is flagged as hitting the turn limit"
     )
   end
+end
+
+-- 24. context preview -----------------------------------------------------------
+
+section("context preview")
+do
+  local config = require("advantage.config")
+  local memory = require("advantage.memory")
+  local agent_mod = require("advantage.agent")
+  memory._root_override = MEMTMP
+  config.options.memory = config.options.memory or {}
+  config.options.memory.enabled = true
+  memory.remember("Preview probe fact alpha bravo charlie", "Architecture")
+
+  -- refactor contract: render()/system_prompt() are their parts joined verbatim,
+  -- so exposing the parts for the breakdown never drifts from what is sent.
+  local rp, rjoin = memory.render_parts(), {}
+  for _, p in ipairs(rp) do
+    rjoin[#rjoin + 1] = p.text
+  end
+  check(table.concat(rjoin, "\n\n") == memory.render(), "render() == render_parts joined (byte-identical)")
+  local sp, sjoin = agent_mod.system_prompt_parts(nil), {}
+  for _, p in ipairs(sp) do
+    sjoin[#sjoin + 1] = p.text
+  end
+  check(
+    table.concat(sjoin, "\n\n") == agent_mod.system_prompt(nil),
+    "system_prompt() == system_prompt_parts joined (byte-identical)"
+  )
+
+  -- no active session: a fresh render, clearly labeled
+  local preview = require("advantage.context_preview")
+  local blob = table.concat((preview.build(nil)), "\n")
+  check(blob:find("# Context preview", 1, true) ~= nil, "preview has a header")
+  check(blob:find("system total", 1, true) ~= nil, "preview breaks down the system prompt")
+  check(blob:find("## Tools", 1, true) ~= nil, "preview accounts for tool schemas")
+  check(blob:find("## Transcript", 1, true) ~= nil, "preview accounts for the transcript")
+  check(blob:find("total context", 1, true) ~= nil, "preview totals the whole context")
+  check(
+    blob:find("Preview probe fact alpha bravo charlie", 1, true) ~= nil,
+    "preview shows the exact system-prompt bytes (memory included)"
+  )
+  check(blob:find("no active session", 1, true) ~= nil, "no-session preview is labeled a fresh render")
+
+  -- with a live agent: frozen block + real transcript + provider-aware economics
+  local ag = agent_mod.new({ model = { provider = "anthropic", id = "claude-x", label = "x" } })
+  ag.messages = { { role = "user", content = { { type = "text", text = "one transcript message here" } } } }
+  local pblob = table.concat((preview.build(ag)), "\n")
+  check(pblob:find("memory frozen", 1, true) ~= nil, "live preview marks the memory block frozen")
+  check(pblob:find("1 messages", 1, true) ~= nil, "live preview counts transcript messages")
+  check(pblob:find("prompt cache", 1, true) ~= nil, "anthropic preview notes the ~10% cache discount")
+
+  -- a mid-session remember writes to disk but not the frozen prefix — preview
+  -- must surface the drift so the ~10% cache win is legible, not silent
+  ag:_memory_prompt_block() -- ensure frozen at the pre-remember state
+  memory.remember("A brand new post-freeze fact delta echo foxtrot", "Notes")
+  local dblob = table.concat((preview.build(ag)), "\n")
+  check(dblob:find("frozen at", 1, true) ~= nil, "preview flags frozen-vs-disk drift after a mid-session remember")
 end
 
 print("")

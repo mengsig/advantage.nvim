@@ -6,15 +6,15 @@
 ---
 ---Two independent code paths produce that summary:
 ---  * `M.compact` / `M.force` — a heuristic, offline, one-line-per-message
----    truncation. No extra model call, so it is free and instant. Used for all
----    silent, mid-turn auto-compaction (a background threshold crossing should
----    never add a surprise network round-trip to a turn the user didn't ask to
----    pay for), and as the default/fallback for manual compaction.
+---    truncation. No extra model call, so it is free and instant. Used when the
+---    selected compaction mode is `"heuristic"` and as the fallback if LLM
+---    summarization fails.
 ---  * `M.summarize_with_llm` — spends one call on `context.summarizer_model` to
 ---    have a model write a real, semantically-prioritized summary from the
 ---    *untruncated* older transcript. Async (goes through a provider's
----    `stream()`), used only for manual/forced compaction when
----    `context.compact_mode == "llm"`.
+---    `stream()`), used for manual/forced compaction when
+---    `context.compact_mode == "llm"`, and for silent auto-compaction when
+---    `context.auto_compact_mode == "llm"`.
 ---Both paths share the same cut-point selection and role/tool-pairing safety
 ---logic (`prepare_split`) and the same splice-back-in logic (`splice_summary`),
 ---so the resulting message shape is identical regardless of which mode wrote it.
@@ -450,8 +450,8 @@ M._resolve_summarizer = resolve_summarizer
 
 ---Spend one model call to write a real semantic summary of the older half of
 ---the transcript, then splice it in exactly like the heuristic path does. Used
----only for manual/forced compaction (`context.compact_mode == "llm"`) — silent
----mid-turn auto-compact always stays on the free heuristic in `M.compact`.
+---when the selected mode is `"llm"` (manual `context.compact_mode` or silent
+---auto `context.auto_compact_mode`).
 ---@param messages table[] canonical messages
 ---@param opts table context config (keep_recent_messages, summarizer_model, …)
 ---@param on_done fun(next_messages: table[]|nil, info: table|nil, err: string|nil)

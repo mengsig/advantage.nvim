@@ -643,14 +643,19 @@ end
 -- Render: the block injected into the system prompt every turn
 --------------------------------------------------------------------------------
 
----Build the memory block for the system prompt. Kept within the token budget and
----returns "" when there is nothing to add, so the cached prefix is untouched.
-function M.render()
-  if not M.enabled() then return "" end
+---Build the memory block as an ordered list of labeled parts. Each entry is
+---`{ label = "<short name>", text = "<block bytes>" }`. `render()` joins the
+---`text` fields; `/context preview` uses the `label`s to attribute per-section
+---token cost. Returns `{}` when memory is disabled or there is nothing to add.
+function M.render_parts()
+  if not M.enabled() then return {} end
   local parts = {}
 
   local proj = project_memory()
-  if proj and proj ~= "" then parts[#parts + 1] = "# Project memory (AGENTS.md/CLAUDE.md)\n" .. proj end
+  if proj and proj ~= "" then
+    parts[#parts + 1] =
+      { label = "project memory (AGENTS/CLAUDE.md)", text = "# Project memory (AGENTS.md/CLAUDE.md)\n" .. proj }
+  end
 
   local bullets, order = parse_context()
   local has_facts = false
@@ -658,12 +663,14 @@ function M.render()
     if #items > 0 then has_facts = true end
   end
   if has_facts then
-    parts[#parts + 1] = vim.trim(render_context(bullets, order))
+    parts[#parts + 1] = { label = "repo memory (context.md)", text = vim.trim(render_context(bullets, order)) }
   else
     -- cold start: tell the model the memory exists and is empty, so the
     -- flywheel starts on session one instead of never
-    parts[#parts + 1] =
-      "# Repo memory\nEmpty so far — this repo hasn't been learned yet. As you discover durable, non-obvious facts (build/test commands, architecture invariants, conventions, gotchas, stated preferences), record them with the `remember` tool so future sessions start ahead."
+    parts[#parts + 1] = {
+      label = "repo memory (context.md, empty)",
+      text = "# Repo memory\nEmpty so far — this repo hasn't been learned yet. As you discover durable, non-obvious facts (build/test commands, architecture invariants, conventions, gotchas, stated preferences), record them with the `remember` tool so future sessions start ahead.",
+    }
   end
 
   local skills = scan_skills()
@@ -679,11 +686,23 @@ function M.render()
       if #d > 200 then d = utf8_safe_sub(d, 197) .. "…" end
       lines[#lines + 1] = ("- %s: %s"):format(s.name, d)
     end
-    parts[#parts + 1] = table.concat(lines, "\n")
+    parts[#parts + 1] = { label = ("skills index (%d)"):format(#skills), text = table.concat(lines, "\n") }
   end
 
+  return parts
+end
+
+---Build the memory block for the system prompt. Kept within the token budget and
+---returns "" when there is nothing to add, so the cached prefix is untouched.
+function M.render()
+  if not M.enabled() then return "" end
+  local parts = M.render_parts()
   if #parts == 0 then return "" end
-  return table.concat(parts, "\n\n")
+  local texts = {}
+  for _, p in ipairs(parts) do
+    texts[#texts + 1] = p.text
+  end
+  return table.concat(texts, "\n\n")
 end
 
 M._SECTIONS = SECTIONS

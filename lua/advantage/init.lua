@@ -58,6 +58,9 @@ function M.setup(opts)
   map("n", maps.add_location, M.add_location, "add cursor location to chat")
   map("n", maps.pick_files, M.pick_files, "pick a file to add to chat")
   map("n", maps.usage, M.usage, "usage dashboard")
+  map("n", maps.context_preview, function()
+    M.context("preview")
+  end, "preview context packet")
   map("n", maps.review, M.review, "review agent changes")
   map("n", maps.yolo, M.toggle_yolo, "toggle yolo mode")
   map("n", maps.effort, M.pick_effort, "tune model effort")
@@ -585,6 +588,16 @@ function M.context(arg)
       lines[#lines + 1] = ("    ↳ missing: %s"):format(s.missing)
     end
     ui.float({ title = "advantage · memory verify", lines = lines, filetype = "markdown", footer = "q close" })
+  elseif action == "preview" then
+    -- show the exact context packet (system prompt + tools + transcript) with the
+    -- cache boundary drawn and a per-section token breakdown — nothing is sent
+    local lines = require("advantage.context_preview").build(current)
+    ui.float({
+      title = "advantage · context preview",
+      lines = lines,
+      filetype = "markdown",
+      footer = "q close · cached prefix billed ~10% after turn 1",
+    })
   elseif action == "forget" then
     local pattern = table.concat(vim.list_slice(args, 2), " ")
     if pattern == "" then
@@ -592,6 +605,8 @@ function M.context(arg)
       return
     end
     local n = memory.forget(pattern)
+    -- drop the frozen memory block so the forgotten fact leaves the live prefix
+    if n > 0 and current then current._memory_block = nil end
     ui.notify(
       n > 0 and ("forgot %d fact%s matching %q"):format(n, n == 1 and "" or "s", pattern)
         or ("no facts matched %q"):format(pattern)
@@ -609,7 +624,7 @@ function M.context(arg)
       title = "advantage · memory",
       lines = lines,
       filetype = "markdown",
-      footer = "q close · /context init · curate · verify · forget <text>",
+      footer = "q close · /context init · curate · verify · preview · forget <text>",
     })
   end
 end
@@ -771,7 +786,7 @@ function M._complete(arglead, cmdline)
     elseif args[1] == "yolo" then
       pool = { "on", "off" }
     elseif args[1] == "context" or args[1] == "memory" then
-      pool = { "init", "curate", "verify", "forget" }
+      pool = { "init", "curate", "verify", "preview", "forget" }
     else
       pool = {}
     end

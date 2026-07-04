@@ -56,7 +56,18 @@ local MEMORY_GUIDE = table.concat({
   "- A skill is a reusable procedure. When a listed skill's description matches the task, call `use_skill` to load its full steps before doing that task. Codify a genuinely reusable multi-step procedure with `save_skill`.",
 }, "\n")
 
-function M.system_prompt()
+---@param memory_block? string a pre-rendered, session-frozen memory block to use
+---  verbatim instead of re-rendering. Passing the same bytes every turn keeps the
+---  cached system prefix byte-identical, so a mid-session `remember`/`save_skill`
+---  write doesn't invalidate the whole prompt cache (a memory write persists to
+---  disk and stays in the recent transcript, so the model still has it). Omit
+---  (nil) to render fresh — sub-agents and tests do.
+---The system prompt as an ordered list of labeled parts. Each entry is
+---`{ label = "<short name>", text = "<bytes>", is_memory? = true }`.
+---`M.system_prompt` joins the `text` fields with "\n\n"; `/context preview` uses
+---the labels to attribute per-section token cost and expands the memory part.
+---@param memory_block? string frozen block to use verbatim (see M.system_prompt)
+function M.system_prompt_parts(memory_block)
   local cfg = config.options.system_prompt
   local base = default_system_prompt()
   if type(cfg) == "string" then
@@ -64,17 +75,27 @@ function M.system_prompt()
   elseif type(cfg) == "function" then
     base = cfg(base)
   end
+  local parts = { { label = "base instructions", text = base } }
   -- Append the memory-tool instructions plus the per-repo learned context and
   -- skills index. It rides the cached system prefix, so after the first turn it
   -- costs ~10%, and it saves tokens by sparing the model repeated read/grep
   -- loops to re-derive known facts. Skipped entirely when memory is disabled.
   local ok, memory = pcall(require, "advantage.memory")
   if ok and memory.enabled() then
-    base = base .. "\n\n" .. MEMORY_GUIDE
-    local block = memory.render()
-    if block and block ~= "" then base = base .. "\n\n" .. block end
+    parts[#parts + 1] = { label = "memory guide", text = MEMORY_GUIDE }
+    local block = memory_block
+    if block == nil then block = memory.render() end
+    if block and block ~= "" then parts[#parts + 1] = { label = "memory block", text = block, is_memory = true } end
   end
-  return base
+  return parts
+end
+
+function M.system_prompt(memory_block)
+  local texts = {}
+  for _, p in ipairs(M.system_prompt_parts(memory_block)) do
+    texts[#texts + 1] = p.text
+  end
+  return table.concat(texts, "\n\n")
 end
 
 ---@param opts {model: table, messages?: table, id?: string, title?: string, usage?: table}
@@ -123,6 +144,20 @@ end
 
 function Agent:busy()
   return self.status ~= "idle"
+end
+
+---The per-session frozen memory block for the system prompt. Rendered once and
+---reused so a mid-session `remember`/`save_skill` write doesn't rewrite the cached
+---system prefix (which would forfeit the prompt-cache discount on the next
+---request). It is refreshed from disk at each compaction boundary — where facts
+---that aged out of the transcript must re-enter the prompt — by nil-ing
+---`self._memory_block`, and on a new session (a fresh Agent starts it nil).
+function Agent:_memory_prompt_block()
+  if self._memory_block == nil then
+    local ok, memory = pcall(require, "advantage.memory")
+    self._memory_block = (ok and memory.render()) or ""
+  end
+  return self._memory_block
 end
 
 ---@param opts? {mode?: "llm"|"heuristic"} one-off override of context.compact_mode
@@ -290,6 +325,38 @@ function Agent:_maybe_compact(force, opts, callback)
   local compact = require("advantage.compact")
   local util = require("advantage.util")
 
+  if not force then
+    -- Re-entrancy guard: the LLM path below is async (self.job resolves later),
+    -- and _turn_impl calls _maybe_compact(false) on every tool-loop round trip.
+    -- Without this, a second round trip can fire before the first summarizer
+    -- call's callback lands (which is where _auto_compact_floor gets set),
+    -- spawning a second concurrent compaction over the *same* still-unchanged
+    -- self.messages — visible as two "compacted ..." notices in a row with
+    -- identical before/after token counts.
+    if self._compacting then return callback(nil) end
+
+    -- Hysteresis: once auto-compaction has run, don't fire again until the
+    -- transcript has genuinely grown past where it left off. Without this, a
+    -- session whose protected "recent" window alone sits near
+    -- compact_at_tokens keeps re-crossing the threshold on almost every
+    -- tool-loop round trip within a single prompt — thrashing (repeated
+    -- summarizer calls / rewritten history) and shredding the prompt cache
+    -- instead of settling. `_auto_compact_floor` is the after_tokens estimate
+    -- from the last compaction (manual or auto); require growth of at least
+    -- 10% of the threshold beyond it before considering another one.
+    local threshold = cfg.compact_at_tokens or 120000
+    local margin = math.max(threshold * 0.1, 2000)
+    if self._auto_compact_floor and compact.estimate_tokens(self.messages) < self._auto_compact_floor + margin then
+      return callback(nil)
+    end
+  end
+
+  self._compacting = true
+  local function done(info)
+    self._compacting = false
+    callback(info)
+  end
+
   local function finish_heuristic()
     local next_messages, info
     if force then
@@ -299,6 +366,11 @@ function Agent:_maybe_compact(force, opts, callback)
     end
     if info then
       self.messages = next_messages
+      self._auto_compact_floor = info.after_tokens
+      -- Compaction boundary: re-render the memory block from disk next turn so any
+      -- fact that just aged out of the transcript re-enters the (now legitimately
+      -- re-cached) system prefix.
+      self._memory_block = nil
       self:ui().notice(
         ("compacted %d old messages (~%s → ~%s tokens)"):format(
           info.compacted_messages,
@@ -307,18 +379,19 @@ function Agent:_maybe_compact(force, opts, callback)
         )
       )
     end
-    callback(info)
+    done(info)
   end
 
-  -- Silent, mid-turn auto-compact always stays on the free heuristic so a
-  -- background threshold crossing never adds a surprise network round-trip to
-  -- a turn the user didn't ask to pay for. Manual /compact can opt into a real
-  -- LLM summary via context.compact_mode (or a one-off /compact llm|heuristic).
-  local mode = force and (opts.mode or cfg.compact_mode or "heuristic") or "heuristic"
+  -- Manual /compact uses context.compact_mode (or a one-off override). Silent
+  -- auto-compact uses its own context.auto_compact_mode, defaulting to the free
+  -- heuristic so background threshold crossings don't add surprise API usage
+  -- unless the user explicitly opts in.
+  local mode = force and (opts.mode or cfg.compact_mode or "heuristic") or (cfg.auto_compact_mode or "heuristic")
   if mode ~= "llm" then return finish_heuristic() end
 
   self.job = compact.summarize_with_llm(self.messages, cfg, function(next_messages, info, err)
     self.job = nil
+    self._compacting = false
     -- If the user cancelled mid-summarize, cancel() already cleaned up; never
     -- splice a summary into a transcript the user abandoned.
     if self.cancelled then return end
@@ -333,6 +406,8 @@ function Agent:_maybe_compact(force, opts, callback)
       return finish_heuristic()
     end
     self.messages = next_messages
+    self._auto_compact_floor = info.after_tokens
+    self._memory_block = nil -- refresh the memory block from disk at the compaction boundary
     if info.usage and ((info.usage.input or 0) > 0 or (info.usage.output or 0) > 0) then
       local u = info.usage
       self.usage.input = self.usage.input + u.input
@@ -392,7 +467,7 @@ function Agent:_turn_impl()
   end
 
   self.status = "streaming"
-  self.ctx.system = M.system_prompt()
+  self.ctx.system = M.system_prompt(self:_memory_prompt_block())
   local ui = self:ui()
   if not self.turn_open then
     ui.begin_assistant(self.model.label)

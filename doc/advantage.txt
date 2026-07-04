@@ -95,6 +95,7 @@ Defaults (configurable under `keymaps`):
   <leader>cf   send current file to the prompt
   <leader>cl   send @file:L{cursor line}
   <leader>cp   pick a project file to send
+  <leader>cP   preview the exact context packet (system + tools + transcript)
   <leader>cu   usage dashboard
   <leader>cd   review file changes (diff)
   <leader>cy   toggle yolo mode
@@ -156,7 +157,11 @@ advantage keeps per-repo memory under `<root>/.advantage/`:
 
 `:Advantage context` shows the memory; `context init` teaches the repo in one
 pass; `context curate` compresses it; `context verify` flags facts whose files
-have moved/vanished; `context forget <text>` drops matching facts. Disable with
+have moved/vanished; `context preview` (also `<leader>cP`) shows the exact
+context packet that will be sent — system prompt, tool schemas and transcript —
+with the cache boundary drawn and a per-section token breakdown, so you can see
+what each part costs and confirm the memory block is frozen for cache reuse;
+`context forget <text>` drops matching facts. Disable with
 `memory = { enabled = false }`. AGENTS.md / CLAUDE.md are also ingested.
 
 vim:tw=78:ts=8:ft=help:norl:

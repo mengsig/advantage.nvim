@@ -552,7 +552,7 @@ local function help_lines()
     "  /usage   token dashboard   /compact [llm|heuristic] shrink old context",
     "  /new     fresh session     /model   switch model",
     "  /resume  resume session    /review  diff agent edits",
-    "  /context repo memory + skills (verify · forget <text>)",
+    "  /context repo memory + skills (init · curate · verify · preview · forget <text>)",
     "  /yolo    skip permissions",
     "  /effort [mode]  tune thinking/reasoning (OpenAI: default/off/minimal/low/medium/high; Claude: adaptive/off/1k/4k/8k/10k/16k/32k)",
     "",
@@ -563,7 +563,8 @@ local function help_lines()
     "  :Advantage resume     resume a session",
     "  :Advantage usage      token dashboard",
     "  :Advantage compact [llm|heuristic]  shrink old conversation context",
-    "  :Advantage context    view/verify/forget repo memory",
+    "  :Advantage context    view/verify/preview/forget repo memory",
+    "  :Advantage context preview  exact context packet + token breakdown (<leader>cP)",
     "  :Advantage help       keybind and command cheatsheet",
     "  :Advantage review     diff the agent's changes",
     "  :Advantage yolo       toggle skip-all-permissions",
@@ -1024,7 +1025,7 @@ end
 ---the bar holds at 95% until compaction_done snaps it to 100%.
 ---@param tokens? integer
 function M.compaction_start(tokens)
-  local est = math.max(6000, math.min(90000, 4000 + (tonumber(tokens) or 0) * 0.25))
+  local est = math.max(12000, math.min(180000, 8000 + (tonumber(tokens) or 0) * 0.5))
   S.compact = { t0 = uv.now(), est = est, done = false }
   M.set_status("compacting")
 end

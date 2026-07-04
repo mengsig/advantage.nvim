@@ -77,13 +77,15 @@ M.defaults = {
     keep_recent_messages = 16,
     ---Maximum characters in the generated compaction summary.
     summary_max_chars = 12000,
+    ---Mode for silent auto-compaction (crossing compact_at_tokens mid-turn):
+    ---"heuristic" keeps the old free/offline behavior; "llm" spends one
+    ---summarizer call when the threshold is crossed. Defaults to heuristic to
+    ---avoid surprise token/API usage unless explicitly opted in.
+    auto_compact_mode = "heuristic",
     ---Mode for manual/forced compaction (`/compact`, `:Advantage compact`):
     ---"llm" spends one call on `summarizer_model` for a real, semantically
-    ---prioritized summary; "heuristic" stays free/offline (the old behavior).
-    ---Silent auto-compact (crossing compact_at_tokens mid-turn) always uses the
-    ---heuristic regardless of this setting, so a background threshold crossing
-    ---never adds a surprise network round-trip to a turn you didn't ask to pay
-    ---for. Override per-invocation with `/compact llm` or `/compact heuristic`.
+    ---prioritized summary; "heuristic" stays free/offline.
+    ---Override per-invocation with `/compact llm` or `/compact heuristic`.
     compact_mode = "llm",
     ---Model that performs the LLM summarization call, as "provider/model-id".
     ---Kept separate from the active chat model so compaction stays cheap and
@@ -148,6 +150,7 @@ M.defaults = {
     add_file = "<leader>cf", -- send current file to the chat prompt
     add_location = "<leader>cl", -- send @file:L{cursor line}
     pick_files = "<leader>cp", -- pick a project file to send
+    context_preview = "<leader>cP", -- preview the exact context packet (system + tools + transcript)
     usage = "<leader>cu", -- token usage dashboard
     review = "<leader>cd", -- review the agent's file changes (diff)
     yolo = "<leader>cy", -- toggle skip-all-permissions mode
@@ -207,9 +210,11 @@ local function validate(o)
     if o[key] ~= nil and type(o[key]) ~= "table" then errs[#errs + 1] = key .. " must be a table" end
   end
   if type(o.context) == "table" then
-    local cm = o.context.compact_mode
-    if cm ~= nil and cm ~= "llm" and cm ~= "heuristic" then
-      errs[#errs + 1] = "context.compact_mode must be 'llm' or 'heuristic'"
+    for _, field in ipairs({ "compact_mode", "auto_compact_mode" }) do
+      local mode = o.context[field]
+      if mode ~= nil and mode ~= "llm" and mode ~= "heuristic" then
+        errs[#errs + 1] = "context." .. field .. " must be 'llm' or 'heuristic'"
+      end
     end
   end
   if o.max_agent_turns ~= nil and (type(o.max_agent_turns) ~= "number" or o.max_agent_turns < 0) then
