@@ -154,19 +154,37 @@ function M.render(bufnr, opts)
   return table.concat(lines, "\n")
 end
 
----Is a language server that handles `ft` already running in this session? Used
----to decide, without loading a buffer, whether editing an unopened file of that
----filetype could yield diagnostics at all.
-local function running_client_for_ft(ft)
+---Does `ft` list `ft`? Small helper shared by the running/configured checks.
+local function fts_include(fts, ft)
+  if type(fts) == "table" then
+    for _, f in ipairs(fts) do
+      if f == ft then return true end
+    end
+  elseif fts == nil then
+    return true -- no declared filetypes: may attach to anything
+  end
+  return false
+end
+
+---Is a language server that handles `ft` running OR enabled-but-not-yet-attached?
+---Used to decide, without loading a buffer, whether editing an unopened file of
+---that filetype could yield diagnostics at all. We must consult *configured*
+---servers too (Neovim 0.11+ `vim.lsp.enable`), not just running ones — servers
+---attach lazily on the first matching buffer, so a repo with a correctly set up
+---server but no open buffer of that ft would otherwise trip a false "no LSP" nudge.
+local function server_available_for_ft(ft)
   if not ft or ft == "" then return false end
   for _, cl in ipairs(vim.lsp.get_clients({})) do
-    local fts = cl.config and cl.config.filetypes
-    if type(fts) == "table" then
-      for _, f in ipairs(fts) do
-        if f == ft then return true end
-      end
-    elseif fts == nil then
-      return true -- a client with no declared filetypes may attach to anything
+    if fts_include(cl.config and cl.config.filetypes, ft) then return true end
+  end
+  -- Enabled-but-not-running configs (vim.lsp.enable, Neovim 0.11+).
+  local enabled = vim.lsp._enabled_configs
+  if type(enabled) == "table" and vim.lsp.config then
+    for name in pairs(enabled) do
+      local ok, conf = pcall(function()
+        return vim.lsp.config[name]
+      end)
+      if ok and type(conf) == "table" and fts_include(conf.filetypes, ft) then return true end
     end
   end
   return false
@@ -177,7 +195,7 @@ local function notify_missing_ft(ft)
   local c = cfg()
   if c.notify_missing == false or not ft or ft == "" then return end
   if M._notified[ft] or NO_LSP_EXPECTED[ft] then return end
-  if running_client_for_ft(ft) then return end
+  if server_available_for_ft(ft) then return end
   M._notified[ft] = true
   local msg = ("no language server attached for '%s' files — install/configure one to get diagnostic feedback on edits"):format(
     ft
@@ -296,7 +314,7 @@ function M.after_edit(path, before, cb)
     end
   else
     local ft = (vim.filetype.match({ filename = path })) or ""
-    if not running_client_for_ft(ft) then
+    if not server_available_for_ft(ft) then
       notify_missing_ft(ft)
       return cb(nil)
     end
