@@ -887,7 +887,7 @@ end
 function M.queued(n, text)
   M.set_queue(n)
   local head = text:gsub("%s+", " ")
-  if #head > 48 then head = head:sub(1, 45) .. "…" end
+  if #head > 48 then head = util.utf8_safe_sub(head, 45) .. "…" end
   M.notice(("queued #%d — %s"):format(n, head))
 end
 
@@ -969,7 +969,7 @@ end
 function M.tool_output(id, chunk)
   if not util.buf_valid(S.buf) or not chunk or chunk == "" then return end
   local max = 6000
-  if #chunk > max then chunk = chunk:sub(1, max) .. "\n… [stream chunk truncated]" end
+  if #chunk > max then chunk = util.utf8_safe_sub(chunk, max) .. "\n… [stream chunk truncated]" end
   local lines = vim.split(chunk:gsub("\r", ""), "\n", { plain = true })
   if lines[#lines] == "" then table.remove(lines) end
   if #lines == 0 then return end

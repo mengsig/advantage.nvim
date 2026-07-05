@@ -161,7 +161,7 @@ local sub_bash = {
         local out = (res.stdout or "") .. (res.stderr or "")
         if res.code == 124 or res.signal ~= 0 then out = out .. "\n(timed out)" end
         if vim.trim(out) == "" then out = "(no output)" end
-        if #out > 30000 then out = out:sub(1, 30000) .. "\n… (truncated)" end
+        if #out > 30000 then out = require("advantage.util").utf8_safe_sub(out, 30000) .. "\n… (truncated)" end
         cb(out, res.code ~= 0 and res.signal == 0 and false or (res.code ~= 0))
       end)
     )

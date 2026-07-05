@@ -103,22 +103,10 @@ local function tokens(s)
   return math.ceil(#(s or "") / 4)
 end
 
----Truncate to at most `n` bytes without splitting a multi-byte UTF-8 character.
----This block is spliced into the system prompt, so a dangling continuation byte
----would make the request body invalid UTF-8. Mirrors compact.lua's helper.
-local function utf8_safe_sub(s, n)
-  if n <= 0 then return "" end
-  if n >= #s then return s end
-  while n > 0 do
-    local b = s:byte(n + 1)
-    if b and b >= 0x80 and b < 0xC0 then
-      n = n - 1
-    else
-      break
-    end
-  end
-  return s:sub(1, n)
-end
+---Character-safe byte truncation (shared helper). This block is spliced into the
+---system prompt, so a mid-character cut would make the request body invalid
+---UTF-8; util.utf8_safe_sub backs off to a character boundary.
+local utf8_safe_sub = require("advantage.util").utf8_safe_sub
 
 ---Seed `<root>/.advantage/context.md` the first time this repo is used, so the
 ---memory file is visible, editable and committable from session one instead of

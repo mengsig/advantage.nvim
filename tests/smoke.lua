@@ -290,6 +290,58 @@ do
   r = assert(run("read_file", { path = "x/hello.txt" }))
   check(r:find("1→alpha") and r:find("3→gamma"), "read_file returns numbered lines")
 
+  -- Big dense multi-byte file: the size budget must stop on a clean line
+  -- boundary (never mid-character, which produced invalid UTF-8 and a provider
+  -- 400) and hand back an ACCURATE resume offset so the whole file is reachable.
+  do
+    local util = require("advantage.util")
+    -- each line carries a 3-byte glyph (→) so a byte-index cut would land
+    -- mid-character; ~90 bytes/line × 900 lines comfortably exceeds the budget.
+    local big = {}
+    for i = 1, 900 do
+      big[i] = ("line %d → %s"):format(i, string.rep("x", 60))
+    end
+    assert(run("write_file", { path = "big.txt", content = table.concat(big, "\n") }))
+
+    local function strict_utf8_ok(s)
+      -- lua has no strict validator; round-trip through the scrubber and require
+      -- it to be a no-op (scrub only changes a string that is already invalid).
+      return util.scrub_utf8(s) == s
+    end
+
+    local pages, off, covered, guard = 0, 1, 0, 0
+    while true do
+      local page = assert(run("read_file", { path = "big.txt", offset = off }))
+      pages = pages + 1
+      guard = guard + 1
+      check(strict_utf8_ok(page), "read_file page " .. pages .. " is valid UTF-8 (no mid-char cut)")
+      local nxt = page:match("continue with offset=(%d+)")
+      if nxt then
+        covered = tonumber(nxt) - 1
+        off = tonumber(nxt)
+      else
+        for ln in page:gmatch("\n?%s*(%d+)→") do
+          covered = tonumber(ln)
+        end
+        break
+      end
+      if guard > 20 then break end
+    end
+    check(pages >= 2, "a file over the size budget spans multiple pages")
+    check(covered == 900, "paginating with the reported offset covers every line (no loss)")
+
+    -- A non-positive limit must not yield an empty page that resumes at the same
+    -- offset (a paging livelock); limit is floored to 1.
+    local zp = assert(run("read_file", { path = "big.txt", limit = 0 }))
+    check(zp:find("1→", 1, true) and not zp:find("continue with offset=1", 1, true), "read_file floors a non-positive limit to 1 (no livelock)")
+
+    -- Belt-and-suspenders: an encoded body carrying genuinely invalid bytes (a
+    -- command emitting Latin-1) is scrubbed to valid UTF-8 instead of 400ing.
+    local bad = util.scrub_utf8(vim.json.encode({ t = "x\xe9\xff\xe2\x86 y" }))
+    check(util.scrub_utf8(bad) == bad and not bad:find("\xff"), "scrub_utf8 makes an invalid body valid")
+    check(util.utf8_safe_sub("ab→cd", 3) == "ab", "utf8_safe_sub backs off a mid-character cut")
+  end
+
   r = assert(run("edit_file", { path = "x/hello.txt", old_string = "beta", new_string = "BETA" }))
   check(r:find("Applied 1 replacement"), "edit_file replaces unique string")
 

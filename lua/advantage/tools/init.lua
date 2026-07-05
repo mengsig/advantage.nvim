@@ -4,6 +4,7 @@
 local M = {}
 
 local uv = vim.uv or vim.loop
+local util = require("advantage.util")
 
 local MAX_OUTPUT = 30000
 local MAX_LINES = 1500
@@ -54,9 +55,11 @@ local function write_all(path, content)
   return true
 end
 
+---Byte-cap `s` for tool output that cannot be paginated (bash/grep). Uses a
+---character-safe cut so the truncation can never emit a partial UTF-8 sequence.
 local function truncate(s, limit)
   limit = limit or MAX_OUTPUT
-  if #s > limit then return s:sub(1, limit) .. "\n… [output truncated at " .. limit .. " chars]" end
+  if #s > limit then return util.utf8_safe_sub(s, limit) .. "\n… [output truncated at " .. limit .. " bytes]" end
   return s
 end
 
@@ -173,20 +176,39 @@ tool({
       return cb(("%s appears to be a binary file (%d bytes) — not shown."):format(input.path, #content), false)
     end
     local lines = vim.split(content, "\n", { plain = true })
+    local total = #lines
     local offset = math.max(1, input.offset or 1)
-    local limit = math.min(input.limit or MAX_LINES, MAX_LINES)
-    local out = {}
-    for i = offset, math.min(#lines, offset + limit - 1) do
+    -- Floor at 1: a model-supplied limit<=0 would otherwise make the loop empty
+    -- yet still emit a "continue with offset=<same>" suffix — a paging livelock.
+    local limit = math.max(1, math.min(input.limit or MAX_LINES, MAX_LINES))
+    if offset > total then
+      return cb(("(offset %d is past the end — file has %d lines)"):format(offset, total), false)
+    end
+    -- Fill whole numbered lines up to the line limit AND a byte budget, stopping
+    -- on a clean line boundary rather than byte-chopping the joined blob. This
+    -- keeps every page valid UTF-8 and — crucially — lets us report the *exact*
+    -- next line to resume from, so the model can page through a large file
+    -- deterministically instead of losing content past a mid-line cut. Overlong
+    -- individual lines are capped character-safely.
+    local out, bytes = {}, 0
+    for i = offset, math.min(total, offset + limit - 1) do
       local line = lines[i]
-      if #line > MAX_LINE_LEN then line = line:sub(1, MAX_LINE_LEN) .. "…" end
-      out[#out + 1] = string.format("%6d→%s", i, line)
+      if #line > MAX_LINE_LEN then line = util.utf8_safe_sub(line, MAX_LINE_LEN) .. "…" end
+      local rendered = string.format("%6d→%s", i, line)
+      -- Always emit at least the first line, even if it alone exceeds the budget.
+      if #out > 0 and bytes + #rendered + 1 > MAX_OUTPUT then break end
+      out[#out + 1] = rendered
+      bytes = bytes + #rendered + 1
     end
-    if #out == 0 then return cb("(empty range — file has " .. #lines .. " lines)", false) end
+    -- Lines are appended consecutively from `offset`, so the last one included is
+    -- exactly offset + #out - 1 (and offset-1, i.e. "nothing", is unreachable now
+    -- that limit is floored to 1 and offset <= total).
+    local last = offset + #out - 1
     local suffix = ""
-    if offset + limit - 1 < #lines then
-      suffix = ("\n… %d more lines (use offset=%d)"):format(#lines - (offset + limit - 1), offset + limit)
+    if last < total then
+      suffix = ("\n… %d more lines — continue with offset=%d"):format(total - last, last + 1)
     end
-    cb(truncate(table.concat(out, "\n") .. suffix), false)
+    cb(table.concat(out, "\n") .. suffix, false)
   end,
 })
 
@@ -402,7 +424,7 @@ tool({
   },
   summary = function(input)
     local c = (input.command or ""):gsub("%s+", " ")
-    return #c > 60 and (c:sub(1, 57) .. "…") or c
+    return #c > 60 and (util.utf8_safe_sub(c, 57) .. "…") or c
   end,
   preview = function(input)
     return { title = "bash", lines = vim.split(input.command or "", "\n", { plain = true }), filetype = "bash" }
@@ -729,7 +751,7 @@ tool({
           lines[#lines + 1] = ("%d. %s — %s"):format(i, strip_html(r.title), r.url)
           local desc = strip_html(r.description)
           if desc ~= "" then
-            if #desc > 240 then desc = desc:sub(1, 240) .. "…" end
+            if #desc > 240 then desc = util.utf8_safe_sub(desc, 240) .. "…" end
             lines[#lines + 1] = "   " .. desc
           end
         end
@@ -796,7 +818,7 @@ tool({
   },
   summary = function(input)
     local p = (input.prompt or ""):gsub("%s+", " ")
-    return #p > 60 and (p:sub(1, 57) .. "…") or p
+    return #p > 60 and (util.utf8_safe_sub(p, 57) .. "…") or p
   end,
   run = function(input, ctx, cb)
     return require("advantage.subagent").run(input, ctx, cb)
@@ -921,7 +943,7 @@ tool({
   },
   summary = function(input)
     local f = (input.fact or ""):gsub("%s+", " ")
-    return #f > 60 and (f:sub(1, 57) .. "…") or f
+    return #f > 60 and (util.utf8_safe_sub(f, 57) .. "…") or f
   end,
   run = function(input, ctx, cb)
     local memory = require("advantage.memory")

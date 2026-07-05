@@ -61,7 +61,7 @@ end
 local function one_line(text, max)
   local s = tostring(text or ""):gsub("%s+", " "):gsub("^%s+", ""):gsub("%s+$", "")
   max = max or 56
-  if #s > max then s = s:sub(1, max - 1) .. "…" end
+  if #s > max then s = require("advantage.util").utf8_safe_sub(s, max - 1) .. "…" end
   return s
 end
 

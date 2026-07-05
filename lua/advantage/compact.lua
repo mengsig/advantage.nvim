@@ -76,24 +76,10 @@ function M.estimate_tokens(messages)
   return math.ceil(chars / 4)
 end
 
--- Truncate to at most `n` bytes without splitting a multi-byte UTF-8 character.
--- Byte-index string.sub can otherwise leave a dangling continuation byte, which
--- produces invalid UTF-8 and makes providers reject the request body.
-local function utf8_safe_sub(s, n)
-  if n <= 0 then return "" end
-  if n >= #s then return s end
-  -- If the byte immediately after the cut is a UTF-8 continuation byte
-  -- (0x80-0xBF), the cut landed mid-character; back off until it isn't.
-  while n > 0 do
-    local b = s:byte(n + 1)
-    if b and b >= 0x80 and b < 0xC0 then
-      n = n - 1
-    else
-      break
-    end
-  end
-  return s:sub(1, n)
-end
+-- Character-safe byte truncation. Shared with the tool-output and memory paths
+-- via util so every size cap backs off multi-byte UTF-8 characters identically —
+-- a mid-character cut makes the request body invalid UTF-8 and the provider 400s.
+local utf8_safe_sub = require("advantage.util").utf8_safe_sub
 
 local function trim_one_line(s, max)
   s = tostring(s or ""):gsub("%s+", " ")

@@ -251,7 +251,9 @@ function Agent:send(text, opts)
     if self.pending_permission then self.pending_permission("interrupt") end
     return
   end
-  if not self.title then self.title = text:gsub("%s+", " "):sub(1, 56) end
+  if not self.title then
+    self.title = require("advantage.util").utf8_safe_sub(text:gsub("%s+", " "), 56)
+  end
 
   self:_push_user_message(text, opts)
   self.cancelled = false

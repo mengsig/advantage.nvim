@@ -11,6 +11,7 @@
 local M = {}
 
 local uv = vim.uv or vim.loop
+local util = require("advantage.util")
 
 local function diag_available()
   return vim.diagnostic ~= nil and vim.lsp ~= nil
@@ -149,7 +150,7 @@ function M.render(bufnr, opts)
   for i = 1, math.min(#kept, max) do
     local d = kept[i]
     local msg = normalize(d.message)
-    if #msg > MAX_MSG then msg = msg:sub(1, MAX_MSG) .. "…" end
+    if #msg > MAX_MSG then msg = util.utf8_safe_sub(msg, MAX_MSG) .. "…" end
     local src = (d.source and d.source ~= "") and (" [" .. d.source .. "]") or ""
     lines[#lines + 1] = ("  L%d:%d %s: %s%s"):format(
       (d.lnum or 0) + 1,

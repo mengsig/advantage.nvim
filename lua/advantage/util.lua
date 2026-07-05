@@ -63,6 +63,94 @@ function M.contain(path, root, allow_outside)
   return abs
 end
 
+---Truncate `s` to at most `n` bytes without ever splitting a UTF-8 character.
+---A plain `s:sub(1, n)` can leave a dangling lead/continuation byte, which makes
+---the request body invalid UTF-8 and the provider rejects it (HTTP 400). If the
+---byte after the cut is a continuation byte (0x80–0xBF) the cut landed
+---mid-character, so back off until it doesn't. Returns a prefix `s[1..n']` with
+---`n' <= n` sitting on a character boundary. Use it for any size cap whose result
+---can reach a provider request body (tool output, compaction, memory); UI-only
+---labels use it too so a truncated glyph never renders as a replacement box.
+function M.utf8_safe_sub(s, n)
+  if n <= 0 then return "" end
+  if n >= #s then return s end
+  while n > 0 do
+    local b = s:byte(n + 1)
+    if b and b >= 0x80 and b < 0xC0 then
+      n = n - 1
+    else
+      break
+    end
+  end
+  return s:sub(1, n)
+end
+
+---Re-encode `s` as strictly valid UTF-8: every byte sequence that is not a
+---well-formed, non-surrogate, non-overlong code point is replaced with U+FFFD.
+---Provider JSON parsers reject invalid UTF-8 in the request body — surrogates
+---included, which a lenient server-side decode manufactures from a stray byte —
+---with an HTTP 400. Scrubbing the *encoded* body just before the request is the
+---last line of defence: it guarantees a well-formed request no matter what byte
+---source (a command emitting Latin-1, binary-ish tool output, a mis-sliced
+---string) introduced the bad bytes. JSON structure is pure ASCII, so this only
+---ever rewrites bytes inside string literals — it can't corrupt the JSON. A body
+---that is already valid is returned untouched after one linear scan (~1ms/MB,
+---JIT-compiled); the pure-ASCII `find` only short-circuits bodies with no
+---multi-byte content at all. Cheap next to the request it precedes.
+function M.scrub_utf8(s)
+  if not s:find("[\128-\255]") then return s end
+  local n, i, out, last = #s, 1, nil, 1
+  while i <= n do
+    local b = s:byte(i)
+    if b < 0x80 then
+      i = i + 1
+    else
+      local len, cp
+      if b >= 0xC2 and b <= 0xDF then
+        len, cp = 2, b - 0xC0
+      elseif b >= 0xE0 and b <= 0xEF then
+        len, cp = 3, b - 0xE0
+      elseif b >= 0xF0 and b <= 0xF4 then
+        len, cp = 4, b - 0xF0
+      end
+      local ok = false
+      if len and i + len - 1 <= n then
+        ok = true
+        for k = 1, len - 1 do
+          local c = s:byte(i + k)
+          if c < 0x80 or c > 0xBF then
+            ok = false
+            break
+          end
+          cp = cp * 64 + (c - 0x80)
+        end
+        if ok then
+          -- reject overlong, surrogate (U+D800–U+DFFF) and out-of-range points
+          if len == 2 then
+            ok = cp >= 0x80
+          elseif len == 3 then
+            ok = cp >= 0x800 and not (cp >= 0xD800 and cp <= 0xDFFF)
+          else
+            ok = cp >= 0x10000 and cp <= 0x10FFFF
+          end
+        end
+      end
+      if ok then
+        i = i + len
+      else
+        out = out or {}
+        if i > last then out[#out + 1] = s:sub(last, i - 1) end
+        out[#out + 1] = "\239\191\189" -- U+FFFD REPLACEMENT CHARACTER
+        i = i + 1
+        last = i
+      end
+    end
+  end
+  if not out then return s end
+  if last <= n then out[#out + 1] = s:sub(last, n) end
+  return table.concat(out)
+end
+
 ---Format a token count like `12.4k`.
 function M.fmt_tokens(n)
   n = n or 0
@@ -122,7 +210,11 @@ function M.request_sse(opts)
   local hdr_file = tmp .. "/h.txt"
 
   local f = assert(io.open(body_file, "w"))
-  f:write(opts.body)
+  -- Single UTF-8 choke point: every request body reaches the wire through this
+  -- one write, so scrubbing here guarantees no provider can send invalid UTF-8
+  -- (which the APIs reject as "not valid JSON: surrogates not allowed") — now and
+  -- for any future provider. Cheap: a no-op linear scan on an already-valid body.
+  f:write(M.scrub_utf8(opts.body))
   f:close()
 
   local function q(s)
