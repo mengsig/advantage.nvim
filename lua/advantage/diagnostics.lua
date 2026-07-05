@@ -68,10 +68,24 @@ local function normalize(msg)
   return (vim.trim(tostring(msg or "")):gsub("%s+", " "))
 end
 
----An already-loaded buffer whose name is `path` (absolute), or nil.
+---An already-loaded buffer whose name is `path` (absolute), or nil. Matches on the
+---exact name first (cheap), then on realpath-equality — so an editor buffer opened
+---via a symlink, a differently-normalized path, or a relative `:edit` still counts
+---as "already open". This matters for speed: reusing the user's WARM buffer (whose
+---server has the file open and indexed) makes an LSP query near-instant, whereas
+---missing the match cold-loads a duplicate buffer and pays the attach/open latency
+---again — the difference between a snappy nav call and one that times out.
 local function loaded_bufnr(path)
   for _, b in ipairs(vim.api.nvim_list_bufs()) do
     if vim.api.nvim_buf_is_loaded(b) and vim.api.nvim_buf_get_name(b) == path then return b end
+  end
+  local target = uv.fs_realpath(path)
+  if not target then return nil end
+  for _, b in ipairs(vim.api.nvim_list_bufs()) do
+    if vim.api.nvim_buf_is_loaded(b) then
+      local name = vim.api.nvim_buf_get_name(b)
+      if name ~= "" and uv.fs_realpath(name) == target then return b end
+    end
   end
   return nil
 end
@@ -381,5 +395,12 @@ function M.report(path, severity, cb)
     cb(M.workspace(severity))
   end
 end
+
+-- Exported for the LSP navigation module (advantage.lsp), which reuses the same
+-- buffer-load, attach-detection and filetype→server plumbing so both features
+-- share one implementation of that subtle logic.
+M.ensure_bufnr = ensure_bufnr
+M.loaded_bufnr = loaded_bufnr
+M.server_available_for_ft = server_available_for_ft
 
 return M

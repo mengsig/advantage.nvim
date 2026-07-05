@@ -23,7 +23,7 @@ local function default_system_prompt()
   local cwd = uv.cwd()
   local branch = git_branch(cwd)
   local lines = {
-    "You are advantage, an expert coding agent running inside Neovim, working directly in the user's project.",
+    "You are advantage, an expert coding agent running inside Neovim, working directly in the user's project. You have access to super powerful LSP based tools, you must use these to reduce token cost and for you to have better context and understanding -- if it's the right decision: diagnostics, document_symbols, goto_definition, find_references, hover, workspace_symbol. Secondly, you have a memory system that you must take advantage of.",
     "",
     "Environment:",
     "- Project root: " .. cwd,
@@ -34,7 +34,7 @@ local function default_system_prompt()
     "",
     "How to work:",
     "- Use the tools to read, search, edit and run things. Paths are relative to the project root.",
-    "- Gather context before acting: read the files and search the code rather than guessing. Batch independent reads/searches in one step, and delegate wide fan-out investigations to the read-only `sub_agent` tool.",
+    "- Gather context before acting: explore the code rather than guessing. Batch independent look-ups in one step, and delegate wide fan-out investigations to the read-only `sub_agent` tool.",
     "- Read a file before editing it. Prefer edit_file for surgical changes; write_file only for new or fully rewritten files.",
     "- Match the surrounding code's style, naming and conventions. Don't add comments that just restate the code.",
     "- After a code change, verify it when a cheap check exists (build, test, lint, syntax check), and fix what you broke.",
@@ -45,6 +45,32 @@ local function default_system_prompt()
     "Style: default to concise, to-the-point user-facing output unless the user asks for detail. Lead with what you did or found; skip filler, hidden reasoning, and restating the request. If a task is ambiguous, state your assumption and proceed rather than stalling.",
   })
   return table.concat(lines, "\n")
+end
+
+---Steer toward the LSP navigation tools. Injected ONLY when they're actually in
+---the schema (config on + this Neovim has vim.lsp) — telling the model to prefer
+---tools that aren't present would just waste turns. This is the real mechanism
+---that makes the model *prefer* semantic navigation over its default grep/read
+---habit: the tool descriptions alone are too weak to overcome that prior. It
+---rides the cached system prefix, so it costs ~10% after turn one.
+local LSP_GUIDE = table.concat({
+  "Semantic code navigation — you have language-server tools; make them your DEFAULT way to understand code, not a fallback after grep. They resolve MEANING (the exact symbol, its real definition, every true call site, its type) where grep only matches text — so they are both more reliable AND fewer steps. The decision procedure:",
+  "- Once you've located a symbol (a grep to FIND an identifier across the repo is fine): to see where it's defined → `goto_definition`; to see everything that uses it before you touch it → `find_references` (grep misses call sites and matches comments/strings; this doesn't); its type/signature → `hover`.",
+  "- Landing in an unfamiliar file → `document_symbols` (or `read_file` with outline=true) to see its shape, instead of reading it top to bottom. This ALWAYS works fast — it falls back to a local treesitter parse — even if the language server is slow or times out on other navigation, so reach for it freely. Tracing dataflow/an action/an event across files → `find_references` on the symbol, not a chain of full-file reads.",
+  "- Locate a symbol you can't place → `workspace_symbol` (match the bare name like `new`, not `M.new`; distinctive names work best — it shows project matches first).",
+  "- Fall back to grep/read for non-symbol text (strings, comments, config, TODOs), for languages with no server, and when an indirect/dynamic reference doesn't resolve. If a tool reports no server is attached, the language isn't set up for navigation — use grep/read for the rest of the session.",
+}, "\n")
+
+---The LSP guide text when the navigation tools are live for this session, else nil.
+---Gated exactly like the tools themselves (config.tools.lsp + vim.lsp presence),
+---and — crucially — on nothing that changes mid-session, so the cached system
+---prefix stays byte-identical turn to turn. Shared by the main prompt and sub-agents.
+function M.lsp_guide()
+  local tcfg = (config.options.tools or {}).lsp
+  if type(tcfg) == "table" and tcfg.enabled == false then return nil end
+  local ok, lsp = pcall(require, "advantage.lsp")
+  if not (ok and lsp.available()) then return nil end
+  return LSP_GUIDE
 end
 
 ---Instructions for the memory tools. Only injected while memory is enabled —
@@ -58,12 +84,12 @@ local MEMORY_GUIDE = table.concat({
   "- A skill is a reusable procedure. When a listed skill's description matches the task, call `use_skill` to load its full steps before doing that task. Codify a genuinely reusable multi-step procedure with `save_skill`.",
 }, "\n")
 
----The system prompt as an ordered list of labeled parts. Each entry is
----`{ label = "<short name>", text = "<bytes>", is_memory? = true }`.
----`M.system_prompt` joins the `text` fields with "\n\n"; `/context preview` uses
----the labels to attribute per-section token cost and expands the memory part.
----@param memory_block? string frozen block to use verbatim (see M.system_prompt)
-function M.system_prompt_parts(memory_block)
+---The base instructions only — no memory guide, no learned memory block. This is
+---what a read-only sub-agent gets: it can't `remember`/`use_skill`, and shipping
+---the parent's full repo memory to every fan-out worker (5× on a parallel batch,
+---cold-cached) is exactly the cost leak sub-agents exist to avoid. Honors a user
+---`system_prompt` override (string/function) just like the main prompt does.
+function M.base_system_prompt()
   local cfg = config.options.system_prompt
   local base = default_system_prompt()
   if type(cfg) == "string" then
@@ -71,7 +97,20 @@ function M.system_prompt_parts(memory_block)
   elseif type(cfg) == "function" then
     base = cfg(base)
   end
+  return base
+end
+
+---The system prompt as an ordered list of labeled parts. Each entry is
+---`{ label = "<short name>", text = "<bytes>", is_memory? = true }`.
+---`M.system_prompt` joins the `text` fields with "\n\n"; `/context preview` uses
+---the labels to attribute per-section token cost and expands the memory part.
+---@param memory_block? string frozen block to use verbatim (see M.system_prompt)
+function M.system_prompt_parts(memory_block)
+  local base = M.base_system_prompt()
   local parts = { { label = "base instructions", text = base } }
+  -- Steer toward semantic navigation (only when those tools are actually live).
+  local lsp = M.lsp_guide()
+  if lsp then parts[#parts + 1] = { label = "lsp guide", text = lsp } end
   -- Append the memory-tool instructions plus the per-repo learned context and
   -- skills index. It rides the cached system prefix, so after the first turn it
   -- costs ~10%, and it saves tokens by sparing the model repeated read/grep
@@ -122,6 +161,10 @@ function M.new(opts)
   self.active_tools = {} -- tool_use_id -> cancellable handle returned by a running tool
   self.snapshots = {} -- abs path -> content before the agent's first touch (false = new file)
   self.turn_changed = {} -- abs paths changed during the current turn
+  -- fresh conversation: reset the LSP usage-nudge streak so a new chat starts clean
+  pcall(function()
+    require("advantage.lsp").reset_session()
+  end)
   -- fresh conversation: allow skills to be hinted again, restart savings math,
   -- and seed the on-disk memory file the first time this repo is used
   pcall(function()
@@ -251,9 +294,7 @@ function Agent:send(text, opts)
     if self.pending_permission then self.pending_permission("interrupt") end
     return
   end
-  if not self.title then
-    self.title = require("advantage.util").utf8_safe_sub(text:gsub("%s+", " "), 56)
-  end
+  if not self.title then self.title = require("advantage.util").utf8_safe_sub(text:gsub("%s+", " "), 56) end
 
   self:_push_user_message(text, opts)
   self.cancelled = false

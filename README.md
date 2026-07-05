@@ -13,6 +13,12 @@ your editor, feeds results back, and repeats until the task is done.
   `find_files`, `list_dir`, `diagnostics`, `sub_agent`, `web_search` — executed
   inside Neovim, so edited buffers reload live, edits get an **LSP/linter feedback
   loop**, and every mutation is gated behind a permission card with a real diff.
+- **Semantic code navigation (LSP).** `document_symbols`, `goto_definition`,
+  `find_references`, `hover`, `workspace_symbol` — the model traverses your code
+  through the **language servers your editor already runs**, finding a definition,
+  every call site, a file's outline or a type signature in a handful of tokens
+  instead of grepping and reading whole files. This is the single biggest token
+  saver here and something a CLI harness structurally can't do.
 - **A UI that respects your colorscheme.** No hardcoded palette: the accent,
   washes and dim tones are derived from *your* theme at runtime. Quiet lowercase
   headers, animated tool cards, dimmed streaming reasoning, token/cost meta per
@@ -39,6 +45,8 @@ Added the flag and threaded it through the formatter…
   and/or [`codex`](https://github.com/openai/codex) CLI — or
   `$ANTHROPIC_API_KEY` / `$OPENAI_API_KEY`
 - `ripgrep` (optional, for fast `grep` / `find_files`)
+- a language server per language (optional but recommended — powers the semantic
+  navigation tools and the edit diagnostics loop; see the suggested list below)
 
 ## Install
 
@@ -182,6 +190,115 @@ runs in one of two modes:
   call and use the free heuristic instead for a single invocation, or set
   `context.compact_mode = "heuristic"` to make that the default everywhere.
 
+**Semantic navigation (LSP).** advantage exposes the language servers your editor
+already runs as read-only tools, so the agent navigates code *semantically*
+instead of grepping and reading whole files:
+
+- `document_symbols` — a file's outline (functions/classes/methods + lines, with
+  signatures) without its text. Also reachable as `read_file` with `outline=true`.
+  Falls back to a **local Treesitter parse** when the language server is slow,
+  still indexing, or absent — so an outline is always instant and never depends on
+  a server that's timing out (the classic big-TypeScript-project failure mode).
+- `goto_definition` — jump from a use of a symbol to where it's defined.
+- `find_references` — every call site of a symbol across the project.
+- `hover` — the type signature and doc for a symbol at a position.
+- `workspace_symbol` — find a symbol by name anywhere in the repo.
+
+Each hop costs a handful of tokens instead of a grep-plus-read-the-results loop —
+the biggest token lever in the harness, and one a CLI-only agent structurally
+can't pull. All are read-only (no permission card) and automatically available to
+sub-agents. Requests are async with a bounded timeout, so a slow server never
+freezes the editor — and because the *first* request to a freshly-opened file
+often times out while the server builds its initial index, a timed-out request
+**auto-retries** (with an extended window) rather than costing the model a turn.
+`workspace_symbol` shows **in-project matches first** and collapses stdlib/dependency
+hits to a count (a real workspace index is dominated by library symbols — noise for
+navigating your repo). Positions are offset-encoding-correct (utf-8/utf-16/utf-32),
+so navigation is precise even on lines with multi-byte characters.
+
+The harness doesn't just *offer* these tools — it **steers** the model to prefer
+them: a guidance block is injected into the (cached) system prompt telling it to
+reach for semantic navigation first on any symbol-level question, and to fall back
+to `grep`/`read_file` only when no server is attached or the target is plain text.
+That steer is added **only when the tools are actually live** (enabled and this
+Neovim has `vim.lsp`), so a setup without language servers never sees advice for
+tools it can't run — and the whole tool set is likewise hidden from the model's
+schema when `tools.lsp.enabled = false` or `vim.lsp` is absent. Because a frozen
+system-prompt steer loses salience as a session grows (the model pattern-matches
+its own recent grep/read behavior), a throttled **in-band nudge** re-surfaces the
+tools from a `grep`/`read_file` result when the model has been exploring code
+without them — but only while a server is actually running, and silenced the
+moment it uses one.
+
+Two failure modes are handled explicitly, because both otherwise trained the model
+to abandon LSP silently: **(1) slow attach** — a heavy server (tsserver/vtsls in a
+monorepo, jdtls, rust-analyzer) can take seconds just to attach to a freshly-opened
+file, so when a server *is* configured for the filetype the tool waits
+`attach_grace_configured_ms` for it (and fails fast when none is configured); and
+**(2) no server at all** — instead of a silent grep-fallback, the tool tells **you**
+(once per filetype, in the transcript) that the language isn't set up for
+navigation, so you know to install a server rather than wondering why it keeps
+grepping.
+
+These tools only work as well as the language server behind them. Install and
+enable a server for each language you work in (via
+[`nvim-lspconfig`](https://github.com/neovim/nvim-lspconfig) +
+[`mason.nvim`](https://github.com/williamboman/mason.nvim), or your own
+`vim.lsp.enable` setup). Suggested servers for full-language support:
+
+| language              | server (binary / mason name)                              |
+| --------------------- | --------------------------------------------------------- |
+| Python                | `pyright` (or `basedpyright`) · `ruff` for lint/format    |
+| C / C++ / Objective-C | `clangd`                                                  |
+| Rust                  | `rust-analyzer`                                            |
+| Zig                   | `zls`                                                      |
+| Go                    | `gopls`                                                   |
+| C# / .NET             | `omnisharp` (or `csharp-ls`)                               |
+| JavaScript / TS / TSX | `vtsls` (or `typescript-language-server`)                 |
+| Lua                   | `lua-language-server` (`lua_ls`)                           |
+| Java                  | `jdtls`                                                    |
+| Ruby                  | `ruby-lsp` (or `solargraph`)                               |
+| PHP                   | `intelephense` (or `phpactor`)                             |
+| Kotlin                | `kotlin-language-server`                                   |
+| Swift                 | `sourcekit-lsp`                                            |
+| Bash / shell          | `bash-language-server`                                     |
+| HTML / CSS / JSON     | `vscode-langservers-extracted`                            |
+| YAML                  | `yaml-language-server`                                     |
+| TOML                  | `taplo`                                                    |
+| Elixir                | `elixir-ls` (or `lexical`)                                 |
+| Haskell               | `haskell-language-server`                                  |
+| Scala                 | `metals`                                                   |
+| Terraform             | `terraform-ls`                                             |
+| Markdown              | `marksman`                                                 |
+
+Tune with `tools = { lsp = { enabled = true, timeout_ms = 4000, attach_grace_ms
+= 1000, max_results = 60 } }`. `attach_grace_ms` is how long a request waits for a
+server to attach to a freshly-opened file; `max_results` caps symbols/references
+returned per call.
+
+minimum install
+```lua
+    ◍ marksman (keywords: markdown)
+    ◍ codebook (keywords: c, css, go, html, haskell, java, javascript, lua, markdown, php, plain, python, ruby, rust, toml, typescript)
+    ◍ yaml-language-server yamlls (keywords: yaml)
+    ◍ omnisharp (keywords: c#)
+    ◍ ast-grep ast_grep (keywords: c, c++, rust, go, java, python, c#, javascript, jsx, typescript, html, css, kotlin, dart, lua)
+    ◍ rust-analyzer rust_analyzer (keywords: rust)
+    ◍ bash-language-server bashls (keywords: bash, csh, ksh, sh, zsh)
+    ◍ biome (keywords: json, javascript, typescript)
+    ◍ clangd (keywords: c, c++)
+    ◍ lua-language-server lua_ls (keywords: lua)
+    ◍ pyright (keywords: python)
+    ◍ stylua (keywords: lua, luau)
+    ◍ zls (keywords: zig)
+```
+
+**Sharper search.** `grep` takes an `output_mode`: `content` (default,
+`file:line:text`), `files_with_matches` (just the paths — cheapest when you only
+need locations), or `count` (per-file match counts), plus `head_limit` to cap
+output lines and `ignore_case`. The model asks for exactly the shape it needs
+instead of always paying for full match text.
+
 **Diagnostics feedback loop.** After the agent edits a file, the **newly-introduced**
 LSP/linter diagnostics are appended straight to that tool's result, so the model
 sees compile/type/lint errors and self-corrects instead of guessing a build
@@ -206,7 +323,14 @@ their network latency instead of one at a time (`subagents.parallel`). Set
 commands and git read-only subcommands only; output redirection, command
 substitution and mutating flags are rejected. It is off by default because bash
 isn't path-contained (a sub-agent could read anything your user can, with no
-permission prompt), so enable it only in repos you trust.
+permission prompt), so enable it only in repos you trust. Sub-agents run on a
+**lean context**: they get the base instructions (and the read-only tool set,
+including the LSP navigation tools) but **not** the repo-memory block or skills
+index — a scout can't `remember`/`use_skill` anyway, and re-shipping the full
+learned context to every worker (and to each worker of a parallel fan-out,
+cold-cached) is exactly the token leak fan-out exists to avoid. Their returned
+report is size-capped before it's spliced into the parent transcript, so a chatty
+worker can't bloat the parent's context.
 
 **Web search.** A `web_search` tool backed by the [Brave Search
 API](https://api.search.brave.com) — one lightweight GET request, no
@@ -346,6 +470,18 @@ require("advantage").setup({
       wait_ms = 1500,            -- ceiling waiting for the LSP to re-analyze
       attach_grace_ms = 250,     -- wait for a server to attach before giving up
       notify_missing = true,     -- once-per-filetype "install an LSP" nudge to you
+    },
+    lsp = {                      -- semantic navigation tools (document_symbols,
+                                 -- goto_definition, find_references, hover,
+                                 -- workspace_symbol); hidden from the schema when
+                                 -- disabled or this Neovim has no vim.lsp
+      enabled = true,
+      timeout_ms = 4000,         -- per-request ceiling before a timeout (extended on retry)
+      max_attempts = 2,          -- auto-retry a TIMED-OUT request (server still indexing)
+      attach_grace_ms = 1000,    -- wait for attach when NO server is configured (fail fast)
+      attach_grace_configured_ms = 4000, -- but wait longer when one IS configured but slow
+                                 -- to attach (tsserver/vtsls/jdtls in a big project)
+      max_results = 60,          -- cap on symbols / references / matches per call
     },
     web_search = {               -- Brave Search API; hidden from the schema with no key
       enabled = true,

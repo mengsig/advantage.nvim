@@ -333,7 +333,10 @@ do
     -- A non-positive limit must not yield an empty page that resumes at the same
     -- offset (a paging livelock); limit is floored to 1.
     local zp = assert(run("read_file", { path = "big.txt", limit = 0 }))
-    check(zp:find("1→", 1, true) and not zp:find("continue with offset=1", 1, true), "read_file floors a non-positive limit to 1 (no livelock)")
+    check(
+      zp:find("1→", 1, true) and not zp:find("continue with offset=1", 1, true),
+      "read_file floors a non-positive limit to 1 (no livelock)"
+    )
 
     -- Belt-and-suspenders: an encoded body carrying genuinely invalid bytes (a
     -- command emitting Latin-1) is scrubbed to valid UTF-8 instead of 400ing.
@@ -3023,6 +3026,841 @@ do
   memory.remember("A brand new post-freeze fact delta echo foxtrot", "Notes")
   local dblob = table.concat((preview.build(ag)), "\n")
   check(dblob:find("frozen at", 1, true) ~= nil, "preview flags frozen-vs-disk drift after a mid-session remember")
+end
+
+-- 4-lsp. LSP navigation tools --------------------------------------------------
+
+section("lsp navigation (pure formatters)")
+do
+  local lsp = require("advantage.lsp")
+
+  -- byte column → offset-encoding conversion (version-safe: 0.10 has only the
+  -- 2-arg str_utfindex, 0.11+ the encoding form; both yield the same count).
+  -- "  résumé = foo": 11 characters precede "foo" but 13 bytes (é is 2 bytes).
+  check(lsp._utf_offset("  résumé = foo", 13, "utf-16") == 11, "utf_offset converts a byte column to utf-16")
+  check(lsp._utf_offset("  résumé = foo", 13, "utf-8") == 13, "utf_offset passes a utf-8 byte column through")
+  check(lsp._utf_offset("abc", 99, "utf-16") == 3, "utf_offset clamps a past-end byte column")
+  -- Astral-plane (non-BMP) glyph: utf-16 counts a surrogate pair as 2 units,
+  -- utf-32 as 1 — so these diverge, which BMP-only text can't test. This guards
+  -- the Neovim 0.10 path where the 2-arg str_utfindex returns (utf-32, utf-16)
+  -- and the utf-16 value must be selected (not the utf-32 first return).
+  check(
+    lsp._utf_offset("😀 x = foo", 9, "utf-16") == 7,
+    "utf_offset returns utf-16 (not utf-32) past an astral glyph"
+  )
+  check(lsp._utf_offset("😀 x = foo", 9, "utf-32") == 6, "utf_offset returns utf-32 distinctly from utf-16")
+  check(lsp._utf_offset("😀 x = foo", 9, "utf-8") == 9, "utf_offset passes an astral utf-8 byte column through")
+
+  -- position_params: the byte column is encoded with EACH client's own
+  -- offset_encoding, so a buffer with mixed-encoding clients stays correct.
+  local posinfo = { line0 = 0, byte_col = 9, text = "😀 x = foo" } -- byte 9 = before "foo"
+  local function char_for(pp, client)
+    local params = type(pp) == "function" and pp(client) or pp
+    return params.position.character
+  end
+  local pp = lsp._position_params("file:///x", posinfo, { { offset_encoding = "utf-16" } }, nil)
+  if type(pp) == "function" then
+    check(
+      char_for(pp, { offset_encoding = "utf-16" }) == 7,
+      "position_params encodes utf-16 per client (0.11+ function form)"
+    )
+    check(
+      char_for(pp, { offset_encoding = "utf-8" }) == 9,
+      "position_params encodes utf-8 per client (mixed-encoding safe)"
+    )
+  else
+    check(char_for(pp, nil) == 7, "position_params bakes the primary client's encoding (0.10 fallback)")
+  end
+  local pp2 = lsp._position_params(
+    "file:///x",
+    { line0 = 3, byte_col = 0, text = "foo" },
+    { { offset_encoding = "utf-16" } },
+    { context = { includeDeclaration = true } }
+  )
+  local params2 = type(pp2) == "function" and pp2({ offset_encoding = "utf-16" }) or pp2
+  check(
+    params2.textDocument.uri == "file:///x" and params2.position.line == 3,
+    "position_params sets textDocument + 0-based line"
+  )
+  check(
+    params2.context and params2.context.includeDeclaration == true,
+    "position_params merges extra request params (references context)"
+  )
+
+  -- documentSymbol formatting: hierarchical (with children) + flat siblings
+  local hier = {
+    {
+      name = "Foo",
+      kind = 5, -- Class
+      range = { start = { line = 0, character = 0 } },
+      selectionRange = { start = { line = 0, character = 6 } },
+      children = {
+        { name = "bar", kind = 6, selectionRange = { start = { line = 1, character = 2 } }, detail = "fun(a)" },
+      },
+    },
+    { name = "baz", kind = 12, selectionRange = { start = { line = 9, character = 0 } } }, -- Function
+  }
+  local out = lsp._format_symbols("m.lua", hier, 60)
+  check(out:find("m.lua — 3 symbols", 1, true), "format_symbols counts nested symbols")
+  check(out:find("Class Foo  L1", 1, true), "format_symbols renders a top-level symbol with kind + line")
+  check(out:find("  Method bar  L2  fun(a)", 1, true), "format_symbols indents children and shows their detail")
+  check(out:find("Function baz  L10", 1, true), "format_symbols renders a flat sibling")
+  check(lsp._format_symbols("x", {}, 60) == nil, "format_symbols returns nil when there are no symbols")
+
+  local many = {}
+  for i = 1, 80 do
+    many[i] = { name = "s" .. i, kind = 12, selectionRange = { start = { line = i - 1, character = 0 } } }
+  end
+  check(
+    lsp._format_symbols("m", many, 60):find("… +20 more symbol", 1, true),
+    "format_symbols caps at max with a +N note"
+  )
+
+  -- location normalization + rendering (Location / LocationLink / list, deduped)
+  local locroot = vim.fn.tempname()
+  vim.fn.mkdir(locroot, "p")
+  vim.fn.writefile({ "line one", "target line here", "third" }, locroot .. "/f.lua")
+  local furi = vim.uri_from_fname(locroot .. "/f.lua")
+  local locs = lsp._collect_locations({
+    [1] = { result = { uri = furi, range = { start = { line = 1, character = 4 } } } }, -- single Location
+    [2] = { result = { { uri = furi, range = { start = { line = 1, character = 4 } } } } }, -- duplicate in a list
+    [3] = { result = { { targetUri = furi, targetSelectionRange = { start = { line = 2, character = 0 } } } } }, -- LocationLink
+  })
+  check(#locs == 2, "collect_locations normalizes Location/LocationLink/list and dedups")
+  local ltxt = lsp._format_locations("references to x", locs, locroot, 60)
+  check(ltxt:find("references to x — 2 results", 1, true), "format_locations headers the count")
+  check(ltxt:find("f.lua:2:5  target line here", 1, true), "format_locations shows relpath:line:col + the line text")
+
+  -- hover contents extraction across the three LSP shapes
+  check(
+    lsp._hover_text({ kind = "markdown", value = "**int** add(int)" }) == "**int** add(int)",
+    "hover_text reads MarkupContent"
+  )
+  check(lsp._hover_text("plain string") == "plain string", "hover_text reads a MarkedString string")
+  check(
+    lsp._hover_text({ { language = "lua", value = "sig" }, "note" }) == "sig\nnote",
+    "hover_text joins a MarkedString array"
+  )
+  check(lsp._hover_text({ value = "" }) == nil, "hover_text returns nil for empty contents")
+
+  -- workspace symbol formatting (with and without a range)
+  local ws = lsp._collect_ws({
+    [1] = {
+      result = {
+        { name = "add", kind = 12, location = { uri = furi, range = { start = { line = 2, character = 0 } } } },
+        { name = "addr", kind = 13, location = { uri = furi } }, -- WorkspaceSymbol without a range
+      },
+    },
+  })
+  check(#ws == 2, "collect_ws merges workspace symbols")
+  local wtxt = lsp._format_ws("add", ws, locroot, 60)
+  check(wtxt:find('workspace symbols for "add" — 2 matches', 1, true), "format_ws headers the query + count")
+  check(wtxt:find("Function add  f.lua:3", 1, true), "format_ws renders a symbol with its location")
+  check(wtxt:find("f.lua:?", 1, true), "format_ws tolerates a symbol with no range")
+
+  -- project-first filtering: stdlib/dependency matches (outside root) are the
+  -- dominant noise in a real workspace index — show project symbols, collapse
+  -- the rest to a count so the model isn't buried under library hits.
+  local ws_mixed = lsp._collect_ws({
+    [1] = {
+      result = {
+        { name = "add", kind = 12, location = { uri = furi, range = { start = { line = 2, character = 0 } } } }, -- in project
+        { name = "add", kind = 12, location = { uri = vim.uri_from_fname("/usr/include/stdlib.h") } }, -- external
+        { name = "add", kind = 12, location = { uri = vim.uri_from_fname("/usr/lib/runtime.lua") } }, -- external
+      },
+    },
+  })
+  local wm = lsp._format_ws("add", ws_mixed, locroot, 60)
+  check(wm:find("1 match in this project", 1, true), "format_ws shows in-project matches first, scoped")
+  check(
+    wm:find("+2 match", 1, true) and wm:find("external/stdlib", 1, true),
+    "format_ws collapses external/stdlib matches to a count"
+  )
+  check(not wm:find("stdlib.h", 1, true), "format_ws hides the external symbol rows entirely (pure noise)")
+  local ws_ext = lsp._collect_ws({
+    [1] = { result = { { name = "q", kind = 12, location = { uri = vim.uri_from_fname("/usr/include/x.h") } } } },
+  })
+  local we = lsp._format_ws("q", ws_ext, locroot, 60)
+  check(
+    we:find('workspace symbols for "q" — 1 match', 1, true) and we:find("x.h", 1, true),
+    "format_ws falls back to external matches when nothing is in-project"
+  )
+end
+
+section("lsp navigation (tool flow, faked server)")
+do
+  local lsp = require("advantage.lsp")
+  local tools = require("advantage.tools")
+  local config = require("advantage.config")
+  local diagnostics = require("advantage.diagnostics")
+  config.options.tools.lsp = vim.deepcopy(config.defaults.tools.lsp)
+
+  -- registration + gating
+  local want = { document_symbols = 1, goto_definition = 1, find_references = 1, hover = 1, workspace_symbol = 1 }
+  local in_schema = {}
+  for _, s in ipairs(tools.schemas()) do
+    if want[s.name] then in_schema[s.name] = true end
+  end
+  check(vim.tbl_count(in_schema) == 5, "all five LSP tools are in the schema when enabled")
+  config.options.tools.lsp.enabled = false
+  local any = false
+  for _, s in ipairs(tools.schemas()) do
+    if want[s.name] then any = true end
+  end
+  check(not any, "LSP tools are hidden when tools.lsp.enabled = false")
+  config.options.tools.lsp.enabled = true
+
+  -- read-only sub-agents inherit them (safe tools)
+  local subagent = require("advantage.subagent")
+  local sub_has = {}
+  for _, s in ipairs(subagent._readonly_tools()) do
+    if want[s.name] then sub_has[s.name] = true end
+  end
+  check(vim.tbl_count(sub_has) == 5, "LSP tools are available to read-only sub-agents")
+
+  -- The system prompt STEERS the model toward these tools (this is what makes it
+  -- PREFER them over its grep/read prior) — but only when they're actually live.
+  local agent_mod = require("advantage.agent")
+  check(agent_mod.lsp_guide() ~= nil, "lsp_guide is present when the tools are enabled")
+  local sp_labels = {}
+  for _, p in ipairs(agent_mod.system_prompt_parts(nil)) do
+    sp_labels[p.label] = p.text
+  end
+  check(sp_labels["lsp guide"] ~= nil, "the system prompt includes an 'lsp guide' part when LSP is live")
+  check(
+    agent_mod.system_prompt(nil):find("goto_definition", 1, true) ~= nil,
+    "the system prompt names the LSP tools so the model prefers them"
+  )
+  config.options.tools.lsp.enabled = false
+  check(agent_mod.lsp_guide() == nil, "lsp_guide is nil (no steer) when the LSP tools are disabled")
+  local off_has = false
+  for _, p in ipairs(agent_mod.system_prompt_parts(nil)) do
+    if p.label == "lsp guide" then off_has = true end
+  end
+  check(not off_has, "the system prompt omits the LSP steer when the tools are disabled (no dangling advice)")
+  config.options.tools.lsp.enabled = true
+
+  -- Full end-to-end tool flow with a FAKED language server: monkeypatch client
+  -- discovery, the buffer loader, and the request seam so every tool runs
+  -- deterministically in CI (no real server needed; clangd validates the wire
+  -- shape separately in dev).
+  local proot = vim.fn.tempname()
+  vim.fn.mkdir(proot, "p")
+  vim.fn.writefile({ "function add(a, b)", "  return a + b", "end", "", "local r = add(1, 2)" }, proot .. "/m.lua")
+  local buf = vim.fn.bufadd(proot .. "/m.lua")
+  vim.fn.bufload(buf)
+  vim.bo[buf].filetype = "lua"
+  local muri = vim.uri_from_bufnr(buf)
+
+  local fake_client = {
+    offset_encoding = "utf-16",
+    server_capabilities = {
+      documentSymbolProvider = true,
+      definitionProvider = true,
+      referencesProvider = true,
+      hoverProvider = true,
+      workspaceSymbolProvider = true,
+    },
+    attached_buffers = { [buf] = true },
+  }
+  local orig_get, orig_ensure, orig_req = vim.lsp.get_clients, diagnostics.ensure_bufnr, lsp._buf_request_all
+  ---@diagnostic disable-next-line: duplicate-set-field
+  vim.lsp.get_clients = function()
+    return { fake_client }
+  end
+  diagnostics.ensure_bufnr = function()
+    return buf
+  end
+  lsp._buf_request_all = function(_, method, _, handler)
+    local result
+    if method == "textDocument/documentSymbol" then
+      result = { { name = "add", kind = 12, selectionRange = { start = { line = 0, character = 9 } } } }
+    elseif method == "textDocument/definition" then
+      result = { { uri = muri, range = { start = { line = 0, character = 9 } } } }
+    elseif method == "textDocument/references" then
+      result = {
+        { uri = muri, range = { start = { line = 0, character = 9 } } },
+        { uri = muri, range = { start = { line = 4, character = 10 } } },
+      }
+    elseif method == "textDocument/hover" then
+      result = { contents = { kind = "markdown", value = "function add(a, b): number" } }
+    elseif method == "workspace/symbol" then
+      result =
+        { { name = "add", kind = 12, location = { uri = muri, range = { start = { line = 0, character = 9 } } } } }
+    end
+    handler({ [1] = { result = result } })
+    return function() end
+  end
+
+  local ctx = { cwd = proot }
+  local function run(name, input)
+    local done, out, err = false, nil, nil
+    tools.get(name).run(input, ctx, function(o, e)
+      out, err, done = o, e, true
+    end)
+    vim.wait(3000, function()
+      return done
+    end, 10)
+    return out, err
+  end
+
+  check(
+    assert(run("document_symbols", { path = "m.lua" })):find("Function add  L1", 1, true),
+    "document_symbols tool returns the outline"
+  )
+  local defout = assert(run("goto_definition", { path = "m.lua", line = 5, symbol = "add" }))
+  check(
+    defout:find("definition of add", 1, true) and defout:find("m.lua:1:10", 1, true),
+    "goto_definition resolves a use to its definition"
+  )
+  check(
+    assert(run("find_references", { path = "m.lua", line = 1, symbol = "add" })):find(
+      "references to add — 2 results",
+      1,
+      true
+    ),
+    "find_references returns every call site"
+  )
+  check(
+    assert(run("hover", { path = "m.lua", line = 1, symbol = "add" })):find("function add(a, b): number", 1, true),
+    "hover returns the signature"
+  )
+  check(
+    assert(run("workspace_symbol", { query = "add" })):find("Function add  m.lua:1", 1, true),
+    "workspace_symbol finds the symbol by name"
+  )
+  check(
+    assert(run("read_file", { path = "m.lua", outline = true })):find("Function add  L1", 1, true),
+    "read_file outline=true delegates to the symbol layer"
+  )
+
+  local _, e_missing = run("goto_definition", { path = "m.lua", line = 2, symbol = "nonexistent_sym" })
+  check(e_missing == true, "goto_definition errors when the symbol isn't found on or near the line")
+  local _, e_escape = run("document_symbols", { path = "../escape.lua" })
+  check(e_escape == true, "LSP tools reject a path outside the project root")
+
+  vim.lsp.get_clients = orig_get
+  diagnostics.ensure_bufnr = orig_ensure
+  lsp._buf_request_all = orig_req
+  pcall(vim.api.nvim_buf_delete, buf, { force = true })
+end
+
+section("lsp request auto-retry (cold-start warming)")
+do
+  -- Real-world: the FIRST request to a freshly-opened large file times out while
+  -- the server does its initial index; a retry (server now warm) is instant. The
+  -- request layer auto-retries a TIMEOUT (never a hard error) instead of making
+  -- the model burn a turn doing it by hand.
+  local lsp = require("advantage.lsp")
+  local tools = require("advantage.tools")
+  local config = require("advantage.config")
+  local diagnostics = require("advantage.diagnostics")
+  config.options.tools.lsp = vim.deepcopy(config.defaults.tools.lsp)
+  config.options.tools.lsp.timeout_ms = 80 -- keep the test fast
+  config.options.tools.lsp.attach_grace_ms = 0
+  config.options.tools.lsp.max_attempts = 2
+
+  local proot = vim.fn.tempname()
+  vim.fn.mkdir(proot, "p")
+  vim.fn.writefile({ "local M = {}", "return M" }, proot .. "/r.lua")
+  local buf = vim.fn.bufadd(proot .. "/r.lua")
+  vim.fn.bufload(buf)
+  vim.bo[buf].filetype = "lua"
+  local fake_client = {
+    offset_encoding = "utf-16",
+    server_capabilities = { documentSymbolProvider = true },
+    attached_buffers = { [buf] = true },
+  }
+  local orig_get, orig_ensure, orig_req = vim.lsp.get_clients, diagnostics.ensure_bufnr, lsp._buf_request_all
+  ---@diagnostic disable-next-line: duplicate-set-field
+  vim.lsp.get_clients = function()
+    return { fake_client }
+  end
+  diagnostics.ensure_bufnr = function()
+    return buf
+  end
+
+  local ctx = { cwd = proot }
+  local function run()
+    local done, out, err = false, nil, nil
+    tools.get("document_symbols").run({ path = "r.lua" }, ctx, function(o, e)
+      out, err, done = o, e, true
+    end)
+    vim.wait(3000, function()
+      return done
+    end, 10)
+    return out, err
+  end
+
+  -- first call never answers (still indexing → timeout), second answers (warm)
+  local calls = 0
+  lsp._buf_request_all = function(_, _, _, handler)
+    calls = calls + 1
+    if calls == 1 then
+      return function() end
+    end
+    handler({
+      [1] = { result = { { name = "M", kind = 2, selectionRange = { start = { line = 0, character = 6 } } } } },
+    })
+    return function() end
+  end
+  local out, err = run()
+  check(calls == 2, "a timed-out LSP request auto-retries once")
+  check(out and out:find("M", 1, true) and not err, "the retry returns the result (warm server), no error surfaced")
+
+  -- exhausting all attempts reports a helpful timeout, not a crash
+  calls = 0
+  lsp._buf_request_all = function(_, _, _, _)
+    calls = calls + 1
+    return function() end
+  end
+  local out2, err2 = run()
+  check(calls == 2, "a persistently-timing-out request stops after max_attempts")
+  check(
+    err2 == true and out2:find("didn't respond in time", 1, true),
+    "exhausted retries surface a timeout message, not a crash"
+  )
+
+  vim.lsp.get_clients = orig_get
+  diagnostics.ensure_bufnr = orig_ensure
+  lsp._buf_request_all = orig_req
+  config.options.tools.lsp = vim.deepcopy(config.defaults.tools.lsp)
+  pcall(vim.api.nvim_buf_delete, buf, { force = true })
+end
+
+section("lsp usage nudge (fights system-prompt decay)")
+do
+  local lsp = require("advantage.lsp")
+  local config = require("advantage.config")
+  local tools = require("advantage.tools")
+  config.options.tools.lsp = vim.deepcopy(config.defaults.tools.lsp)
+  local orig_get = vim.lsp.get_clients
+  ---@diagnostic disable-next-line: duplicate-set-field
+  vim.lsp.get_clients = function()
+    return { { name = "fake" } }
+  end -- a server is "running"
+
+  -- throttle + streak
+  lsp.reset_session()
+  check(
+    lsp.explore_nudge() .. lsp.explore_nudge() .. lsp.explore_nudge() == "",
+    "explore_nudge stays quiet below the grep/read streak threshold"
+  )
+  check(
+    lsp.explore_nudge():find("language server is attached", 1, true) ~= nil,
+    "explore_nudge fires after a grep/read streak while a server is up"
+  )
+  -- an LSP-tool use resets the streak (a navigating session never gets nudged)
+  lsp.note_lsp_use()
+  check(
+    lsp.explore_nudge() == "" and lsp.explore_nudge() == "" and lsp.explore_nudge() == "",
+    "note_lsp_use resets the streak"
+  )
+  check(lsp.explore_nudge() ~= "", "the streak fires again after the reset + 4 more probes")
+
+  lsp.reset_session()
+  local fires = 0
+  for _ = 1, 40 do
+    if lsp.explore_nudge() ~= "" then fires = fires + 1 end
+  end
+  check(fires == 3, "explore_nudge is throttled to a few fires per session (no spam)")
+
+  -- never fires when no server is running (don't push tools that can't work)
+  ---@diagnostic disable-next-line: duplicate-set-field
+  vim.lsp.get_clients = function()
+    return {}
+  end
+  lsp.reset_session()
+  local none = ""
+  for _ = 1, 20 do
+    none = none .. lsp.explore_nudge()
+  end
+  check(none == "", "explore_nudge never fires when no language server is running")
+
+  -- integration: the nudge rides a grep result once the streak trips
+  ---@diagnostic disable-next-line: duplicate-set-field
+  vim.lsp.get_clients = function()
+    return { { name = "fake" } }
+  end
+  lsp.reset_session()
+  local tmp = vim.fn.tempname()
+  vim.fn.mkdir(tmp, "p")
+  vim.fn.writefile({ "alpha" }, tmp .. "/a.txt")
+  local function grep()
+    local done, out = false, nil
+    tools.get("grep").run({ pattern = "alpha" }, { cwd = tmp }, function(o)
+      out, done = o, true
+    end)
+    vim.wait(2000, function()
+      return done
+    end, 10)
+    return out
+  end
+  local o1 = grep()
+  grep()
+  grep()
+  local o4 = grep()
+  check(not o1:find("language server is attached", 1, true), "a grep result carries no nudge below the streak")
+  check(
+    o4:find("language server is attached", 1, true) ~= nil,
+    "a grep result carries the LSP nudge once the streak trips"
+  )
+  -- disabled → never nudges, even past the threshold
+  config.options.tools.lsp.enabled = false
+  lsp.reset_session()
+  local dis = grep() .. grep() .. grep() .. grep() .. grep()
+  check(not dis:find("language server is attached", 1, true), "no nudge when the LSP tools are disabled")
+
+  vim.lsp.get_clients = orig_get
+  config.options.tools.lsp = vim.deepcopy(config.defaults.tools.lsp)
+end
+
+section("lsp no-server is visible to the user")
+do
+  -- The environmental cause of a silent grep-fallback (no server for this language)
+  -- must surface to the USER, once per filetype — not just a message the model
+  -- swallows. Reuses the diagnostics missing-server nudge.
+  local tools = require("advantage.tools")
+  local diagnostics = require("advantage.diagnostics")
+  local config = require("advantage.config")
+  config.options.tools.lsp = vim.deepcopy(config.defaults.tools.lsp)
+  local proot = vim.fn.tempname()
+  vim.fn.mkdir(proot, "p")
+  vim.fn.writefile({ "x" }, proot .. "/z.code")
+  local buf = vim.fn.bufadd(proot .. "/z.code")
+  vim.fn.bufload(buf)
+  vim.bo[buf].filetype = "faketsx"
+  local og, oe, osa, onf =
+    vim.lsp.get_clients, diagnostics.ensure_bufnr, diagnostics.server_available_for_ft, diagnostics._notify_missing_ft
+  ---@diagnostic disable-next-line: duplicate-set-field
+  vim.lsp.get_clients = function()
+    return {}
+  end
+  diagnostics.ensure_bufnr = function()
+    return buf
+  end
+  diagnostics.server_available_for_ft = function()
+    return false
+  end
+  local notified
+  diagnostics._notify_missing_ft = function(ft)
+    notified = ft
+  end
+  local done, out = false, nil
+  tools.get("document_symbols").run({ path = "z.code" }, { cwd = proot }, function(o)
+    out, done = o, true
+  end)
+  vim.wait(2000, function()
+    return done
+  end, 10)
+  check(
+    out and out:find("No language server is attached", 1, true),
+    "document_symbols tells the model no server is attached"
+  )
+  check(notified == "faketsx", "and surfaces a once-per-filetype 'install a server' nudge to the USER")
+
+  vim.lsp.get_clients, diagnostics.ensure_bufnr, diagnostics.server_available_for_ft, diagnostics._notify_missing_ft =
+    og, oe, osa, onf
+  pcall(vim.api.nvim_buf_delete, buf, { force = true })
+end
+
+section("lsp treesitter outline (works without the language server)")
+do
+  local lsp = require("advantage.lsp")
+  local tools = require("advantage.tools")
+  local config = require("advantage.config")
+  local diagnostics = require("advantage.diagnostics")
+  config.options.tools.lsp = vim.deepcopy(config.defaults.tools.lsp)
+  lsp.reset_session()
+
+  local proot = vim.fn.tempname()
+  vim.fn.mkdir(proot, "p")
+  vim.fn.writefile(
+    { "local M = {}", "function M.foo(a)", "  return a", "end", "local function bar() end", "return M" },
+    proot .. "/t.lua"
+  )
+  local buf = vim.fn.bufadd(proot .. "/t.lua")
+  vim.fn.bufload(buf)
+  vim.bo[buf].filetype = "lua"
+
+  local flat = lsp.treesitter_symbols(buf)
+  if not flat then
+    print("  skip (no lua treesitter parser bundled in this Neovim)")
+  else
+    check(#flat >= 2, "treesitter_symbols extracts declarations from a real buffer")
+    local names = {}
+    for _, s in ipairs(flat) do
+      names[s.name] = s.kind
+    end
+    check(
+      names["M.foo"] == "Function" and names["bar"] == "Function",
+      "treesitter_symbols names functions with their kinds"
+    )
+
+    -- document_symbols with NO LSP server attached still returns an outline,
+    -- instantly, via treesitter (the fix for a server that won't answer nav)
+    local og, oe = vim.lsp.get_clients, diagnostics.ensure_bufnr
+    ---@diagnostic disable-next-line: duplicate-set-field
+    vim.lsp.get_clients = function()
+      return {}
+    end
+    diagnostics.ensure_bufnr = function()
+      return buf
+    end
+    local done, out, err = false, nil, nil
+    tools.get("document_symbols").run({ path = "t.lua" }, { cwd = proot }, function(o, e)
+      out, err, done = o, e, true
+    end)
+    vim.wait(3000, function()
+      return done
+    end, 10)
+    check(
+      out and out:find("Function M.foo", 1, true) and not err,
+      "document_symbols returns a treesitter outline when no LSP server is attached"
+    )
+    vim.lsp.get_clients, diagnostics.ensure_bufnr = og, oe
+  end
+
+  lsp.reset_session()
+  pcall(vim.api.nvim_buf_delete, buf, { force = true })
+end
+
+section("lsp capability check (no request a client can't answer)")
+do
+  -- A diagnostics/lint-only client (eslint, none-ls, biome) is attached but does
+  -- NOT provide navigation — firing documentSymbol/definition at it makes Neovim
+  -- print "method not supported by any server". We must check capabilities first:
+  -- document_symbols → treesitter; definition/hover → a clean message. No request.
+  local lsp = require("advantage.lsp")
+  local tools = require("advantage.tools")
+  local config = require("advantage.config")
+  local diagnostics = require("advantage.diagnostics")
+  config.options.tools.lsp = vim.deepcopy(config.defaults.tools.lsp)
+  lsp.reset_session()
+
+  local proot = vim.fn.tempname()
+  vim.fn.mkdir(proot, "p")
+  vim.fn.writefile({ "local M = {}", "function M.foo() end", "return M" }, proot .. "/c.lua")
+  local buf = vim.fn.bufadd(proot .. "/c.lua")
+  vim.fn.bufload(buf)
+  vim.bo[buf].filetype = "lua"
+
+  if not lsp.treesitter_symbols(buf) then
+    print("  skip (no lua treesitter parser)")
+  else
+    local lint_only =
+      { initialized = true, offset_encoding = "utf-16", server_capabilities = {}, attached_buffers = { [buf] = true } }
+    local og, oe, oreq = vim.lsp.get_clients, diagnostics.ensure_bufnr, lsp._buf_request_all
+    ---@diagnostic disable-next-line: duplicate-set-field
+    vim.lsp.get_clients = function()
+      return { lint_only }
+    end
+    diagnostics.ensure_bufnr = function()
+      return buf
+    end
+    local requested = false
+    lsp._buf_request_all = function()
+      requested = true
+      return function() end
+    end
+    local function run(name, input)
+      local done, out = false, nil
+      tools.get(name).run(input, { cwd = proot }, function(o)
+        out, done = o, true
+      end)
+      vim.wait(2000, function()
+        return done
+      end, 10)
+      return out
+    end
+
+    local ds = run("document_symbols", { path = "c.lua" })
+    check(
+      ds:find("Function M.foo", 1, true) and not requested,
+      "document_symbols uses treesitter (never requests) when the client can't do documentSymbol"
+    )
+    requested = false
+    local defout = run("goto_definition", { path = "c.lua", line = 2, symbol = "foo" })
+    check(
+      not requested and defout:find("provides definition", 1, true),
+      "goto_definition reports cleanly (never requests) when the client lacks definitionProvider"
+    )
+
+    vim.lsp.get_clients, diagnostics.ensure_bufnr, lsp._buf_request_all = og, oe, oreq
+  end
+  lsp.reset_session()
+  pcall(vim.api.nvim_buf_delete, buf, { force = true })
+end
+
+section("lsp nav-timeout latch (fail fast, recover on warm-up)")
+do
+  -- A server that serves diagnostics but times out on navigation (tsserver mid-load)
+  -- shouldn't cost the full timeout on every nav call. After repeated timeouts the
+  -- latch trips and further nav short-circuits to a fast grep/read fallback — but a
+  -- periodic re-probe recovers navigation if the server later warms up.
+  local lsp = require("advantage.lsp")
+  local tools = require("advantage.tools")
+  local config = require("advantage.config")
+  local diagnostics = require("advantage.diagnostics")
+  config.options.tools.lsp = vim.deepcopy(config.defaults.tools.lsp)
+  config.options.tools.lsp.timeout_ms = 60
+  config.options.tools.lsp.attach_grace_ms = 0
+  config.options.tools.lsp.max_attempts = 1
+  lsp.reset_session()
+
+  local proot = vim.fn.tempname()
+  vim.fn.mkdir(proot, "p")
+  vim.fn.writefile({ "x" }, proot .. "/n.lua")
+  local buf = vim.fn.bufadd(proot .. "/n.lua")
+  vim.fn.bufload(buf)
+  vim.bo[buf].filetype = "lua"
+  local fake_client = {
+    initialized = true,
+    offset_encoding = "utf-16",
+    server_capabilities = { documentSymbolProvider = true },
+    attached_buffers = { [buf] = true },
+  }
+  local og, oe, oreq = vim.lsp.get_clients, diagnostics.ensure_bufnr, lsp._buf_request_all
+  ---@diagnostic disable-next-line: duplicate-set-field
+  vim.lsp.get_clients = function()
+    return { fake_client }
+  end
+  diagnostics.ensure_bufnr = function()
+    return buf
+  end
+
+  local calls, answering = 0, false
+  lsp._buf_request_all = function(_, _, _, handler)
+    calls = calls + 1
+    if answering then
+      handler({
+        [1] = { result = { { name = "M", kind = 12, selectionRange = { start = { line = 0, character = 0 } } } } },
+      })
+    end
+    return function() end
+  end
+  local function ds()
+    local done, out = false, nil
+    tools.get("document_symbols").run({ path = "n.lua" }, { cwd = proot }, function(o)
+      out, done = o, true
+    end)
+    vim.wait(2000, function()
+      return done
+    end, 10)
+    return out
+  end
+
+  ds()
+  ds() -- two navigation timeouts
+  check(lsp._nav_latched(), "the nav latch trips after repeated navigation timeouts")
+  local before = calls
+  local out3 = ds()
+  check(calls == before, "a latched nav call skips the request entirely (no wasted timeout)")
+  check(out3:find("Skipping navigation", 1, true) ~= nil, "a latched nav call returns a fast grep/read fallback")
+
+  -- the server warms up; the periodic re-probe recovers navigation
+  answering = true
+  local recovered = ds() .. ds() .. ds()
+  check(recovered:find("Function M", 1, true) ~= nil, "a periodic re-probe recovers navigation once the server answers")
+  check(not lsp._nav_latched(), "a successful re-probe clears the latch")
+
+  vim.lsp.get_clients, diagnostics.ensure_bufnr, lsp._buf_request_all = og, oe, oreq
+  config.options.tools.lsp = vim.deepcopy(config.defaults.tools.lsp)
+  lsp.reset_session()
+  pcall(vim.api.nvim_buf_delete, buf, { force = true })
+end
+
+-- 4-grep. grep output modes ----------------------------------------------------
+
+section("grep output modes")
+do
+  local tools = require("advantage.tools")
+  local tmp = vim.fn.tempname()
+  vim.fn.mkdir(tmp, "p")
+  vim.fn.writefile({ "alpha match", "beta", "alpha again" }, tmp .. "/a.txt")
+  vim.fn.writefile({ "alpha only here" }, tmp .. "/b.txt")
+  local ctx = { cwd = tmp }
+  local function run(input)
+    local done, out, err = false, nil, nil
+    tools.get("grep").run(input, ctx, function(o, e)
+      out, err, done = o, e, true
+    end)
+    vim.wait(3000, function()
+      return done
+    end, 10)
+    return out, err
+  end
+
+  local content = assert(run({ pattern = "alpha", output_mode = "content" }))
+  check(content:find("a.txt") and content:find("alpha match"), "grep content mode returns file:line:text")
+  local files = assert(run({ pattern = "alpha", output_mode = "files_with_matches" }))
+  check(
+    files:find("a.txt") and files:find("b.txt") and not files:find("alpha match"),
+    "grep files_with_matches returns paths only"
+  )
+  local counts = assert(run({ pattern = "alpha", output_mode = "count" }))
+  check(counts:find("a.txt") and counts:match("a%.txt[^\n]*2"), "grep count mode reports per-file match counts")
+  local head = assert(run({ pattern = "alpha", head_limit = 1 }))
+  check(head:find("more line", 1, true), "grep head_limit caps output with a +N note")
+  check(
+    assert(run({ pattern = "ALPHA", ignore_case = true })):find("alpha", 1, true),
+    "grep ignore_case matches case-insensitively"
+  )
+  check(assert(run({ pattern = "zzzznomatch" })):find("No matches", 1, true), "grep reports no matches cleanly")
+end
+
+-- 4-sub. sub-agent lean context (no memory leak, capped report) ----------------
+
+section("sub-agent lean context")
+do
+  local providers = require("advantage.providers")
+  local tools = require("advantage.tools")
+  local agent_mod = require("advantage.agent")
+  local config = require("advantage.config")
+  config.options.tools.lsp = vim.deepcopy(config.defaults.tools.lsp) -- ensure LSP steer is live
+
+  -- base_system_prompt is the base instructions ONLY — no memory guide/block
+  local base = agent_mod.base_system_prompt()
+  check(base:find("expert coding agent", 1, true) ~= nil, "base_system_prompt keeps the base instructions")
+  check(not base:find("Persistent repo memory", 1, true), "base_system_prompt omits the memory guide")
+
+  local big = string.rep("x report ", 4000) -- ~36k chars, over the 16k report cap
+  local seen_system
+  providers.register("fakesublean", {
+    stream = function(req)
+      seen_system = req.system
+      vim.defer_fn(function()
+        req.on.complete({ { type = "text", text = big } }, "end_turn")
+      end, 5)
+      return { stop = function() end }
+    end,
+  })
+  local ctx = { cwd = vim.fn.tempname(), system = "PARENT-SYSTEM-WITH-MEMORY-BLOCK-XYZ" }
+  vim.fn.mkdir(ctx.cwd, "p")
+  local done, result = false, nil
+  tools.get("sub_agent").run({ prompt = "scout the thing", model = "fakesublean/m" }, ctx, function(out)
+    result, done = out, true
+  end)
+  vim.wait(3000, function()
+    return done
+  end, 10)
+  check(
+    seen_system and not seen_system:find("PARENT-SYSTEM-WITH-MEMORY-BLOCK-XYZ", 1, true),
+    "sub-agent ignores the parent's memory-laden system prompt"
+  )
+  check(seen_system and seen_system:find("read-only sub-agent", 1, true), "sub-agent gets the read-only role prompt")
+  check(
+    seen_system and not seen_system:find("Persistent repo memory", 1, true),
+    "sub-agent system omits the repo memory guide/block"
+  )
+  check(
+    seen_system and seen_system:find("Semantic code navigation", 1, true),
+    "sub-agent still gets the LSP navigation steer (scouts navigate code too)"
+  )
+  check(
+    result and #result < #big and result:find("report truncated", 1, true),
+    "an oversized sub-agent report is capped before it reaches the parent transcript"
+  )
 end
 
 print("")

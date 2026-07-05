@@ -195,13 +195,30 @@ local function text_from_blocks(blocks)
   return table.concat(out, "\n")
 end
 
-local function system_prompt(parent_system)
-  return table.concat({
-    parent_system or require("advantage.agent").system_prompt(),
+---A sub-agent gets the BASE instructions only — deliberately NOT the parent's
+---repo-memory block or skills index. A read-only scout can't call
+---`remember`/`use_skill` anyway, and re-shipping the full learned context to
+---every worker (and 5× on a parallel fan-out, each cold-cached) is the exact
+---token leak the sub-agent design is meant to avoid. The parent already digested
+---memory and wrote a specific task prompt; that carries the context the scout needs.
+local function system_prompt()
+  local agent = require("advantage.agent")
+  local lines = { agent.base_system_prompt() }
+  -- The scout gets the same semantic-navigation steer as the parent (it has the
+  -- LSP tools too), when they're live — a scout answering "where is X defined /
+  -- who calls it" should use goto_definition/find_references, not grep.
+  local lsp = agent.lsp_guide()
+  if lsp then
+    lines[#lines + 1] = ""
+    lines[#lines + 1] = lsp
+  end
+  vim.list_extend(lines, {
     "",
     "You are a read-only sub-agent. Investigate independently and return a concise report to the parent agent.",
     "You may use only read-only tools. Do not edit files or run mutating commands. Include file paths and line numbers when useful.",
-  }, "\n")
+    "Keep the report tight: the parent pays tokens for every word of it, so return findings and the evidence for them, not a play-by-play.",
+  })
+  return table.concat(lines, "\n")
 end
 
 local function run_tool_call(call, ctx, cb)
@@ -294,10 +311,19 @@ function M.run(input, ctx, cb)
   local usage = { input = 0, output = 0 }
   local last_text = "" -- newest interim findings, so a turn-limit stop isn't wasted
 
+  -- The scout's report is spliced straight into the PARENT transcript, where it
+  -- then costs input tokens on every subsequent parent turn until compaction. A
+  -- verbose worker could bloat that unbounded, so cap it like every other tool
+  -- output (character-safe so the cut never lands mid-UTF-8).
+  local REPORT_CAP = 16000
+
   local function finish(text, is_error)
     if cancelled then return end
     text = vim.trim(text or "")
     if text == "" and not is_error then text = "Sub-agent finished without a text report." end
+    if #text > REPORT_CAP then
+      text = require("advantage.util").utf8_safe_sub(text, REPORT_CAP) .. "\n… [sub-agent report truncated]"
+    end
     local suffix = (usage.input > 0 or usage.output > 0)
         and ("\n\n[sub-agent usage: ↑%s ↓%s]"):format(
           require("advantage.util").fmt_tokens(usage.input),
@@ -319,7 +345,7 @@ function M.run(input, ctx, cb)
 
     job = provider.stream({
       model = model,
-      system = system_prompt(ctx.system),
+      system = system_prompt(),
       messages = messages,
       tools = readonly_tools(),
       on = {

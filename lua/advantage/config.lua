@@ -93,6 +93,28 @@ M.defaults = {
       notify_missing = true,
     },
 
+    ---Editor-native LSP navigation tools (document_symbols, goto_definition,
+    ---find_references, hover, workspace_symbol). These let the agent traverse
+    ---code semantically — a few tokens per hop — instead of grepping and reading
+    ---whole files, using the language servers your editor already runs. Read-only,
+    ---so they never prompt and are available to sub-agents too. The whole set is
+    ---hidden from the schema when `enabled = false` or this Neovim lacks vim.lsp.
+    ---Needs a language server for the relevant filetype — see the README's list.
+    lsp = {
+      enabled = true,
+      timeout_ms = 4000, -- per-request ceiling before a timeout (extended on retry)
+      max_attempts = 2, -- auto-retry a TIMED-OUT request this many times: the first
+      -- request to a freshly-opened file often times out while the server does its
+      -- initial index; the retry (with an extended window) then returns instantly
+      attach_grace_ms = 1000, -- wait this long for a server to attach when NONE is
+      -- configured for the filetype (fail fast → the user is nudged to install one)
+      attach_grace_configured_ms = 4000, -- but when a server IS configured for the
+      -- filetype, wait this long for it to attach to a freshly-loaded buffer: heavy
+      -- servers (tsserver/vtsls in a monorepo, jdtls, rust-analyzer) take seconds to
+      -- come up, and a too-short wait reads as "no server" and abandons LSP wrongly
+      max_results = 60, -- cap on symbols / references / matches returned per call
+    },
+
     ---Web search via the Brave Search API (https://api.search.brave.com) — a
     ---single lightweight GET request, no page-scraping/fetch step. Needs an API
     ---key (Brave's free tier covers casual use); the tool is hidden entirely

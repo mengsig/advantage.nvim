@@ -86,6 +86,18 @@ local function record_nudge()
   return memory.record_nudge_suffix()
 end
 
+---In-band steer toward the LSP navigation tools when the model is grep/read-looping
+---over code while a language server is available (throttled per session in lsp.lua;
+---silenced by any LSP-tool use). Empty string when LSP is off/absent or not yet due.
+---This counters the frozen system-prompt steer losing salience as a session grows.
+local function lsp_explore_nudge()
+  local ok, lsp = pcall(require, "advantage.lsp")
+  if not (ok and lsp.available()) then return "" end
+  local t = (require("advantage.config").options.tools or {}).lsp
+  if type(t) == "table" and t.enabled == false then return "" end
+  return lsp.explore_nudge()
+end
+
 ---Finish a successful mutating edit: reload any open buffer, then (best-effort)
 ---append the newly-introduced LSP/linter diagnostics to the tool result so the
 ---model can self-correct. Snapshotting the pre-edit diagnostics happens before
@@ -152,20 +164,35 @@ end
 tool({
   name = "read_file",
   safe = true,
-  description = "Read a file from the project. Returns numbered lines. Use offset/limit for large files.",
+  description = "Read a file from the project. Returns numbered lines. Use offset/limit for large files. Set outline=true to get just the file's symbol outline (via LSP) instead of its text — far cheaper for navigating a large file.",
   input_schema = {
     type = "object",
     properties = {
       path = { type = "string", description = "File path, relative to the project root" },
       offset = { type = "integer", description = "1-based line to start from (default 1)" },
       limit = { type = "integer", description = "Max lines to return (default 1500)" },
+      outline = {
+        type = "boolean",
+        description = "Return the file's symbol outline (functions/classes/methods + lines) instead of its text. Needs a language server for the filetype.",
+      },
     },
     required = { "path" },
   },
   summary = function(input)
-    return input.path or ""
+    return (input.path or "") .. (input.outline and " (outline)" or "")
   end,
   run = function(input, ctx, cb)
+    -- Outline mode: hand off to the LSP symbol layer for a token-lean overview of
+    -- a large file instead of paging its full text. Degrades to a clear message
+    -- (which the model reads as "just read it normally") when no server answers.
+    if input.outline then
+      local ok, lsp = pcall(require, "advantage.lsp")
+      if ok and lsp.available() then return lsp.document_symbols(input.path, ctx.cwd, cb) end
+      return cb(
+        "Outline needs a language server, which isn't available here — omit outline to read the file text.",
+        false
+      )
+    end
     local path, perr = resolve(input.path, ctx)
     if not path then return cb(("Cannot read %s: %s"):format(tostring(input.path), perr), true) end
     local content = read_all(path)
@@ -205,10 +232,8 @@ tool({
     -- that limit is floored to 1 and offset <= total).
     local last = offset + #out - 1
     local suffix = ""
-    if last < total then
-      suffix = ("\n… %d more lines — continue with offset=%d"):format(total - last, last + 1)
-    end
-    cb(table.concat(out, "\n") .. suffix, false)
+    if last < total then suffix = ("\n… %d more lines — continue with offset=%d"):format(total - last, last + 1) end
+    cb(table.concat(out, "\n") .. suffix .. lsp_explore_nudge(), false)
   end,
 })
 
@@ -535,21 +560,46 @@ tool({
 
 -- grep ------------------------------------------------------------------
 
+---Cap a list of output lines at `head_limit`, appending a "+N more" note when it
+---bites, then join and byte-truncate. `empty` is returned when there's nothing.
+local function finalize_search(lines, head_limit, empty)
+  if #lines == 0 then return empty end
+  if head_limit and head_limit > 0 and #lines > head_limit then
+    local more = #lines - head_limit
+    lines = vim.list_slice(lines, 1, head_limit)
+    lines[#lines + 1] = ("… +%d more line%s (raise head_limit or narrow the pattern)"):format(
+      more,
+      more == 1 and "" or "s"
+    )
+  end
+  return truncate(table.concat(lines, "\n"))
+end
+
+local GREP_MODES = { content = true, files_with_matches = true, count = true }
+
 tool({
   name = "grep",
   safe = true,
-  description = "Search file contents with a regex (ripgrep). Returns file:line:text matches.",
+  description = 'Search file contents with a regex (ripgrep). output_mode controls what comes back: "content" (default) returns file:line:text matches; "files_with_matches" returns just the matching file paths (cheapest when you only need locations); "count" returns per-file match counts. Use head_limit to cap output lines.',
   input_schema = {
     type = "object",
     properties = {
       pattern = { type = "string", description = "Regex pattern to search for" },
       path = { type = "string", description = "Directory or file to search (default: project root)" },
       glob = { type = "string", description = 'Filter files, e.g. "*.lua"' },
+      output_mode = {
+        type = "string",
+        description = "content (default) | files_with_matches | count",
+        enum = { "content", "files_with_matches", "count" },
+      },
+      ignore_case = { type = "boolean", description = "Case-insensitive search" },
+      head_limit = { type = "integer", description = "Cap the number of output lines returned" },
     },
     required = { "pattern" },
   },
   summary = function(input)
-    return input.pattern or ""
+    local m = input.output_mode
+    return (input.pattern or "") .. ((m and m ~= "content") and (" [" .. m .. "]") or "")
   end,
   run = function(input, ctx, cb)
     local search_path = "."
@@ -558,19 +608,43 @@ tool({
       if not p then return cb(("Cannot search %s: %s"):format(tostring(input.path), perr), true) end
       search_path = p
     end
+    local mode = GREP_MODES[input.output_mode] and input.output_mode or "content"
+    local head_limit = tonumber(input.head_limit)
+    local has_rg = vim.fn.executable("rg") == 1
     local cmd
-    if vim.fn.executable("rg") == 1 then
-      cmd = { "rg", "--line-number", "--no-heading", "--color=never", "--max-count=100", "-e", input.pattern }
+    if has_rg then
+      cmd = { "rg", "--color=never" }
+      if mode == "files_with_matches" then
+        cmd[#cmd + 1] = "--files-with-matches"
+      elseif mode == "count" then
+        cmd[#cmd + 1] = "--count" -- file:matching-line-count, omits zero-match files
+      else
+        vim.list_extend(cmd, { "--line-number", "--no-heading", "--max-count=100" })
+      end
+      if input.ignore_case then cmd[#cmd + 1] = "-i" end
+      vim.list_extend(cmd, { "-e", input.pattern })
       if input.glob then vim.list_extend(cmd, { "--glob", input.glob }) end
       cmd[#cmd + 1] = search_path
     else
-      cmd = { "grep", "-rn", "-E", input.pattern, search_path }
+      local flag = mode == "files_with_matches" and "-rlE" or mode == "count" and "-rcE" or "-rnE"
+      cmd = { "grep", flag }
+      if input.ignore_case then cmd[#cmd + 1] = "-i" end
+      vim.list_extend(cmd, { input.pattern, search_path })
     end
     vim.system(cmd, { cwd = ctx.cwd, text = true }, function(res)
       vim.schedule(function()
         if res.code > 1 then return cb("Search failed: " .. (res.stderr or ""), true) end
-        local out = vim.trim(res.stdout or "")
-        cb(out == "" and "No matches." or truncate(out), false)
+        local lines = vim.split(vim.trim(res.stdout or ""), "\n", { plain = true, trimempty = true })
+        -- grep -rc prints "path:0" for files with no match; drop that noise so the
+        -- count mode only lists files that actually matched (rg --count already does).
+        if mode == "count" and not has_rg then
+          local kept = {}
+          for _, l in ipairs(lines) do
+            if not l:match(":0$") then kept[#kept + 1] = l end
+          end
+          lines = kept
+        end
+        cb(finalize_search(lines, head_limit, "No matches.") .. lsp_explore_nudge(), false)
       end)
     end)
   end,
@@ -621,7 +695,7 @@ tool({
           lines = vim.list_slice(lines, 1, 300)
           lines[#lines + 1] = ("… %d more files"):format(total - 300)
         end
-        cb(#lines == 0 and "No files matched." or table.concat(lines, "\n"), false)
+        cb((#lines == 0 and "No files matched." or table.concat(lines, "\n")) .. lsp_explore_nudge(), false)
       end)
     end)
   end,
@@ -795,6 +869,124 @@ tool({
     diagnostics.report(nil, severity, function(text)
       cb(text, false)
     end)
+  end,
+})
+
+-- lsp navigation --------------------------------------------------------
+-- Editor-native semantic code navigation. These traverse the language server
+-- the editor already runs, so the model finds a definition / every call site /
+-- a file's outline / a type signature in a few tokens instead of grepping and
+-- reading whole files. All read-only (safe), gated behind tools.lsp + vim.lsp.
+
+tool({
+  name = "document_symbols",
+  safe = true,
+  feature = "lsp",
+  description = "Outline a file's symbols (functions, classes, methods, fields) with their lines, via the language server — a token-lean map of a file without reading its full text. Use it to orient in a large file before reading the parts that matter.",
+  input_schema = {
+    type = "object",
+    properties = {
+      path = { type = "string", description = "File path, relative to the project root" },
+    },
+    required = { "path" },
+  },
+  summary = function(input)
+    return input.path or ""
+  end,
+  run = function(input, ctx, cb)
+    require("advantage.lsp").document_symbols(input.path, ctx.cwd, cb)
+  end,
+})
+
+tool({
+  name = "goto_definition",
+  safe = true,
+  feature = "lsp",
+  description = "Jump to where a symbol is defined, via the language server. Give the file and the line where the symbol is used, and the symbol name; returns the definition's file:line (with the line's text). Far cheaper than grepping for a name and reading the results.",
+  input_schema = {
+    type = "object",
+    properties = {
+      path = { type = "string", description = "File path (relative to the project root) where the symbol appears" },
+      line = { type = "integer", description = "1-based line where the symbol is used" },
+      symbol = { type = "string", description = "The symbol name on that line (used to find the exact column)" },
+      column = {
+        type = "integer",
+        description = "Optional 1-based column override if the symbol name is ambiguous on the line",
+      },
+    },
+    required = { "path", "line" },
+  },
+  summary = function(input)
+    return ("%s:%s"):format(input.path or "", input.line or "?")
+  end,
+  run = function(input, ctx, cb)
+    require("advantage.lsp").definition(input.path, ctx.cwd, input.line, input.symbol, input.column, cb)
+  end,
+})
+
+tool({
+  name = "find_references",
+  safe = true,
+  feature = "lsp",
+  description = 'List every reference/call site of a symbol across the project, via the language server. Give the file and line where the symbol appears, and its name. The token-lean way to answer "who calls / uses this?" without grepping and reading each hit.',
+  input_schema = {
+    type = "object",
+    properties = {
+      path = { type = "string", description = "File path (relative to the project root) where the symbol appears" },
+      line = { type = "integer", description = "1-based line where the symbol appears" },
+      symbol = { type = "string", description = "The symbol name on that line (used to find the exact column)" },
+      column = { type = "integer", description = "Optional 1-based column override" },
+    },
+    required = { "path", "line" },
+  },
+  summary = function(input)
+    return ("%s:%s"):format(input.path or "", input.line or "?")
+  end,
+  run = function(input, ctx, cb)
+    require("advantage.lsp").references(input.path, ctx.cwd, input.line, input.symbol, input.column, cb)
+  end,
+})
+
+tool({
+  name = "hover",
+  safe = true,
+  feature = "lsp",
+  description = "Get the type signature and documentation for a symbol at a position, via the language server (the same info the editor shows on hover). Cheaper and more precise than reading a definition to infer a type.",
+  input_schema = {
+    type = "object",
+    properties = {
+      path = { type = "string", description = "File path, relative to the project root" },
+      line = { type = "integer", description = "1-based line where the symbol appears" },
+      symbol = { type = "string", description = "The symbol name on that line (used to find the exact column)" },
+      column = { type = "integer", description = "Optional 1-based column override" },
+    },
+    required = { "path", "line" },
+  },
+  summary = function(input)
+    return ("%s:%s"):format(input.path or "", input.line or "?")
+  end,
+  run = function(input, ctx, cb)
+    require("advantage.lsp").hover(input.path, ctx.cwd, input.line, input.symbol, input.column, cb)
+  end,
+})
+
+tool({
+  name = "workspace_symbol",
+  safe = true,
+  feature = "lsp",
+  description = 'Find a symbol by name anywhere in the project, via the language server — a semantic, index-backed search for definitions. Match on the bare symbol name (e.g. "new", not "M.new"), and prefer a distinctive name: common names return many matches. In-project results are shown first and external/stdlib matches are collapsed to a count. Requires a language server to already be running (open/read a file of that language first).',
+  input_schema = {
+    type = "object",
+    properties = {
+      query = { type = "string", description = "Symbol name or fragment to search for" },
+    },
+    required = { "query" },
+  },
+  summary = function(input)
+    return input.query or ""
+  end,
+  run = function(input, ctx, cb)
+    require("advantage.lsp").workspace_symbol(input.query, ctx.cwd, cb)
   end,
 })
 
@@ -1106,6 +1298,12 @@ function M.enabled(def)
     local t = (require("advantage.config").options.tools or {}).web_search
     if not (type(t) == "table" and t.enabled ~= false) then return false end
     return web_search_key(t) ~= nil
+  end
+  if def.feature == "lsp" then
+    local t = (require("advantage.config").options.tools or {}).lsp
+    if type(t) == "table" and t.enabled == false then return false end
+    local ok, lsp = pcall(require, "advantage.lsp")
+    return ok and lsp.available()
   end
   return true
 end
