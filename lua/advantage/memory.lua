@@ -442,7 +442,7 @@ function M.record_nudge_suffix()
   local since = (s.work_actions or 0) - (s.work_at_last_nudge or 0)
   if since < RECORD_NUDGE_EVERY then return "" end
   s.work_at_last_nudge = s.work_actions or 0
-  return "\n\nReminder: you've done more work here without recording anything to memory. If this session revealed a durable, non-obvious fact future sessions would need — a convention, a gotcha, a build/test command, an architecture invariant, a stated preference — call `remember` now. If nothing qualifies, carry on."
+  return "\n\nMemory check: has this session surfaced a durable, non-obvious fact future sessions would need — a convention, a gotcha, a build/test command, an architecture invariant, a stated preference? If so, `remember` it now. If not — which is the common case — record nothing; padding memory with trivia is worse than an occasional miss."
 end
 
 ---Remove every bullet whose text matches `pattern` (plain, case-insensitive

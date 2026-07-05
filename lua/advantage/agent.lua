@@ -54,7 +54,7 @@ local MEMORY_GUIDE = table.concat({
   "Persistent repo memory (this is your edge — it makes you faster and cheaper over time):",
   "- Repo memory and skills are injected below. Treat repo memory as trusted prior knowledge about THIS codebase; prefer it over re-deriving the same facts.",
   "- When you learn a durable, non-obvious fact future sessions would want — an architecture invariant, a convention, a build/test command, a gotcha, or a preference the user states — call `remember` to save it (one specific, self-contained fact in the right section). Prefer precision over brevity, but don't duplicate a fact already in memory. Don't record trivia or anything a quick file read re-derives.",
-  "- Record as you go, not just when asked: the moment an investigation, edit, test run, or the user's own words reveal such a fact, `remember` it right then — it's cheap and the knowledge is lost when this session ends. Under-recording is the common failure: if you did real work here (writing code OR just studying it) and learned something durable, capture it before you finish the turn.",
+  "- Record as you go, not just when asked: the moment an investigation, edit, test run, or the user's own words reveal such a fact, `remember` it right then — the knowledge is lost when this session ends. But the bar is high in both directions: most turns teach nothing worth persisting, and recording trivia is as harmful as missing a real fact — it dilutes the signal and evicts good facts under the token budget. When unsure, don't record.",
   "- A skill is a reusable procedure. When a listed skill's description matches the task, call `use_skill` to load its full steps before doing that task. Codify a genuinely reusable multi-step procedure with `save_skill`.",
 }, "\n")
 
