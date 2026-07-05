@@ -1870,6 +1870,29 @@ do
   memory.forget("alpha widget cache")
   memory.forget("widget rendering pipeline resolves layout")
 
+  -- recurring record nudge: as a session does work without recording, the model
+  -- gets an in-band steer every RECORD_NUDGE_EVERY (8) work actions; recording a
+  -- fact resets the window and buys quiet.
+  memory.reset_session()
+  local fired = 0
+  for _ = 1, 8 do
+    memory.note_work()
+    if memory.record_nudge_suffix() ~= "" then fired = fired + 1 end
+  end
+  check(fired == 1, "record nudge fires once after 8 work actions with nothing recorded")
+  check(memory.record_nudge_suffix() == "", "record nudge stays quiet until the window fills again")
+  for _ = 1, 8 do
+    memory.note_work()
+  end
+  check(memory.record_nudge_suffix() ~= "", "record nudge recurs when work keeps piling up unrecorded")
+  memory.remember("A durable fact recorded mid-session to reset the nudge window", "Notes")
+  for _ = 1, 8 do
+    memory.note_work()
+  end
+  check(memory.record_nudge_suffix() == "", "recording a fact resets the window so the nudge goes quiet")
+  memory.forget("durable fact recorded mid-session")
+  memory.reset_session()
+
   -- skills index is budgeted: past the cap, skills drop off the always-loaded
   -- list (with a "+N more" note) but stay fully loadable by name.
   config.options.memory.skills_index_budget_tokens = 1 -- force truncation to 1 shown

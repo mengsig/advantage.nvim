@@ -338,6 +338,7 @@ function M.remember(fact, section)
   bullets[section][#bullets[section] + 1] = fact
   local evicted = enforce_budget(bullets, order)
   save_context(bullets, order)
+  M._session.remember_count = (M._session.remember_count or 0) + 1
   local advice = M.curation_advice()
   return {
     status = "added",
@@ -409,6 +410,39 @@ function M.curation_nudge_due()
   if M._session.curation_nudged then return false end
   M._session.curation_nudged = true
   return true
+end
+
+-- The frozen system-prompt guidance to `remember` decays as a session grows
+-- (it sits atop context while attention drifts to the recent transcript), so we
+-- re-surface it in-band every this-many substantial work actions (edits, shell
+-- runs) that pass WITHOUT a new fact being recorded. Recording anything resets
+-- the window, so an actively-curating session never sees a nudge.
+local RECORD_NUDGE_EVERY = 8
+
+---Count one substantial work action (an edit or a shell run) toward the
+---record-nudge window. Cheap; call from the tools that signal real work.
+function M.note_work()
+  M._session.work_actions = (M._session.work_actions or 0) + 1
+end
+
+---Recurring in-band steer, appended to a tool result (never the cached prefix,
+---so it costs nothing per turn), that re-surfaces the `remember` habit as the
+---session grows and the frozen system-prompt instruction loses salience. Fires
+---when RECORD_NUDGE_EVERY work actions have passed since the last record or
+---nudge; a `remember` call resets the window and buys quiet. Returns "" when not
+---due. Deterministic — no model call, no user-facing notice.
+function M.record_nudge_suffix()
+  local s = M._session
+  -- the model recorded since we last looked → reset the window, stay quiet
+  if (s.remember_count or 0) > (s.record_seen or 0) then
+    s.record_seen = s.remember_count
+    s.work_at_last_nudge = s.work_actions or 0
+    return ""
+  end
+  local since = (s.work_actions or 0) - (s.work_at_last_nudge or 0)
+  if since < RECORD_NUDGE_EVERY then return "" end
+  s.work_at_last_nudge = s.work_actions or 0
+  return "\n\nReminder: you've done more work here without recording anything to memory. If this session revealed a durable, non-obvious fact future sessions would need — a convention, a gotcha, a build/test command, an architecture invariant, a stated preference — call `remember` now. If nothing qualifies, carry on."
 end
 
 ---Remove every bullet whose text matches `pattern` (plain, case-insensitive
@@ -524,10 +558,24 @@ end
 ---Session-lifetime counters for instrumentation and hint throttling. Reset per
 ---conversation (agent.new) so a fresh chat can re-surface skills and the /usage
 ---savings math starts clean.
-M._session = { skill_loads = 0, skill_load_tokens = 0, loaded = {}, hinted = {}, curation_nudged = false }
+local function fresh_session()
+  return {
+    skill_loads = 0,
+    skill_load_tokens = 0,
+    loaded = {},
+    hinted = {},
+    curation_nudged = false,
+    remember_count = 0,
+    work_actions = 0,
+    record_seen = 0,
+    work_at_last_nudge = 0,
+  }
+end
+
+M._session = fresh_session()
 
 function M.reset_session()
-  M._session = { skill_loads = 0, skill_load_tokens = 0, loaded = {}, hinted = {}, curation_nudged = false }
+  M._session = fresh_session()
 end
 
 ---Return the full body of a skill by name, or nil.

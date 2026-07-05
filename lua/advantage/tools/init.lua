@@ -73,6 +73,16 @@ local function refresh_buffers(path)
   end)
 end
 
+---Count one substantial work action and return the one-shot record-nudge suffix
+---(steers the model to `remember` what it learned once a session has done real
+---work but recorded nothing). Empty string when memory is off or not yet due.
+local function record_nudge()
+  local ok, memory = pcall(require, "advantage.memory")
+  if not (ok and memory.enabled()) then return "" end
+  memory.note_work()
+  return memory.record_nudge_suffix()
+end
+
 ---Finish a successful mutating edit: reload any open buffer, then (best-effort)
 ---append the newly-introduced LSP/linter diagnostics to the tool result so the
 ---model can self-correct. Snapshotting the pre-edit diagnostics happens before
@@ -80,14 +90,15 @@ end
 ---actually introduced. Degrades to a plain success when diagnostics are off or
 ---unavailable.
 local function finish_write(path, msg, cb)
+  local nudge = record_nudge()
   local ok, diagnostics = pcall(require, "advantage.diagnostics")
   local dcfg = (require("advantage.config").options.tools or {}).diagnostics
   local severity = (type(dcfg) == "table" and dcfg.severity) or "error"
   local before = ok and diagnostics.snapshot(path, severity) or nil
   refresh_buffers(path)
-  if not ok then return cb(msg, false) end
+  if not ok then return cb(msg .. nudge, false) end
   diagnostics.after_edit(path, before, function(extra)
-    cb(msg .. (extra or ""), false)
+    cb(msg .. (extra or "") .. nudge, false)
   end)
 end
 
@@ -461,7 +472,15 @@ tool({
             out = out .. (out ~= "" and "\n" or "") .. ("(exit code %d)"):format(code)
           end
           if vim.trim(out) == "" then out = "(no output)" end
-          cb(truncate(out), timed_out or stopped or code ~= 0)
+          local is_err = timed_out or stopped or code ~= 0
+          local suffix = ""
+          local ok_mem, memory = pcall(require, "advantage.memory")
+          if ok_mem and memory.enabled() then
+            memory.note_work()
+            -- only steer on a clean run; don't bolt a memory nudge onto an error
+            if not is_err then suffix = memory.record_nudge_suffix() end
+          end
+          cb(truncate(out) .. suffix, is_err)
         end)
       end,
     })
