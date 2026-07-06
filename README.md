@@ -375,6 +375,15 @@ per-repo memory so the agent gets *better and cheaper* at your codebase over tim
   prompt, so the cached prefix stays byte-identical.
 - Your committed `AGENTS.md` / `CLAUDE.md` is ingested too (parity with the real
   CLIs), with `@file` imports resolved.
+- **Add your own standing instructions** by dropping any Markdown file into
+  `<repo>/.advantage/` — every `.advantage/<name>.md` is injected verbatim into
+  the system prompt (name-sorted so the frozen prefix stays cache-stable, each
+  budget-capped by `memory.config_budget_tokens`). No code change, no tool call:
+  create `.advantage/style.md`, `.advantage/review-rules.md`, etc. and the agent
+  reads them every turn. **`context.md` is the one name you cannot use this way** —
+  it is the managed memory file (owned by the `remember`/`curate` machinery), so
+  it is deliberately excluded from config-doc ingestion; put hand-authored
+  instructions in any *other* `.md` file instead.
 - Everything is deterministic and offline — no embeddings, no second model
   validating anything. Files live in `<repo>/.advantage/` (a plain, editable
   Markdown `context.md` plus `skills/`).
@@ -525,6 +534,7 @@ require("advantage").setup({
     skills_index_budget_tokens = 1200, -- cap on the always-loaded skills index; skills past
                                  -- it stay loadable by name (deterministic truncation)
     project_budget_tokens = 2000,-- cap on ingested AGENTS.md / CLAUDE.md
+    config_budget_tokens = 2000, -- per-file cap on user-authored .advantage/<name>.md docs
     dedupe_threshold = 0.8,      -- word-overlap ratio above which a fact is a duplicate
   },
   keymaps = {                    -- set to "" to disable any of these

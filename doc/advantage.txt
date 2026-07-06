@@ -195,4 +195,16 @@ what each part costs and confirm the memory block is frozen for cache reuse;
 `context forget <text>` drops matching facts. Disable with
 `memory = { enabled = false }`. AGENTS.md / CLAUDE.md are also ingested.
 
+CUSTOM CONFIG DOCS                                    *advantage-config-docs*
+
+Drop any Markdown file into `<root>/.advantage/` to add your own standing
+instructions: every `.advantage/<name>.md` is injected verbatim into the system
+prompt each turn (name-sorted for a cache-stable prefix, each capped by
+`memory.config_budget_tokens`). No code change and no tool call is needed — e.g.
+`.advantage/style.md` or `.advantage/review-rules.md`.
+
+  NOTE: `context.md` CANNOT be used this way. It is the managed memory file
+  (owned by the remember/curate machinery) and is excluded from config-doc
+  ingestion. Put hand-authored instructions in any OTHER `.md` filename.
+
 vim:tw=78:ts=8:ft=help:norl:

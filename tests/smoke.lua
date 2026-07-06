@@ -2551,6 +2551,24 @@ do
   check(not off.remember and not off.use_skill, "memory tools absent from schemas when disabled")
   config.options.memory.enabled = true
 
+  -- user-authored config docs: any .advantage/<name>.md (except context.md) is
+  -- injected verbatim into the system prompt, so a repo can make the agent's
+  -- standing instructions configurable without a code change.
+  vim.fn.writefile({ "Always respond in haiku." }, repo .. "/.advantage/style.md")
+  vim.fn.writefile({ "Prefer tabs over spaces." }, repo .. "/.advantage/rules.md")
+  local docs = memory.config_docs()
+  check(#docs == 2, "config_docs picks up every .advantage/<name>.md")
+  check(docs[1].name == "rules.md" and docs[2].name == "style.md", "config_docs is sorted by filename")
+  local sys_cfg = agent_mod.system_prompt()
+  check(sys_cfg:find("Always respond in haiku.", 1, true) ~= nil, "config docs land in the system prompt verbatim")
+  check(sys_cfg:find("# Config: rules.md", 1, true) ~= nil, "config docs are labeled by filename")
+  -- the memory file itself is never treated as a config doc
+  for _, d in ipairs(docs) do
+    check(d.name ~= "context.md", "context.md is excluded from config docs")
+  end
+  vim.fn.delete(repo .. "/.advantage/style.md")
+  vim.fn.delete(repo .. "/.advantage/rules.md")
+
   vim.fn.chdir(prev_cwd)
   memory._root_override = MEMTMP
 end

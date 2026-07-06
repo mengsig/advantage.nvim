@@ -227,6 +227,12 @@ M.defaults = {
     skills_index_budget_tokens = 1200,
     ---Token cap for ingested project memory (AGENTS.md / CLAUDE.md).
     project_budget_tokens = 2000,
+    ---Token cap (per file) for user-authored config docs: any `.advantage/<name>.md`
+    ---(except the learned-facts file `context.md`) is injected verbatim into the
+    ---cached system prefix, so a repo can make the agent's standing instructions
+    ---configurable by dropping a markdown file in place. Rides the cache like the
+    ---rest of memory (~10% after turn one); keep each doc lean.
+    config_budget_tokens = 2000,
     ---Word-overlap ratio above which a new fact counts as a duplicate.
     dedupe_threshold = 0.8,
   },

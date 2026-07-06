@@ -14,6 +14,7 @@
 ---Files live at the repo root (git root when there is one):
 ---  .advantage/context.md          learned facts, one bullet each, under fixed sections
 ---  .advantage/skills/<name>/SKILL.md   a named reusable procedure (frontmatter + body)
+---  .advantage/<name>.md           user-authored config doc, injected verbatim (see M.config_docs)
 ---Project memory (AGENTS.md / CLAUDE.md) is also ingested for parity with the real CLIs.
 local config = require("advantage.config")
 
@@ -747,6 +748,39 @@ local function project_memory()
   return vim.trim(text)
 end
 
+---Arbitrary user-authored config docs: every `.advantage/<name>.md` (except the
+---memory file `context.md`) is injected verbatim into the system prompt, so a
+---repo can make the agent's standing instructions configurable by dropping a
+---markdown file in place — no code change. Returned name-sorted so the frozen
+---prefix stays prompt-cache-stable. Each doc is budget-capped like project memory.
+---@return {name: string, text: string}[]
+function M.config_docs()
+  local dir = mem_dir()
+  local fs = uv.fs_scandir(dir)
+  if not fs then return {} end
+  local names = {}
+  while true do
+    local name, typ = uv.fs_scandir_next(fs)
+    if not name then break end
+    -- skills/ is a subdir; context.md is memory; *.tmp are atomic-write scratch.
+    if (typ == "file" or typ == nil) and name:match("%.md$") and name ~= "context.md" then names[#names + 1] = name end
+  end
+  table.sort(names)
+  local cap = (opts().config_budget_tokens or 2000) * 4
+  local docs = {}
+  for _, name in ipairs(names) do
+    local text = read_file(dir .. "/" .. name)
+    if text then
+      text = vim.trim(text:gsub("<!%-%-.-%-%->", ""))
+      if #text > 0 then
+        if #text > cap then text = utf8_safe_sub(text, cap) .. "\n… [config doc truncated]" end
+        docs[#docs + 1] = { name = name, text = text }
+      end
+    end
+  end
+  return docs
+end
+
 --------------------------------------------------------------------------------
 -- verify: flag facts whose file/path anchors no longer exist (honesty pass)
 --------------------------------------------------------------------------------
@@ -817,6 +851,15 @@ function M.render_parts()
   if proj and proj ~= "" then
     parts[#parts + 1] =
       { label = "project memory (AGENTS/CLAUDE.md)", text = "# Project memory (AGENTS.md/CLAUDE.md)\n" .. proj }
+  end
+
+  -- User-authored config docs (.advantage/<name>.md) — standing instructions the
+  -- repo owner drops in to make the agent configurable, injected verbatim.
+  for _, doc in ipairs(M.config_docs()) do
+    parts[#parts + 1] = {
+      label = ("config (%s)"):format(doc.name),
+      text = ("# Config: %s\n%s"):format(doc.name, doc.text),
+    }
   end
 
   local bullets, order = parse_context()
