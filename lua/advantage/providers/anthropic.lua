@@ -16,6 +16,7 @@ local OAUTH_IDENTITY = "You are Claude Code, Anthropic's official CLI for Claude
 ---strictly alternate, so back-to-back user turns (e.g. a compaction summary followed
 ---by a retained user message, or interrupt-injected messages) would otherwise 400.
 local function sanitize_messages(messages)
+  assert(type(messages) == "table", "sanitize_messages: messages must be a table")
   local out = {}
   local seen_tool_use = {}
   for _, msg in ipairs(messages) do
@@ -62,6 +63,7 @@ M._sanitize_messages = sanitize_messages
 ---does not touch the original messages).
 local CACHE_CONTROL = { type = "ephemeral" }
 local function apply_message_cache(messages)
+  assert(type(messages) == "table", "apply_message_cache: messages must be a table")
   local marks = 0
   for idx = #messages, 1, -1 do
     if marks >= 2 then break end
@@ -75,77 +77,111 @@ local function apply_message_cache(messages)
 end
 M._apply_message_cache = apply_message_cache
 
+---Decode a completed tool_use block's accumulated JSON argument stream. A
+---truncated/empty stream decodes to an empty object rather than crashing the turn.
+local function finalize_tool_use(current)
+  assert(type(current) == "table", "finalize_tool_use: current block must be a table")
+  local ok, input = pcall(vim.json.decode, current._json ~= "" and current._json or "{}")
+  current.input = ok and input or vim.empty_dict()
+  current._json = nil
+end
+
+---Begin a new content block from a `content_block_start` event.
+local function start_block(st, on, cb)
+  assert(type(st) == "table" and type(on) == "table", "start_block: state and callbacks required")
+  cb = cb or {}
+  if cb.type == "text" then
+    st.current = { type = "text", text = "" }
+  elseif cb.type == "thinking" then
+    st.current = { type = "thinking", thinking = "", signature = "" }
+  elseif cb.type == "redacted_thinking" then
+    st.current = { type = "redacted_thinking", data = cb.data }
+  elseif cb.type == "tool_use" then
+    st.current = { type = "tool_use", id = cb.id, name = cb.name, _json = "" }
+    on.tool_start(cb.id, cb.name)
+  else
+    st.current = { type = cb.type }
+  end
+end
+
+---Fold a `content_block_delta` into the block currently being assembled. No-op
+---until a block has started, matching the API's ordering guarantees.
+local function apply_delta(st, on, delta)
+  assert(type(st) == "table" and type(on) == "table", "apply_delta: state and callbacks required")
+  local current = st.current
+  if not current then return end
+  if delta.type == "text_delta" then
+    current.text = (current.text or "") .. delta.text
+    on.text(delta.text)
+  elseif delta.type == "thinking_delta" then
+    current.thinking = (current.thinking or "") .. delta.thinking
+    if delta.thinking ~= "" then on.thinking(delta.thinking) end
+  elseif delta.type == "signature_delta" then
+    current.signature = (current.signature or "") .. (delta.signature or "")
+  elseif delta.type == "input_json_delta" then
+    current._json = (current._json or "") .. (delta.partial_json or "")
+  end
+end
+
+---Seal the block currently being assembled and append it to the result list.
+local function stop_block(st)
+  assert(type(st) == "table" and type(st.blocks) == "table", "stop_block: state with blocks required")
+  local current = st.current
+  if not current then return end
+  if current.type == "tool_use" then finalize_tool_use(current) end
+  st.blocks[#st.blocks + 1] = current
+  st.current = nil
+end
+
 ---Build the streaming event handler. Exposed for tests via M._make_handler.
+---Per-event logic lives in the module-level helpers above so this dispatcher
+---stays a short, flat switch over the Anthropic SSE event types.
 local function make_handler(on)
-  local blocks = {}
-  local current = nil
-  local stop_reason = nil
-  local usage = { input = 0, output = 0, cached = 0 }
-  local completed = false
+  assert(type(on) == "table", "make_handler: on must be a table of callbacks")
+  assert(
+    type(on.complete) == "function" and type(on.error) == "function",
+    "make_handler: on.complete and on.error are required callbacks"
+  )
+  local st = {
+    blocks = {},
+    current = nil,
+    stop_reason = nil,
+    usage = { input = 0, output = 0, cached = 0 },
+    completed = false,
+  }
 
   local function on_event(_, d)
     if type(d) ~= "table" then return end
     local t = d.type
     if t == "message_start" then
       local u = d.message and d.message.usage or {}
-      usage.input = (u.input_tokens or 0) + (u.cache_read_input_tokens or 0) + (u.cache_creation_input_tokens or 0)
-      usage.cached = u.cache_read_input_tokens or 0
+      st.usage.input = (u.input_tokens or 0) + (u.cache_read_input_tokens or 0) + (u.cache_creation_input_tokens or 0)
+      st.usage.cached = u.cache_read_input_tokens or 0
     elseif t == "content_block_start" then
-      local cb = d.content_block or {}
-      if cb.type == "text" then
-        current = { type = "text", text = "" }
-      elseif cb.type == "thinking" then
-        current = { type = "thinking", thinking = "", signature = "" }
-      elseif cb.type == "redacted_thinking" then
-        current = { type = "redacted_thinking", data = cb.data }
-      elseif cb.type == "tool_use" then
-        current = { type = "tool_use", id = cb.id, name = cb.name, _json = "" }
-        on.tool_start(cb.id, cb.name)
-      else
-        current = { type = cb.type }
-      end
+      start_block(st, on, d.content_block or {})
     elseif t == "content_block_delta" then
-      local delta = d.delta or {}
-      if delta.type == "text_delta" and current then
-        current.text = (current.text or "") .. delta.text
-        on.text(delta.text)
-      elseif delta.type == "thinking_delta" and current then
-        current.thinking = (current.thinking or "") .. delta.thinking
-        if delta.thinking ~= "" then on.thinking(delta.thinking) end
-      elseif delta.type == "signature_delta" and current then
-        current.signature = (current.signature or "") .. (delta.signature or "")
-      elseif delta.type == "input_json_delta" and current then
-        current._json = (current._json or "") .. (delta.partial_json or "")
-      end
+      apply_delta(st, on, d.delta or {})
     elseif t == "content_block_stop" then
-      if current then
-        if current.type == "tool_use" then
-          local ok, input = pcall(vim.json.decode, current._json ~= "" and current._json or "{}")
-          current.input = ok and input or vim.empty_dict()
-          current._json = nil
-        end
-        blocks[#blocks + 1] = current
-        current = nil
-      end
+      stop_block(st)
     elseif t == "message_delta" then
-      if d.delta and d.delta.stop_reason then stop_reason = d.delta.stop_reason end
-      if d.usage and d.usage.output_tokens then usage.output = d.usage.output_tokens end
+      if d.delta and d.delta.stop_reason then st.stop_reason = d.delta.stop_reason end
+      if d.usage and d.usage.output_tokens then st.usage.output = d.usage.output_tokens end
     elseif t == "message_stop" then
-      if not completed then
-        completed = true
-        on.usage(usage.input, usage.output, usage.cached)
-        on.complete(blocks, stop_reason or "end_turn", usage)
+      if not st.completed then
+        st.completed = true
+        on.usage(st.usage.input, st.usage.output, st.usage.cached)
+        on.complete(st.blocks, st.stop_reason or "end_turn", st.usage)
       end
     elseif t == "error" then
-      if not completed then
-        completed = true
+      if not st.completed then
+        st.completed = true
         on.error((d.error and d.error.message) or "unknown API error")
       end
     end
   end
 
   return on_event, function()
-    return completed
+    return st.completed
   end
 end
 

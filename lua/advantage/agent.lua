@@ -359,12 +359,105 @@ function Agent:_snapshot(call)
   return path
 end
 
+---Silent auto-compact gates. Returns true to skip compaction this round.
+---(Manual/forced compaction bypasses all three.)
+function Agent:_auto_compact_blocked(compact, threshold)
+  assert(type(threshold) == "number", "_auto_compact_blocked: numeric threshold required")
+  assert(type(self.messages) == "table", "_auto_compact_blocked: agent must have a messages table")
+  -- Re-entrancy guard: the LLM path is async (self.job resolves later), and
+  -- _turn_impl calls _maybe_compact(false) on every tool-loop round trip.
+  -- Without this, a second round trip can fire before the first summarizer
+  -- call's callback lands (which is where _auto_compact_floor gets set),
+  -- spawning a second concurrent compaction over the *same* still-unchanged
+  -- self.messages — visible as two "compacted ..." notices in a row with
+  -- identical before/after token counts.
+  if self._compacting then return true end
+
+  -- Threshold gate: silent auto-compact (heuristic or llm) never fires below the
+  -- resolved threshold. The heuristic path re-checks this itself, but the llm
+  -- path does not, so without this check the very first auto-compact of a session
+  -- (before _auto_compact_floor exists) would fire on message count alone under
+  -- auto_compact_mode = "llm", ignoring the threshold entirely.
+  if compact.estimate_tokens(self.messages) < threshold then return true end
+
+  -- Hysteresis: once auto-compaction has run, don't fire again until the
+  -- transcript has genuinely grown past where it left off. Without this, a
+  -- session whose protected "recent" window alone sits near compact_at_tokens
+  -- keeps re-crossing the threshold on almost every tool-loop round trip within a
+  -- single prompt — thrashing (repeated summarizer calls / rewritten history) and
+  -- shredding the prompt cache instead of settling. `_auto_compact_floor` is the
+  -- after_tokens estimate from the last compaction (manual or auto); require
+  -- growth of at least 10% of the threshold beyond it before considering another.
+  local margin = math.max(threshold * 0.1, 2000)
+  if self._auto_compact_floor and compact.estimate_tokens(self.messages) < self._auto_compact_floor + margin then
+    return true
+  end
+  return false
+end
+
+---Adopt a freshly compacted transcript and refresh the compaction bookkeeping.
+---Called from both the heuristic and llm completion paths.
+function Agent:_adopt_compaction(next_messages, info)
+  assert(type(next_messages) == "table" and #next_messages > 0, "_adopt_compaction: non-empty messages required")
+  assert(type(info) == "table", "_adopt_compaction: info table required")
+  self.messages = next_messages
+  self._auto_compact_floor = info.after_tokens
+  -- Compaction boundary: re-render the memory block from disk next turn so any
+  -- fact that just aged out of the transcript re-enters the (now legitimately
+  -- re-cached) system prefix.
+  self._memory_block = nil
+end
+
+---Completion callback for the async LLM summarizer. Splices the summary in on
+---success, records its token usage, and falls back to the heuristic on failure.
+function Agent:_on_llm_compaction(next_messages, info, err, finish_heuristic, callback)
+  assert(
+    type(finish_heuristic) == "function" and type(callback) == "function",
+    "_on_llm_compaction: callbacks required"
+  )
+  local util = require("advantage.util")
+  self.job = nil
+  self._compacting = false
+  -- If the user cancelled mid-summarize, cancel() already cleaned up; never
+  -- splice a summary into a transcript the user abandoned.
+  if self.cancelled then return end
+  if not next_messages then
+    if not err then return callback(nil) end
+    self
+      :ui()
+      .notify("LLM compaction failed (" .. tostring(err) .. ") — falling back to the offline heuristic", vim.log.levels.WARN)
+    return finish_heuristic()
+  end
+  info = info or {}
+  self:_adopt_compaction(next_messages, info)
+  if info.usage and ((info.usage.input or 0) > 0 or (info.usage.output or 0) > 0) then
+    local u = info.usage
+    self.usage.input = self.usage.input + u.input
+    self.usage.output = self.usage.output + u.output
+    self.usage.cached = (self.usage.cached or 0) + (u.cached or 0)
+    self:ui().set_usage(self.usage)
+    require("advantage.usage").record(info.model, u.input, u.output, u.cached)
+  end
+  local label = (info.model and info.model.label) or "llm"
+  if info.reason == "llm_summary_increased_context" then label = label .. " → heuristic fallback" end
+  self:ui().notice(
+    ("compacted %d old messages with %s (~%s → ~%s tokens)"):format(
+      info.compacted_messages,
+      label,
+      util.fmt_tokens(info.before_tokens),
+      util.fmt_tokens(info.after_tokens)
+    )
+  )
+  callback(info)
+end
+
 ---@param force boolean true for manual/forced compaction, false for the silent auto-compact check
 ---@param opts? {mode?: "llm"|"heuristic"}
 ---@param callback? fun(info: table|nil)
 function Agent:_maybe_compact(force, opts, callback)
   opts = opts or {}
   callback = callback or function() end
+  assert(type(callback) == "function", "_maybe_compact: callback must be a function")
   local cfg = config.options.context or {}
   if not force and cfg.auto_compact == false then return callback(nil) end
   local compact = require("advantage.compact")
@@ -378,37 +471,7 @@ function Agent:_maybe_compact(force, opts, callback)
   -- consumes the numbers handed to it below in `eff`.
   local threshold = compact.resolve_threshold(cfg, self.model)
 
-  if not force then
-    -- Re-entrancy guard: the LLM path below is async (self.job resolves later),
-    -- and _turn_impl calls _maybe_compact(false) on every tool-loop round trip.
-    -- Without this, a second round trip can fire before the first summarizer
-    -- call's callback lands (which is where _auto_compact_floor gets set),
-    -- spawning a second concurrent compaction over the *same* still-unchanged
-    -- self.messages — visible as two "compacted ..." notices in a row with
-    -- identical before/after token counts.
-    if self._compacting then return callback(nil) end
-
-    -- Threshold gate: silent auto-compact (heuristic or llm) never fires below
-    -- the resolved threshold. The heuristic path re-checks this itself, but the
-    -- llm path does not, so without this check here the very first auto-compact
-    -- of a session (before _auto_compact_floor exists) would fire on message
-    -- count alone under auto_compact_mode = "llm", ignoring the threshold entirely.
-    if compact.estimate_tokens(self.messages) < threshold then return callback(nil) end
-
-    -- Hysteresis: once auto-compaction has run, don't fire again until the
-    -- transcript has genuinely grown past where it left off. Without this, a
-    -- session whose protected "recent" window alone sits near
-    -- compact_at_tokens keeps re-crossing the threshold on almost every
-    -- tool-loop round trip within a single prompt — thrashing (repeated
-    -- summarizer calls / rewritten history) and shredding the prompt cache
-    -- instead of settling. `_auto_compact_floor` is the after_tokens estimate
-    -- from the last compaction (manual or auto); require growth of at least
-    -- 10% of the threshold beyond it before considering another one.
-    local margin = math.max(threshold * 0.1, 2000)
-    if self._auto_compact_floor and compact.estimate_tokens(self.messages) < self._auto_compact_floor + margin then
-      return callback(nil)
-    end
-  end
+  if not force and self:_auto_compact_blocked(compact, threshold) then return callback(nil) end
 
   self._compacting = true
   -- Resolved config for the model-agnostic compaction functions: the
@@ -432,12 +495,7 @@ function Agent:_maybe_compact(force, opts, callback)
       next_messages, info = compact.compact(self.messages, eff)
     end
     if info then
-      self.messages = next_messages
-      self._auto_compact_floor = info.after_tokens
-      -- Compaction boundary: re-render the memory block from disk next turn so any
-      -- fact that just aged out of the transcript re-enters the (now legitimately
-      -- re-cached) system prefix.
-      self._memory_block = nil
+      self:_adopt_compaction(next_messages, info)
       self:ui().notice(
         ("compacted %d old messages (~%s → ~%s tokens)"):format(
           info.compacted_messages,
@@ -457,44 +515,7 @@ function Agent:_maybe_compact(force, opts, callback)
   if mode ~= "llm" then return finish_heuristic() end
 
   self.job = compact.summarize_with_llm(self.messages, eff, function(next_messages, info, err)
-    self.job = nil
-    self._compacting = false
-    -- If the user cancelled mid-summarize, cancel() already cleaned up; never
-    -- splice a summary into a transcript the user abandoned.
-    if self.cancelled then return end
-    if not next_messages then
-      if not err then return callback(nil) end
-      self
-        :ui()
-        .notify(
-          "LLM compaction failed (" .. tostring(err) .. ") — falling back to the offline heuristic",
-          vim.log.levels.WARN
-        )
-      return finish_heuristic()
-    end
-    info = info or {}
-    self.messages = next_messages
-    self._auto_compact_floor = info.after_tokens
-    self._memory_block = nil -- refresh the memory block from disk at the compaction boundary
-    if info.usage and ((info.usage.input or 0) > 0 or (info.usage.output or 0) > 0) then
-      local u = info.usage
-      self.usage.input = self.usage.input + u.input
-      self.usage.output = self.usage.output + u.output
-      self.usage.cached = (self.usage.cached or 0) + (u.cached or 0)
-      self:ui().set_usage(self.usage)
-      require("advantage.usage").record(info.model, u.input, u.output, u.cached)
-    end
-    local label = (info.model and info.model.label) or "llm"
-    if info.reason == "llm_summary_increased_context" then label = label .. " → heuristic fallback" end
-    self:ui().notice(
-      ("compacted %d old messages with %s (~%s → ~%s tokens)"):format(
-        info.compacted_messages,
-        label,
-        util.fmt_tokens(info.before_tokens),
-        util.fmt_tokens(info.after_tokens)
-      )
-    )
-    callback(info)
+    self:_on_llm_compaction(next_messages, info, err, finish_heuristic, callback)
   end, self.model)
 end
 
@@ -539,6 +560,60 @@ function Agent:_turn_impl()
     self:_maybe_compact(false, nil, continue_turn)
   end)
   if not ok then continue_turn() end
+end
+
+---Fold a streamed usage report into both the session and per-turn counters.
+function Agent:_accumulate_usage(inp, out, cached)
+  assert(type(inp) == "number" and type(out) == "number", "_accumulate_usage: numeric token counts required")
+  assert(type(self.usage) == "table" and type(self.turn_usage) == "table", "_accumulate_usage: usage tables missing")
+  cached = cached or 0
+  self.usage.input = self.usage.input + inp
+  self.usage.output = self.usage.output + out
+  self.usage.cached = (self.usage.cached or 0) + cached
+  self.turn_usage.input = self.turn_usage.input + inp
+  self.turn_usage.output = self.turn_usage.output + out
+  self.turn_usage.cached = (self.turn_usage.cached or 0) + cached
+  self:ui().set_usage(self.usage)
+  require("advantage.usage").record(self.model, inp, out, cached)
+end
+
+---Reset per-turn bookkeeping and begin a fresh assistant turn. Used when drained
+---interrupts inject input that must be answered before the loop continues.
+function Agent:_restart_turn()
+  self.turn_started = uv.hrtime()
+  self.turn_usage = { input = 0, output = 0, cached = 0 }
+  self.turn_open = false
+  return self:_turn()
+end
+
+---Handle a completed model response: record the assistant blocks, then route to
+---tool execution, an interrupt-driven restart, or turn completion.
+function Agent:_on_stream_complete(blocks, stop_reason)
+  assert(type(blocks) == "table", "_on_stream_complete: blocks must be a table")
+  self.job = nil
+  if self.cancelled then return end
+  if #blocks > 0 then table.insert(self.messages, { role = "assistant", content = blocks }) end
+  self:ui().message_meta(self.turn_usage, self.turn_started and (uv.hrtime() - self.turn_started) or nil)
+
+  if stop_reason == "tool_use" then
+    local calls = {}
+    for _, b in ipairs(blocks) do
+      if b.type == "tool_use" then calls[#calls + 1] = b end
+    end
+    if #calls > 0 then
+      if self:_drain_interrupts(nil, calls) then return self:_restart_turn() end
+      return self:_run_tools(calls)
+    end
+  end
+
+  if self:_drain_interrupts_as_user_messages() then return self:_restart_turn() end
+
+  if stop_reason == "refusal" then
+    self:ui().notice("the model declined this request (safety refusal)")
+  elseif stop_reason == "max_tokens" then
+    self:ui().notice("response hit the output-token limit and was truncated")
+  end
+  self:_finish()
 end
 
 function Agent:_continue_turn()
@@ -590,51 +665,10 @@ function Agent:_continue_turn()
         ui.set_auth(badge)
       end,
       usage = function(inp, out, cached)
-        cached = cached or 0
-        self.usage.input = self.usage.input + inp
-        self.usage.output = self.usage.output + out
-        self.usage.cached = (self.usage.cached or 0) + cached
-        self.turn_usage.input = self.turn_usage.input + inp
-        self.turn_usage.output = self.turn_usage.output + out
-        self.turn_usage.cached = (self.turn_usage.cached or 0) + cached
-        ui.set_usage(self.usage)
-        require("advantage.usage").record(self.model, inp, out, cached)
+        self:_accumulate_usage(inp, out, cached)
       end,
       complete = function(blocks, stop_reason)
-        self.job = nil
-        if self.cancelled then return end
-        if #blocks > 0 then table.insert(self.messages, { role = "assistant", content = blocks }) end
-        ui.message_meta(self.turn_usage, self.turn_started and (uv.hrtime() - self.turn_started) or nil)
-
-        if stop_reason == "tool_use" then
-          local calls = {}
-          for _, b in ipairs(blocks) do
-            if b.type == "tool_use" then calls[#calls + 1] = b end
-          end
-          if #calls > 0 then
-            if self:_drain_interrupts(nil, calls) then
-              self.turn_started = uv.hrtime()
-              self.turn_usage = { input = 0, output = 0, cached = 0 }
-              self.turn_open = false
-              return self:_turn()
-            end
-            return self:_run_tools(calls)
-          end
-        end
-
-        if self:_drain_interrupts_as_user_messages() then
-          self.turn_started = uv.hrtime()
-          self.turn_usage = { input = 0, output = 0, cached = 0 }
-          self.turn_open = false
-          return self:_turn()
-        end
-
-        if stop_reason == "refusal" then
-          ui.notice("the model declined this request (safety refusal)")
-        elseif stop_reason == "max_tokens" then
-          ui.notice("response hit the output-token limit and was truncated")
-        end
-        self:_finish()
+        self:_on_stream_complete(blocks, stop_reason)
       end,
       error = function(msg)
         self.job = nil

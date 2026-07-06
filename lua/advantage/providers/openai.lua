@@ -105,11 +105,56 @@ local function to_tools(tools)
   return out
 end
 
+---Record a completed function_call output item as a canonical tool_use block.
+local function append_function_call(st, item)
+  assert(type(st) == "table" and type(st.blocks) == "table", "append_function_call: state with blocks required")
+  assert(type(item) == "table", "append_function_call: item must be a table")
+  st.has_tool_call = true
+  local ok, input = pcall(vim.json.decode, item.arguments and item.arguments ~= "" and item.arguments or "{}")
+  st.blocks[#st.blocks + 1] = {
+    type = "tool_use",
+    id = item.call_id or item.id,
+    openai_item_id = item.id,
+    status = item.status or "completed",
+    name = item.name,
+    input = ok and input or vim.empty_dict(),
+  }
+end
+
+---Coalesce a completed message item's output_text parts into one text block.
+local function append_message(st, item)
+  assert(type(st) == "table" and type(st.blocks) == "table", "append_message: state with blocks required")
+  assert(type(item) == "table", "append_message: item must be a table")
+  local text = {}
+  for _, part in ipairs(item.content or {}) do
+    if part.type == "output_text" then text[#text + 1] = part.text end
+  end
+  if #text > 0 then st.blocks[#st.blocks + 1] = { type = "text", text = table.concat(text) } end
+end
+
+---Dispatch a `response.output_item.done` item to the right block builder.
+local function finish_output_item(st, item)
+  assert(type(st) == "table", "finish_output_item: state required")
+  item = type(item) == "table" and item or {}
+  if item.type == "function_call" then
+    append_function_call(st, item)
+  elseif item.type == "message" then
+    append_message(st, item)
+  elseif item.type == "reasoning" then
+    st.blocks[#st.blocks + 1] = { type = "openai_reasoning", item = item }
+  end
+end
+
+---Build the streaming event handler. Exposed for tests via M._make_handler.
+---Item-completion logic lives in the module-level helpers above so this
+---dispatcher stays a short, flat switch over the Responses API event types.
 local function make_handler(on)
-  local blocks = {}
-  local usage = { input = 0, output = 0, cached = 0 }
-  local completed = false
-  local has_tool_call = false
+  assert(type(on) == "table", "make_handler: on must be a table of callbacks")
+  assert(
+    type(on.complete) == "function" and type(on.error) == "function",
+    "make_handler: on.complete and on.error are required callbacks"
+  )
+  local st = { blocks = {}, usage = { input = 0, output = 0, cached = 0 }, completed = false, has_tool_call = false }
 
   local function on_event(name, d)
     if type(d) ~= "table" then return end
@@ -122,53 +167,33 @@ local function make_handler(on)
     elseif t == "response.reasoning_summary_text.delta" then
       if d.delta and d.delta ~= "" then on.thinking(d.delta) end
     elseif t == "response.output_item.done" then
-      local item = d.item or {}
-      if item.type == "function_call" then
-        has_tool_call = true
-        local ok, input = pcall(vim.json.decode, item.arguments and item.arguments ~= "" and item.arguments or "{}")
-        blocks[#blocks + 1] = {
-          type = "tool_use",
-          id = item.call_id or item.id,
-          openai_item_id = item.id,
-          status = item.status or "completed",
-          name = item.name,
-          input = ok and input or vim.empty_dict(),
-        }
-      elseif item.type == "message" then
-        local text = {}
-        for _, part in ipairs(item.content or {}) do
-          if part.type == "output_text" then text[#text + 1] = part.text end
-        end
-        if #text > 0 then blocks[#blocks + 1] = { type = "text", text = table.concat(text) } end
-      elseif item.type == "reasoning" then
-        blocks[#blocks + 1] = { type = "openai_reasoning", item = item }
-      end
+      finish_output_item(st, d.item)
     elseif t == "response.completed" then
-      if not completed then
-        completed = true
+      if not st.completed then
+        st.completed = true
         local u = (d.response and d.response.usage) or {}
-        usage.input = u.input_tokens or 0
-        usage.output = u.output_tokens or 0
-        usage.cached = (u.input_tokens_details and u.input_tokens_details.cached_tokens) or 0
-        on.usage(usage.input, usage.output, usage.cached)
-        on.complete(blocks, has_tool_call and "tool_use" or "end_turn", usage)
+        st.usage.input = u.input_tokens or 0
+        st.usage.output = u.output_tokens or 0
+        st.usage.cached = (u.input_tokens_details and u.input_tokens_details.cached_tokens) or 0
+        on.usage(st.usage.input, st.usage.output, st.usage.cached)
+        on.complete(st.blocks, st.has_tool_call and "tool_use" or "end_turn", st.usage)
       end
     elseif t == "response.failed" or t == "response.incomplete" then
-      if not completed then
-        completed = true
+      if not st.completed then
+        st.completed = true
         local err = d.response and d.response.error
         on.error((err and err.message) or ("response " .. (t == "response.failed" and "failed" or "incomplete")))
       end
     elseif t == "error" then
-      if not completed then
-        completed = true
+      if not st.completed then
+        st.completed = true
         on.error(d.message or (d.error and d.error.message) or "unknown API error")
       end
     end
   end
 
   return on_event, function()
-    return completed
+    return st.completed
   end
 end
 
