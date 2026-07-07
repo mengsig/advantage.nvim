@@ -16,6 +16,16 @@ end
 ---of `input` served from the prompt cache (billed at ~10%), tracked so the
 ---dashboard can show real cost instead of full-price input.
 function M.record(model, input, output, cached)
+  assert(model == nil or type(model) == "table", "usage.record: model must be a table or nil")
+  assert(input == nil or (type(input) == "number" and input >= 0), "usage.record: input tokens must be non-negative")
+  assert(
+    output == nil or (type(output) == "number" and output >= 0),
+    "usage.record: output tokens must be non-negative"
+  )
+  assert(
+    cached == nil or (type(cached) == "number" and cached >= 0),
+    "usage.record: cached tokens must be non-negative"
+  )
   if (input or 0) == 0 and (output or 0) == 0 then return end
   local rec = {
     t = os.time(),
@@ -70,6 +80,7 @@ end
 ---Aggregate the ledger into dashboard-ready stats.
 ---@param now integer|nil injected for tests
 function M.stats(now)
+  assert(now == nil or type(now) == "number", "usage.stats: now must be a unix timestamp")
   now = now or os.time()
   local week_start = midnight(-6)
   local records = read_since(week_start)
@@ -117,6 +128,7 @@ function M.stats(now)
   -- projection to midnight at today's pace
   local hours_left = (midnight(1) - now) / 3600
   st.projected_today = st.today.total + math.floor(st.pace * hours_left)
+  assert(#st.days == 7, "usage.stats: 7-day bucket array must stay length 7")
   return st
 end
 

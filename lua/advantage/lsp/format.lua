@@ -59,7 +59,10 @@ end
 ---Flatten a documentSymbol response — either hierarchical DocumentSymbol[] (with
 ---.children) or flat SymbolInformation[] — into a depth-tagged list.
 function F.flatten_symbols(result, depth, out)
+  assert(result == nil or type(result) == "table", "flatten_symbols: result must be a table or nil")
+  assert(depth == nil or type(depth) == "number", "flatten_symbols: depth must be a number")
   out = out or {}
+  assert(type(out) == "table", "flatten_symbols: accumulator must be a table")
   for _, s in ipairs(result or {}) do
     if type(s) == "table" and s.name then
       out[#out + 1] = {
@@ -84,6 +87,8 @@ end
 ---@param note string? optional suffix line (e.g. "outline via treesitter")
 ---@return string|nil
 function F.format_flat(label, flat, max, note)
+  assert(type(flat) == "table", "format_flat: flat symbol list must be a table")
+  assert(type(max) == "number" and max >= 0, "format_flat: max must be a non-negative number")
   if #flat == 0 then return nil end
   local lines = { ("%s — %d symbol%s"):format(label, #flat, #flat == 1 and "" or "s") }
   local shown = math.min(#flat, max)

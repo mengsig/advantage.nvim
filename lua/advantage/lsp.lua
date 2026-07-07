@@ -236,6 +236,9 @@ end
 ---each round (the server is mid-index, so give it progressively longer). A real
 ---error (not a timeout) does not retry. `cb(results, err)`.
 local function request(bufnr, method, params, cb)
+  assert(type(bufnr) == "number", "lsp.request: bufnr must be a number")
+  assert(type(method) == "string" and method ~= "", "lsp.request: method must be a non-empty string")
+  assert(type(cb) == "function", "lsp.request: cb must be a function")
   local base = math.max(200, tonumber(cfg().timeout_ms) or 4000)
   local max_attempts = math.max(1, math.min(tonumber(cfg().max_attempts) or 2, 4))
 
