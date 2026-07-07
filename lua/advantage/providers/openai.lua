@@ -30,6 +30,61 @@ local function is_compaction_summary(block)
 end
 
 ---Convert canonical (Anthropic-shaped) messages into Responses API input items.
+---Convert one content block into a Responses API input item, or nil to skip it.
+---Mutates seen_tool_calls to record which function_calls have appeared, so an
+---orphan tool_result (whose call was dropped) is skipped rather than 400-ing.
+local function convert_block(block, role, seen_tool_calls, compacted)
+  assert(type(block) == "table" and block.type ~= nil, "convert_block: normalized block required")
+  assert(type(seen_tool_calls) == "table", "convert_block: seen_tool_calls set required")
+  if block.type == "text" then
+    if role == "assistant" then
+      return { role = "assistant", content = { { type = "output_text", text = block.text } } }
+    end
+    return { role = "user", content = { { type = "input_text", text = block.text } } }
+  elseif block.type == "image" and block.source and block.source.data then
+    return {
+      role = "user",
+      content = {
+        {
+          type = "input_image",
+          image_url = ("data:%s;base64,%s"):format(block.source.media_type or "image/png", block.source.data),
+        },
+      },
+    }
+  elseif block.type == "tool_use" and block.id then
+    seen_tool_calls[block.id] = true
+    local item = {
+      type = "function_call",
+      call_id = block.id,
+      name = block.name,
+      arguments = vim.json.encode(block.input or vim.empty_dict()),
+      status = block.status or "completed",
+    }
+    -- Once context has been compacted the paired encrypted reasoning item is
+    -- gone, so a function_call carrying its server-side id (fc_…) would be
+    -- rejected for lacking its required preceding reasoning item. Replay it as
+    -- a fresh client-provided call instead.
+    if block.openai_item_id and not compacted then item.id = block.openai_item_id end
+    return item
+  elseif block.type == "tool_result" then
+    if not seen_tool_calls[block.tool_use_id] then return nil end
+    local content = block.content
+    if type(content) == "table" then content = vim.json.encode(content) end
+    return {
+      type = "function_call_output",
+      call_id = block.tool_use_id,
+      output = content or "",
+    }
+  elseif block.type == "openai_reasoning" and block.item and not compacted then
+    -- Replay reasoning items so codex models keep their chain across tool calls.
+    -- Once context has been compacted the encrypted item no longer matches the
+    -- exact prior transcript, and the Responses API may reject the request.
+    return block.item
+  end
+  -- anthropic thinking blocks are dropped for this provider
+  return nil
+end
+
 local function to_input_items(messages)
   local items = {}
   local seen_tool_calls = {}
@@ -39,54 +94,8 @@ local function to_input_items(messages)
     for _, block in ipairs(content_blocks(msg)) do
       block = type(block) == "table" and block or { type = "text", text = tostring(block or "") }
       if is_compaction_summary(block) then compacted = true end
-      if block.type == "text" then
-        if msg.role == "assistant" then
-          items[#items + 1] = { role = "assistant", content = { { type = "output_text", text = block.text } } }
-        else
-          items[#items + 1] = { role = "user", content = { { type = "input_text", text = block.text } } }
-        end
-      elseif block.type == "image" and block.source and block.source.data then
-        items[#items + 1] = {
-          role = "user",
-          content = {
-            {
-              type = "input_image",
-              image_url = ("data:%s;base64,%s"):format(block.source.media_type or "image/png", block.source.data),
-            },
-          },
-        }
-      elseif block.type == "tool_use" and block.id then
-        seen_tool_calls[block.id] = true
-        local item = {
-          type = "function_call",
-          call_id = block.id,
-          name = block.name,
-          arguments = vim.json.encode(block.input or vim.empty_dict()),
-          status = block.status or "completed",
-        }
-        -- Once context has been compacted the paired encrypted reasoning item is
-        -- gone, so a function_call carrying its server-side id (fc_…) would be
-        -- rejected for lacking its required preceding reasoning item. Replay it as
-        -- a fresh client-provided call instead.
-        if block.openai_item_id and not compacted then item.id = block.openai_item_id end
-        items[#items + 1] = item
-      elseif block.type == "tool_result" then
-        if seen_tool_calls[block.tool_use_id] then
-          local content = block.content
-          if type(content) == "table" then content = vim.json.encode(content) end
-          items[#items + 1] = {
-            type = "function_call_output",
-            call_id = block.tool_use_id,
-            output = content or "",
-          }
-        end
-      elseif block.type == "openai_reasoning" and block.item and not compacted then
-        -- Replay reasoning items so codex models keep their chain across tool calls.
-        -- Once context has been compacted the encrypted item no longer matches the
-        -- exact prior transcript, and the Responses API may reject the request.
-        items[#items + 1] = block.item
-      end
-      -- anthropic thinking blocks are dropped for this provider
+      local item = convert_block(block, msg.role, seen_tool_calls, compacted)
+      if item then items[#items + 1] = item end
     end
   end
   return items
@@ -201,7 +210,55 @@ M._to_input_items = to_input_items
 M._to_tools = to_tools
 M._make_handler = make_handler
 
+---Build the Responses API request body (tools, reasoning, streaming flags).
+local function build_body(pcfg, req)
+  local otools = to_tools(req.tools)
+  local effort = req.model.reasoning_effort
+  if effort == nil then effort = pcfg.reasoning_effort end
+  return {
+    model = req.model.id,
+    input = to_input_items(req.messages),
+    instructions = req.system,
+    -- omit when empty: Lua can't distinguish {} array from {} object, so an
+    -- empty table would serialize as a JSON object and the Responses API 400s.
+    tools = #otools > 0 and otools or nil,
+    tool_choice = #otools > 0 and "auto" or nil,
+    stream = true,
+    store = false,
+    include = effort ~= false and { "reasoning.encrypted_content" } or nil,
+    reasoning = effort ~= false and {
+      effort = effort,
+      summary = "auto",
+    } or nil,
+  }
+end
+
+---Pick endpoint + headers for the credential mode. Mutates `body` for the
+---API-key path (which caps output tokens). Returns url, headers.
+local function endpoint_for(cred, pcfg, body)
+  assert(type(cred) == "table" and cred.mode ~= nil, "openai.endpoint_for: resolved credential required")
+  if cred.mode == "chatgpt" then
+    return "https://chatgpt.com/backend-api/codex/responses",
+      {
+        "content-type: application/json",
+        "accept: text/event-stream",
+        "authorization: Bearer " .. cred.token,
+        "chatgpt-account-id: " .. cred.account_id,
+        "OpenAI-Beta: responses=experimental",
+        "originator: codex_cli_rs",
+        "session_id: " .. uuid(),
+      }
+  end
+  body.max_output_tokens = pcfg.max_output_tokens
+  return pcfg.base_url .. "/v1/responses",
+    {
+      "content-type: application/json",
+      "authorization: Bearer " .. cred.key,
+    }
+end
+
 function M.stream(req)
+  assert(type(req) == "table" and type(req.on) == "table", "openai.stream: req with on handlers required")
   local pcfg = config.options.providers.openai
   local cancelled, inner, reauthed = false, nil, false
   local attempt
@@ -212,47 +269,8 @@ function M.stream(req)
       if not cred then return req.on.error(autherr) end
       if req.on.auth then req.on.auth(cred.badge) end
 
-      local url, headers
-      local otools = to_tools(req.tools)
-      local effort = req.model.reasoning_effort
-      if effort == nil then effort = pcfg.reasoning_effort end
-      local body = {
-        model = req.model.id,
-        input = to_input_items(req.messages),
-        instructions = req.system,
-        -- omit when empty: Lua can't distinguish {} array from {} object, so an
-        -- empty table would serialize as a JSON object and the Responses API 400s.
-        tools = #otools > 0 and otools or nil,
-        tool_choice = #otools > 0 and "auto" or nil,
-        stream = true,
-        store = false,
-        include = effort ~= false and { "reasoning.encrypted_content" } or nil,
-        reasoning = effort ~= false and {
-          effort = effort,
-          summary = "auto",
-        } or nil,
-      }
-
-      if cred.mode == "chatgpt" then
-        url = "https://chatgpt.com/backend-api/codex/responses"
-        headers = {
-          "content-type: application/json",
-          "accept: text/event-stream",
-          "authorization: Bearer " .. cred.token,
-          "chatgpt-account-id: " .. cred.account_id,
-          "OpenAI-Beta: responses=experimental",
-          "originator: codex_cli_rs",
-          "session_id: " .. uuid(),
-        }
-      else
-        url = pcfg.base_url .. "/v1/responses"
-        headers = {
-          "content-type: application/json",
-          "authorization: Bearer " .. cred.key,
-        }
-        body.max_output_tokens = pcfg.max_output_tokens
-      end
-
+      local body = build_body(pcfg, req)
+      local url, headers = endpoint_for(cred, pcfg, body)
       local on_event, is_completed = make_handler(req.on)
 
       inner = util.request_sse({

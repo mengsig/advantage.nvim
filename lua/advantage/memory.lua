@@ -454,95 +454,26 @@ function M.forget(pattern)
 end
 
 --------------------------------------------------------------------------------
--- Skills: index always known, body loaded on demand
+-- Skills: index always known, body loaded on demand. The implementation lives in
+-- memory/skills.lua; it is wired with this module's shared helpers here so the two
+-- files share one scan cache and the session without a circular require.
 --------------------------------------------------------------------------------
 
----Parse `---` frontmatter (key: value) + body from a SKILL.md.
-local function parse_skill(text)
-  local name, desc, body_start = nil, nil, 1
-  local lines = vim.split(text, "\n", { plain = true })
-  if lines[1] == "---" then
-    local i = 2
-    while i <= #lines and lines[i] ~= "---" do
-      local k, v = lines[i]:match("^(%w+):%s*(.*)$")
-      if k == "name" then
-        name = vim.trim(v)
-      elseif k == "description" then
-        desc = vim.trim(v)
-      end
-      i = i + 1
-    end
-    body_start = i + 1
-  end
-  local body = table.concat(vim.list_slice(lines, body_start), "\n")
-  return name, desc, vim.trim(body)
-end
+local skills = require("advantage.memory.skills")
+skills.setup({
+  mem = M,
+  read_file = read_file,
+  write_file = write_file,
+  tokens = tokens,
+  opts = opts,
+  skills_dir = skills_dir,
+  word_set = word_set,
+})
 
--- Cache parsed skills across turns. `render()`/`skill_hints()`/`stats()` all scan
--- on every system-prompt build; without this each turn re-reads and frontmatter-
--- parses every SKILL.md. Keyed by a cheap stat signature (paths + mtime + size)
--- so an add/remove/content-edit invalidates it; save_skill clears it explicitly.
-local _skills_cache = { sig = nil, value = nil }
-
-local function skill_roots()
-  return { skills_dir(), M.root() .. "/.claude/skills" }
-end
-
-local function skills_signature()
-  local parts = {}
-  for _, root in ipairs(skill_roots()) do
-    local dir = uv.fs_scandir(root)
-    if dir then
-      while true do
-        local entry = uv.fs_scandir_next(dir)
-        if not entry then break end
-        local p = root .. "/" .. entry .. "/SKILL.md"
-        local st = uv.fs_stat(p)
-        if st then parts[#parts + 1] = ("%s:%d:%d"):format(p, st.mtime and st.mtime.sec or 0, st.size or 0) end
-      end
-    end
-  end
-  table.sort(parts)
-  return table.concat(parts, "|")
-end
-
----Scan skill directories (.advantage/skills and, for interop, .claude/skills).
----Returns { {name=, description=, path=} } sorted by name, de-duplicated by name.
----@return {name:string, description:string, path:string}[]
-local function scan_skills()
-  local sig = skills_signature()
-  if _skills_cache.sig == sig and _skills_cache.value then return _skills_cache.value end
-  local roots = skill_roots()
-  local seen, out = {}, {}
-  for _, root in ipairs(roots) do
-    local dir = uv.fs_scandir(root)
-    if dir then
-      while true do
-        local entry = uv.fs_scandir_next(dir)
-        if not entry then break end
-        local skill_path = root .. "/" .. entry .. "/SKILL.md"
-        local text = read_file(skill_path)
-        if text and not seen[entry] then
-          local name, desc = parse_skill(text)
-          name = name or entry
-          if not seen[name] then
-            seen[name] = true
-            out[#out + 1] = { name = name, description = desc or "", path = skill_path }
-          end
-        end
-      end
-    end
-  end
-  table.sort(out, function(a, b)
-    return a.name < b.name
-  end)
-  _skills_cache.sig, _skills_cache.value = sig, out
-  return out
-end
-
-function M.skills_index()
-  return scan_skills()
-end
+M.skills_index = skills.skills_index
+M.use_skill = skills.use_skill
+M.skill_hints = skills.skill_hints
+M.save_skill = skills.save_skill
 
 ---Session-lifetime counters for instrumentation and hint throttling. Reset per
 ---conversation (agent.new) so a fresh chat can re-surface skills and the /usage
@@ -565,58 +496,6 @@ M._session = fresh_session()
 
 function M.reset_session()
   M._session = fresh_session()
-end
-
----Return the full body of a skill by name, or nil.
-function M.use_skill(name)
-  name = vim.trim(tostring(name or ""))
-  for _, s in ipairs(scan_skills()) do
-    if s.name == name then
-      local _, _, body = parse_skill(read_file(s.path) or "")
-      if body then
-        M._session.loaded[name] = true
-        M._session.skill_loads = M._session.skill_loads + 1
-        M._session.skill_load_tokens = M._session.skill_load_tokens + tokens(body)
-      end
-      return body, s.description
-    end
-  end
-  return nil
-end
-
----Deterministically pick skills relevant to a prompt: significant-word overlap
----against the skill's name (weighted) and description. No embeddings, no model
----call. Each skill is hinted at most once per session, and never after its body
----was already loaded.
----@return { name: string, description: string }[]
-function M.skill_hints(text, limit)
-  if not M.enabled() then return {} end
-  local pw, pn = word_set(text)
-  if pn == 0 then return {} end
-  local scored = {}
-  for _, s in ipairs(scan_skills()) do
-    if not M._session.loaded[s.name] and not M._session.hinted[s.name] then
-      local score = 0
-      local nw = word_set((s.name or ""):gsub("[-_]", " "))
-      for w in pairs(nw) do
-        if pw[w] then score = score + 3 end
-      end
-      local dw = word_set(s.description)
-      for w in pairs(dw) do
-        if pw[w] then score = score + 1 end
-      end
-      if score >= 3 then scored[#scored + 1] = { skill = s, score = score } end
-    end
-  end
-  table.sort(scored, function(a, b)
-    return a.score > b.score
-  end)
-  local out = {}
-  for i = 1, math.min(limit or 2, #scored) do
-    out[#out + 1] = scored[i].skill
-    M._session.hinted[scored[i].skill.name] = true
-  end
-  return out
 end
 
 ---The `/context init` prompt — parity with `claude /init`: the agent explores
@@ -687,35 +566,19 @@ end
 ---and what staying index-only (bodies on demand) avoids versus inlining every
 ---skill body into every request.
 function M.stats()
-  local skills = scan_skills()
+  local list = skills.scan_skills()
   local bodies_tokens = 0
-  for _, s in ipairs(skills) do
-    local _, _, body = parse_skill(read_file(s.path) or "")
+  for _, s in ipairs(list) do
+    local _, _, body = skills.parse_skill(read_file(s.path) or "")
     bodies_tokens = bodies_tokens + tokens(body or "")
   end
   return {
     block_tokens = tokens(M.render()),
-    skills = #skills,
+    skills = #list,
     bodies_tokens = bodies_tokens,
     loads = M._session.skill_loads,
     loaded_tokens = M._session.skill_load_tokens,
   }
-end
-
----Create or overwrite a skill.
-function M.save_skill(name, description, body)
-  name = tostring(name or ""):gsub("[^%w._-]", "-")
-  -- Reject empty and dot-only names ("."/".."): "%w._-" keeps dots, so ".." would
-  -- resolve to `.advantage/skills/../SKILL.md` (outside the skills dir).
-  if name == "" or name:match("^%.+$") then return false, "invalid skill name" end
-  local text = ("---\nname: %s\ndescription: %s\n---\n\n%s\n"):format(
-    name,
-    tostring(description or ""),
-    vim.trim(tostring(body or ""))
-  )
-  local ok = write_file(skills_dir() .. "/" .. name .. "/SKILL.md", text)
-  _skills_cache.sig = nil -- new/updated skill: force a re-scan next time
-  return ok, ok and nil or "write failed"
 end
 
 --------------------------------------------------------------------------------
@@ -839,6 +702,58 @@ end
 -- Render: the block injected into the system prompt every turn
 --------------------------------------------------------------------------------
 
+---Build the repo-facts part from context.md, or a cold-start placeholder telling
+---the model the (empty) memory exists so the learning flywheel starts on turn one.
+local function repo_facts_part()
+  local bullets, order = parse_context()
+  assert(type(bullets) == "table", "repo_facts_part: parse_context must return a bullets table")
+  local has_facts = false
+  for _, items in pairs(bullets) do
+    if #items > 0 then has_facts = true end
+  end
+  if has_facts then return { label = "repo memory (context.md)", text = vim.trim(render_context(bullets, order)) } end
+  return {
+    label = "repo memory (context.md, empty)",
+    text = "# Repo memory\nEmpty so far — this repo hasn't been learned yet. As you discover durable, non-obvious facts (build/test commands, architecture invariants, conventions, gotchas, stated preferences), record them with the `remember` tool so future sessions start ahead.",
+  }
+end
+
+---Build the budgeted, always-loaded skills index part, or nil when no skills
+---exist. Truncation is deterministic (scan_skills is alphabetical), so the frozen
+---block stays prompt-cache-stable; a dropped skill is still loadable by name.
+local function skills_index_part()
+  local skill_list = skills.scan_skills()
+  if #skill_list == 0 then return nil end
+  local lines = {
+    "# Skills — reusable procedures for this repo.",
+    "Call the `use_skill` tool with the name to load a skill's full steps before doing that task.",
+  }
+  local budget = math.max(200, (opts().skills_index_budget_tokens or 1200) * 4)
+  assert(budget >= 200, "skills_index_part: index budget must be positive")
+  local used = #lines[1] + #lines[2] + 2
+  local shown, dropped = 0, 0
+  for _, s in ipairs(skill_list) do
+    -- keep the index lean: one line, description capped so a verbose skill
+    -- can't bloat the always-loaded tier (the body loads on demand anyway).
+    local d = s.description or ""
+    if #d > 200 then d = utf8_safe_sub(d, 197) .. "…" end
+    local line = ("- %s: %s"):format(s.name, d)
+    -- always keep at least one; otherwise stop once the index budget is spent
+    if shown == 0 or used + #line + 1 <= budget then
+      lines[#lines + 1] = line
+      used = used + #line + 1
+      shown = shown + 1
+    else
+      dropped = dropped + 1
+    end
+  end
+  assert(shown >= 1, "skills_index_part: must retain at least one skill when any exist")
+  if dropped > 0 then
+    lines[#lines + 1] = ("- … +%d more skill(s) — load any by name with use_skill"):format(dropped)
+  end
+  return { label = ("skills index (%d)"):format(#skill_list), text = table.concat(lines, "\n") }
+end
+
 ---Build the memory block as an ordered list of labeled parts. Each entry is
 ---`{ label = "<short name>", text = "<block bytes>" }`. `render()` joins the
 ---`text` fields; `/context preview` uses the `label`s to attribute per-section
@@ -862,55 +777,10 @@ function M.render_parts()
     }
   end
 
-  local bullets, order = parse_context()
-  local has_facts = false
-  for _, items in pairs(bullets) do
-    if #items > 0 then has_facts = true end
-  end
-  if has_facts then
-    parts[#parts + 1] = { label = "repo memory (context.md)", text = vim.trim(render_context(bullets, order)) }
-  else
-    -- cold start: tell the model the memory exists and is empty, so the
-    -- flywheel starts on session one instead of never
-    parts[#parts + 1] = {
-      label = "repo memory (context.md, empty)",
-      text = "# Repo memory\nEmpty so far — this repo hasn't been learned yet. As you discover durable, non-obvious facts (build/test commands, architecture invariants, conventions, gotchas, stated preferences), record them with the `remember` tool so future sessions start ahead.",
-    }
-  end
+  parts[#parts + 1] = repo_facts_part()
 
-  local skills = scan_skills()
-  if #skills > 0 then
-    local lines = {
-      "# Skills — reusable procedures for this repo.",
-      "Call the `use_skill` tool with the name to load a skill's full steps before doing that task.",
-    }
-    -- Budget the always-loaded index so a large skill library can't re-bloat the
-    -- cached prefix. Truncation is deterministic (scan_skills is alphabetical), so
-    -- the frozen block stays prompt-cache-stable; a dropped skill is still fully
-    -- available — loadable by name with use_skill and still keyword-hinted.
-    local budget = math.max(200, (opts().skills_index_budget_tokens or 1200) * 4)
-    local used = #lines[1] + #lines[2] + 2
-    local shown, dropped = 0, 0
-    for _, s in ipairs(skills) do
-      -- keep the index lean: one line, description capped so a verbose skill
-      -- can't bloat the always-loaded tier (the body loads on demand anyway).
-      local d = s.description or ""
-      if #d > 200 then d = utf8_safe_sub(d, 197) .. "…" end
-      local line = ("- %s: %s"):format(s.name, d)
-      -- always keep at least one; otherwise stop once the index budget is spent
-      if shown == 0 or used + #line + 1 <= budget then
-        lines[#lines + 1] = line
-        used = used + #line + 1
-        shown = shown + 1
-      else
-        dropped = dropped + 1
-      end
-    end
-    if dropped > 0 then
-      lines[#lines + 1] = ("- … +%d more skill(s) — load any by name with use_skill"):format(dropped)
-    end
-    parts[#parts + 1] = { label = ("skills index (%d)"):format(#skills), text = table.concat(lines, "\n") }
-  end
+  local skills_part = skills_index_part()
+  if skills_part then parts[#parts + 1] = skills_part end
 
   return parts
 end

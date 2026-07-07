@@ -198,18 +198,37 @@ function M.sse_parser(on_event, on_stray)
   }
 end
 
----POST `body` to `url` and stream SSE events back.
----Uses a curl config file so the API key never appears in the process list.
----@param opts {url:string, headers:string[], body:string, on_event:fun(name:string,data:any), on_error:fun(msg:string, status?:integer), on_done:fun(), on_retry?:fun(attempt:integer, reason:any), idle_timeout?:integer, max_attempts?:integer}
----@return {stop: fun()}
-function M.request_sse(opts)
+-- Transient curl exit codes worth retrying: connection/recv/send failures,
+-- empty replies (52), timeouts (28), TLS handshake resets (35). These happen
+-- under provider load and are safe to retry *only before any SSE event has
+-- been dispatched* — otherwise a retry would duplicate streamed content.
+local RETRIABLE = {
+  [6] = true,
+  [7] = true,
+  [16] = true,
+  [28] = true,
+  [35] = true,
+  [52] = true,
+  [55] = true,
+  [56] = true,
+  [92] = true,
+}
+
+local function cfg_quote(s)
+  return '"' .. s:gsub("\\", "\\\\"):gsub('"', '\\"') .. '"'
+end
+
+---Write the request body and a curl config file into a fresh 0700 temp dir.
+---Returns the paths table {tmp, body, cfg, hdr}.
+local function write_request_files(opts)
+  assert(type(opts.url) == "string" and opts.url ~= "", "request_sse: opts.url required")
+  assert(type(opts.body) == "string", "request_sse: opts.body must be a string")
+  assert(type(opts.headers) == "table", "request_sse: opts.headers must be a table")
   local tmp = vim.fn.tempname()
   vim.fn.mkdir(tmp, "p", "0700")
-  local body_file = tmp .. "/b.json"
-  local cfg_file = tmp .. "/c.cfg"
-  local hdr_file = tmp .. "/h.txt"
+  local paths = { tmp = tmp, body = tmp .. "/b.json", cfg = tmp .. "/c.cfg", hdr = tmp .. "/h.txt" }
 
-  local f = assert(io.open(body_file, "w"))
+  local f = assert(io.open(paths.body, "w"))
   -- Single UTF-8 choke point: every request body reaches the wire through this
   -- one write, so scrubbing here guarantees no provider can send invalid UTF-8
   -- (which the APIs reject as "not valid JSON: surrogates not allowed") — now and
@@ -217,9 +236,7 @@ function M.request_sse(opts)
   f:write(M.scrub_utf8(opts.body))
   f:close()
 
-  local function q(s)
-    return '"' .. s:gsub("\\", "\\\\"):gsub('"', '\\"') .. '"'
-  end
+  local q = cfg_quote
   local cfg = {
     "url = " .. q(opts.url),
     "request = POST",
@@ -233,175 +250,189 @@ function M.request_sse(opts)
     -- turn forever. Legit streams send pings/tokens well within the window.
     "speed-limit = 1",
     "speed-time = " .. tostring(opts.idle_timeout or 120),
-    "dump-header = " .. q(hdr_file),
-    "data-binary = " .. q("@" .. body_file),
+    "dump-header = " .. q(paths.hdr),
+    "data-binary = " .. q("@" .. paths.body),
   }
   for _, h in ipairs(opts.headers) do
     cfg[#cfg + 1] = "header = " .. q(h)
   end
-  f = assert(io.open(cfg_file, "w"))
+  f = assert(io.open(paths.cfg, "w"))
   f:write(table.concat(cfg, "\n"))
   f:close()
+  return paths
+end
 
-  -- Transient curl exit codes worth retrying: connection/recv/send failures,
-  -- empty replies (52), timeouts (28), TLS handshake resets (35). These happen
-  -- under provider load and are safe to retry *only before any SSE event has
-  -- been dispatched* — otherwise a retry would duplicate streamed content.
-  local RETRIABLE = {
-    [6] = true,
-    [7] = true,
-    [16] = true,
-    [28] = true,
-    [35] = true,
-    [52] = true,
-    [55] = true,
-    [56] = true,
-    [92] = true,
-  }
-  local max_attempts = opts.max_attempts or 3
-
-  local finished, dispatched, stopped = false, 0, false
-  local current_job = nil
+---One-shot temp-dir cleanup guard; repeated calls are no-ops.
+local function make_cleanup(paths)
   local cleaned = false
-
-  local function cleanup()
+  return function()
     if cleaned then return end
     cleaned = true
-    os.remove(body_file)
-    os.remove(cfg_file)
-    os.remove(hdr_file)
-    uv.fs_rmdir(tmp)
+    os.remove(paths.body)
+    os.remove(paths.cfg)
+    os.remove(paths.hdr)
+    uv.fs_rmdir(paths.tmp)
   end
+end
 
-  -- Parse the dumped response headers for the final HTTP status and Retry-After.
-  -- Under redirects/100-continue there can be several status lines; keep the last.
-  local function response_meta()
-    local fh = io.open(hdr_file, "r")
-    if not fh then return nil, nil end
-    local status, retry_after
-    for line in fh:lines() do
-      local code = line:match("^HTTP/%S+%s+(%d%d%d)")
-      if code then status = tonumber(code) end
-      local ra = line:match("^[Rr]etry%-[Aa]fter:%s*(.-)%s*\r?$")
-      if ra then retry_after = ra end
+-- Parse the dumped response headers for the final HTTP status and Retry-After.
+-- Under redirects/100-continue there can be several status lines; keep the last.
+local function read_response_meta(hdr_file)
+  local fh = io.open(hdr_file, "r")
+  if not fh then return nil, nil end
+  local status, retry_after
+  for line in fh:lines() do
+    local code = line:match("^HTTP/%S+%s+(%d%d%d)")
+    if code then status = tonumber(code) end
+    local ra = line:match("^[Rr]etry%-[Aa]fter:%s*(.-)%s*\r?$")
+    if ra then retry_after = ra end
+  end
+  fh:close()
+  return status, retry_after
+end
+
+---Decide whether an exit is a retriable transient failure. Retries only happen
+---before anything has streamed, so a retry can never duplicate content. Returns
+---(delay_ms, reason) to retry, or nil to finish.
+local function retry_plan(code, status, retry_after, stray_count, dispatched, stopped, attempt_no, max_attempts)
+  assert(type(attempt_no) == "number" and type(max_attempts) == "number", "retry_plan: numeric attempt counters")
+  if stopped or dispatched > 0 or attempt_no >= max_attempts then return nil end
+  -- Transient network failure with nothing streamed and no stray body.
+  if code ~= 0 and stray_count == 0 and RETRIABLE[code] then return 400 * attempt_no, code end
+  -- HTTP rate-limit / server error (429, 5xx): curl exits cleanly with a JSON
+  -- error body, so nothing has streamed yet. Honor Retry-After when sane.
+  if status and (status == 429 or (status >= 500 and status <= 599)) then
+    local delay = math.min(500 * 2 ^ (attempt_no - 1), 8000)
+    local secs = tonumber(retry_after)
+    if secs and secs > 0 and secs <= 60 then delay = secs * 1000 end
+    return delay, status
+  end
+  return nil
+end
+
+---Report a terminal (non-retried) attempt to the caller's callbacks.
+local function report_result(opts, code, status, stray, stderr)
+  if #stray > 0 then
+    -- Non-SSE body: usually a JSON error envelope from the API.
+    local ok, err = pcall(vim.json.decode, table.concat(stray, "\n"))
+    local msg
+    if ok and type(err) == "table" then
+      msg = (err.error and err.error.message) or vim.inspect(err)
+    else
+      msg = table.concat(stray, " ")
     end
-    fh:close()
-    return status, retry_after
+    if status and status >= 400 then msg = ("HTTP %d: %s"):format(status, msg) end
+    opts.on_error(msg, status)
+  elseif code ~= 0 then
+    opts.on_error(#stderr > 0 and table.concat(stderr, " ") or ("curl exited with code " .. code), status)
+  else
+    opts.on_done()
   end
+end
 
-  local run_attempt
-  run_attempt = function(attempt_no)
-    local stray, stderr, pending = {}, {}, ""
-    local parser = M.sse_parser(function(name, data)
-      if not finished then
-        dispatched = dispatched + 1
-        opts.on_event(name, data)
+-- Mutually recursive with on_attempt_exit (a retry re-enters run_attempt).
+local run_attempt
+
+---Terminal handler for a finished curl job: retry with backoff, or report.
+local function on_attempt_exit(ctx, attempt_no, code, stray, stderr)
+  local st, opts = ctx.st, ctx.opts
+  if st.finished then return end
+  local status, retry_after = read_response_meta(ctx.paths.hdr)
+  local delay, reason =
+    retry_plan(code, status, retry_after, #stray, st.dispatched, st.stopped, attempt_no, ctx.max_attempts)
+  if delay then
+    if opts.on_retry then pcall(opts.on_retry, attempt_no, reason) end
+    vim.defer_fn(function()
+      if not st.finished and not st.stopped then run_attempt(ctx, attempt_no + 1) end
+    end, delay)
+    return
+  end
+  st.finished = true
+  ctx.cleanup()
+  report_result(opts, code, status, stray, stderr)
+end
+
+---Run one curl attempt, feeding stdout through the SSE parser.
+function run_attempt(ctx, attempt_no)
+  assert(type(ctx) == "table" and type(ctx.st) == "table", "run_attempt: ctx with state required")
+  assert(type(attempt_no) == "number" and attempt_no >= 1, "run_attempt: attempt_no must be >= 1")
+  local opts, st = ctx.opts, ctx.st
+  local stray, stderr, pending = {}, {}, ""
+  local parser = M.sse_parser(function(name, data)
+    if not st.finished then
+      st.dispatched = st.dispatched + 1
+      opts.on_event(name, data)
+    end
+  end, function(line)
+    if line ~= "" then stray[#stray + 1] = line end
+  end)
+
+  st.job = vim.fn.jobstart({ "curl", "--config", ctx.paths.cfg }, {
+    on_stdout = function(_, data)
+      if not data then return end
+      data[1] = pending .. data[1]
+      pending = table.remove(data)
+      for _, line in ipairs(data) do
+        parser.feed_line(line)
       end
-    end, function(line)
-      if line ~= "" then stray[#stray + 1] = line end
+    end,
+    on_stderr = function(_, data)
+      if not data then return end
+      for _, line in ipairs(data) do
+        if line ~= "" then stderr[#stderr + 1] = line end
+      end
+    end,
+    on_exit = function(_, code)
+      if pending ~= "" then
+        parser.feed_line(pending)
+        pending = ""
+      end
+      -- Flush a complete-but-unterminated buffered event: if the stream closed
+      -- right after the final `data:` line without the trailing blank line, the
+      -- payload is still buffered — a blank line dispatches it. No-op otherwise.
+      parser.feed_line("")
+      on_attempt_exit(ctx, attempt_no, code, stray, stderr)
+    end,
+  })
+
+  if st.job <= 0 then
+    st.finished = true
+    ctx.cleanup()
+    vim.schedule(function()
+      opts.on_error("failed to start curl — is it installed?")
     end)
-
-    current_job = vim.fn.jobstart({ "curl", "--config", cfg_file }, {
-      on_stdout = function(_, data)
-        if not data then return end
-        data[1] = pending .. data[1]
-        pending = table.remove(data)
-        for _, line in ipairs(data) do
-          parser.feed_line(line)
-        end
-      end,
-      on_stderr = function(_, data)
-        if not data then return end
-        for _, line in ipairs(data) do
-          if line ~= "" then stderr[#stderr + 1] = line end
-        end
-      end,
-      on_exit = function(_, code)
-        if pending ~= "" then
-          parser.feed_line(pending)
-          pending = ""
-        end
-        -- Flush a complete-but-unterminated buffered event: if the stream closed
-        -- right after the final `data:` line without the trailing blank line, the
-        -- payload is still buffered — a blank line dispatches it. No-op otherwise.
-        parser.feed_line("")
-        if finished then return end
-
-        local status, retry_after = response_meta()
-
-        local function retry(delay, reason)
-          if opts.on_retry then pcall(opts.on_retry, attempt_no, reason) end
-          vim.defer_fn(function()
-            if not finished and not stopped then run_attempt(attempt_no + 1) end
-          end, delay)
-        end
-
-        -- Retry a transient network failure iff nothing has streamed yet.
-        if
-          code ~= 0
-          and #stray == 0
-          and dispatched == 0
-          and not stopped
-          and RETRIABLE[code]
-          and attempt_no < max_attempts
-        then
-          return retry(400 * attempt_no, code)
-        end
-
-        -- Retry HTTP rate-limits / server errors (429, 5xx) with backoff. These
-        -- exit curl cleanly with a JSON error body, so nothing has streamed yet.
-        if
-          status
-          and dispatched == 0
-          and not stopped
-          and attempt_no < max_attempts
-          and (status == 429 or (status >= 500 and status <= 599))
-        then
-          local delay = math.min(500 * 2 ^ (attempt_no - 1), 8000)
-          local secs = tonumber(retry_after)
-          if secs and secs > 0 and secs <= 60 then delay = secs * 1000 end
-          return retry(delay, status)
-        end
-
-        finished = true
-        cleanup()
-        if #stray > 0 then
-          -- Non-SSE body: usually a JSON error envelope from the API.
-          local ok, err = pcall(vim.json.decode, table.concat(stray, "\n"))
-          local msg
-          if ok and type(err) == "table" then
-            msg = (err.error and err.error.message) or vim.inspect(err)
-          else
-            msg = table.concat(stray, " ")
-          end
-          if status and status >= 400 then msg = ("HTTP %d: %s"):format(status, msg) end
-          opts.on_error(msg, status)
-        elseif code ~= 0 then
-          opts.on_error(#stderr > 0 and table.concat(stderr, " ") or ("curl exited with code " .. code), status)
-        else
-          opts.on_done()
-        end
-      end,
-    })
-
-    if current_job <= 0 then
-      finished = true
-      cleanup()
-      vim.schedule(function()
-        opts.on_error("failed to start curl — is it installed?")
-      end)
-    end
   end
+end
 
-  run_attempt(1)
+---POST `body` to `url` and stream SSE events back.
+---Uses a curl config file so the API key never appears in the process list.
+---@param opts {url:string, headers:string[], body:string, on_event:fun(name:string,data:any), on_error:fun(msg:string, status?:integer), on_done:fun(), on_retry?:fun(attempt:integer, reason:any), idle_timeout?:integer, max_attempts?:integer}
+---@return {stop: fun()}
+function M.request_sse(opts)
+  assert(type(opts) == "table", "request_sse: opts table required")
+  assert(type(opts.on_event) == "function", "request_sse: opts.on_event required")
+  assert(
+    type(opts.on_error) == "function" and type(opts.on_done) == "function",
+    "request_sse: on_error and on_done callbacks required"
+  )
+  local paths = write_request_files(opts)
+  local ctx = {
+    opts = opts,
+    paths = paths,
+    cleanup = make_cleanup(paths),
+    max_attempts = opts.max_attempts or 3,
+    st = { finished = false, dispatched = 0, stopped = false, job = nil },
+  }
+  run_attempt(ctx, 1)
 
+  local st = ctx.st
   return {
     stop = function()
-      stopped = true
-      if not finished then
-        finished = true
-        pcall(vim.fn.jobstop, current_job)
-        cleanup()
+      st.stopped = true
+      if not st.finished then
+        st.finished = true
+        pcall(vim.fn.jobstop, st.job)
+        ctx.cleanup()
       end
     end,
   }

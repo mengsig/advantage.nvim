@@ -125,15 +125,8 @@ local function fmt(n)
 end
 
 ---Render the dashboard lines for the float.
-function M.dashboard_lines(session_usage)
-  local cfg = require("advantage.config").options.usage or {}
-  local now = os.time()
-  local st = M.stats(now)
-  local lines = {}
-  local function add(label, value)
-    lines[#lines + 1] = ("  %-12s %s"):format(label, value)
-  end
-
+---Session/today/cache/pace/7-day rows.
+local function add_totals(add, st, session_usage)
   if session_usage then
     add("session", ("↑%s ↓%s"):format(fmt(session_usage.input or 0), fmt(session_usage.output or 0)))
   end
@@ -156,7 +149,10 @@ function M.dashboard_lines(session_usage)
   add("last hour", fmt(st.last_hour) .. " tokens")
   add("pace", fmt(st.pace) .. "/h")
   add("7 days", ("%s  %s total · avg %s/day"):format(sparkline(st.days), fmt(st.week_total), fmt(st.week_avg)))
+end
 
+---Per-model token rows, sorted by descending total.
+local function add_by_model(add, st)
   local models = {}
   for m, total in pairs(st.by_model) do
     models[#models + 1] = { m, total }
@@ -167,55 +163,73 @@ function M.dashboard_lines(session_usage)
   for i, m in ipairs(models) do
     add(i == 1 and "by model" or "", ("%s  %s"):format(fmt(m[2]), m[1]))
   end
+end
 
-  -- Harness instrumentation: what the repo memory injects per turn (cached),
-  -- and what the index-only skill design avoided versus inlining every body.
+---Harness instrumentation: what the repo memory injects per turn (cached), and
+---what the index-only skill design avoided versus inlining every body.
+local function add_harness(lines, add, st, session_usage)
   local mok, memory = pcall(require, "advantage.memory")
-  if mok and memory.enabled() then
-    local ok_hs, hs = pcall(memory.stats)
-    if ok_hs and (hs.block_tokens > 0 or hs.skills > 0) then
-      lines[#lines + 1] = ""
-      add("harness", ("repo memory ~%s tok/turn, rides the cached prefix"):format(fmt(hs.block_tokens)))
-      if hs.skills > 0 then
-        local turns = (session_usage and session_usage.turns) or 0
-        local saved = turns > 0 and math.max(0, turns * hs.bodies_tokens - hs.loaded_tokens) or 0
-        add(
-          "",
-          ("%d skill%s indexed · %d load%s on demand%s"):format(
-            hs.skills,
-            hs.skills == 1 and "" or "s",
-            hs.loads,
-            hs.loads == 1 and "" or "s",
-            saved > 0 and (" · ~%s tok saved vs inlining bodies"):format(fmt(saved)) or ""
-          )
-        )
-      end
+  if not (mok and memory.enabled()) then return end
+  local ok_hs, hs = pcall(memory.stats)
+  if not (ok_hs and (hs.block_tokens > 0 or hs.skills > 0)) then return end
+  lines[#lines + 1] = ""
+  add("harness", ("repo memory ~%s tok/turn, rides the cached prefix"):format(fmt(hs.block_tokens)))
+  if hs.skills > 0 then
+    local turns = (session_usage and session_usage.turns) or 0
+    local saved = turns > 0 and math.max(0, turns * hs.bodies_tokens - hs.loaded_tokens) or 0
+    add(
+      "",
+      ("%d skill%s indexed · %d load%s on demand%s"):format(
+        hs.skills,
+        hs.skills == 1 and "" or "s",
+        hs.loads,
+        hs.loads == 1 and "" or "s",
+        saved > 0 and (" · ~%s tok saved vs inlining bodies"):format(fmt(saved)) or ""
+      )
+    )
+  end
+end
+
+---Daily-budget row with a run-out estimate when a budget is configured.
+local function add_budget(add, st, cfg, now)
+  local budget = cfg.daily_budget
+  if not (budget and budget > 0) then
+    return add("budget", "not set — usage.daily_budget enables run-out estimates")
+  end
+  local used = st.today.total
+  local pct = math.floor(used / budget * 100 + 0.5)
+  local line = ("%s/day · %d%% used"):format(fmt(budget), pct)
+  if used >= budget then
+    line = line .. " · budget exhausted"
+  elseif st.pace > 0 then
+    local eta = now + math.floor((budget - used) / st.pace * 3600)
+    local mid = midnight(1)
+    if eta < mid then
+      line = line .. (" · runs out ~%s at this pace"):format(os.date("%H:%M", eta))
+    else
+      line = line .. " · on track for today"
     end
   end
+  add("budget", line)
+end
+
+function M.dashboard_lines(session_usage)
+  local cfg = require("advantage.config").options.usage or {}
+  local now = os.time()
+  local st = M.stats(now)
+  assert(type(st) == "table" and type(st.today) == "table", "dashboard_lines: stats must include today")
+  local lines = {}
+  local function add(label, value)
+    lines[#lines + 1] = ("  %-12s %s"):format(label, value)
+  end
+
+  add_totals(add, st, session_usage)
+  add_by_model(add, st)
+  add_harness(lines, add, st, session_usage)
 
   lines[#lines + 1] = ""
   if st.pace > 0 then add("projection", ("~%s by midnight at today's pace"):format(fmt(st.projected_today))) end
-
-  local budget = cfg.daily_budget
-  if budget and budget > 0 then
-    local used = st.today.total
-    local pct = math.floor(used / budget * 100 + 0.5)
-    local line = ("%s/day · %d%% used"):format(fmt(budget), pct)
-    if used >= budget then
-      line = line .. " · budget exhausted"
-    elseif st.pace > 0 then
-      local eta = now + math.floor((budget - used) / st.pace * 3600)
-      local mid = midnight(1)
-      if eta < mid then
-        line = line .. (" · runs out ~%s at this pace"):format(os.date("%H:%M", eta))
-      else
-        line = line .. " · on track for today"
-      end
-    end
-    add("budget", line)
-  else
-    add("budget", "not set — usage.daily_budget enables run-out estimates")
-  end
+  add_budget(add, st, cfg, now)
   return lines
 end
 

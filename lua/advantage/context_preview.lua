@@ -18,48 +18,24 @@ local function row(label, tokens, note)
   return ("  %-34s %6d tok%s"):format(label, tokens, note and ("   " .. note) or "")
 end
 
----@param agent table|nil the active agent (nil = no session, so a fresh render)
----@return string[] lines markdown lines for a ui.float
----@return string raw_system the exact system prompt bytes (also appended to lines)
-function M.build(agent)
-  local agentmod = require("advantage.agent")
-  local memory = require("advantage.memory")
-  local tools = require("advantage.tools")
-  local compact = require("advantage.compact")
-  local config = require("advantage.config")
-
-  -- The model whose request we are previewing (falls back to the configured
-  -- default when there's no live session).
+---Resolve the model whose request we are previewing (falls back to the
+---configured default when there's no live session).
+local function resolve_model(agent, config)
   local model = agent and agent.model or nil
   local model_ref = model and (tostring(model.provider) .. "/" .. tostring(model.id))
     or config.options.default_model
     or "?"
   local model_label = (model and model.label) or "(default)"
   local provider = (model and model.provider) or (model_ref:match("^([^/]+)/") or "")
+  return { ref = model_ref, label = model_label, provider = provider }
+end
 
-  -- The memory block that will actually be sent: the agent's session-frozen
-  -- block, or a fresh render when there is no session. Passing it through the
-  -- real system_prompt builder means the bytes shown are byte-for-byte the bytes
-  -- sent — including the frozen-vs-disk state.
-  local frozen = agent and agent:_memory_prompt_block() or nil
-  local sys_parts = agentmod.system_prompt_parts(frozen)
-  local raw_system = agentmod.system_prompt(frozen)
-
-  local lines = {}
-  local function add(l)
-    lines[#lines + 1] = l
-  end
-
-  add("# Context preview")
-  add("")
-  add("The exact packet advantage sends the model each turn. The system prompt and")
-  add("tool schemas are the cached prefix; the transcript grows and only its newest")
-  add("turn is billed at full price.")
-  add("")
-  add(("Model: %s  ·  %s"):format(model_ref, model_label))
-  add("")
-
-  -- ── System prompt ──────────────────────────────────────────────────────────
+---Render the system-prompt breakdown. Expands the memory block into its
+---composition and warns when the frozen prefix has drifted from disk.
+---@return integer system_total token subtotal for the whole system prompt
+local function render_system_section(add, agent, memory, frozen, sys_parts)
+  assert(type(add) == "function", "render_system_section: add sink required")
+  assert(type(sys_parts) == "table", "render_system_section: sys_parts must be a table")
   local mem_on = memory.enabled()
   local frozen_note = (agent and mem_on) and "[memory frozen ✓ · refreshes at /compact]"
     or (mem_on and "[fresh render — no active session]" or "[memory disabled]")
@@ -100,9 +76,15 @@ function M.build(agent)
     end
   end
   add("")
+  return system_total
+end
 
-  -- ── Tools ──────────────────────────────────────────────────────────────────
+---Render the tool-schema breakdown with a wrapped list of tool names.
+---@return integer tools_tok token subtotal for the encoded tool schemas
+local function render_tools_section(add, tools)
+  assert(type(add) == "function", "render_tools_section: add sink required")
   local schemas = tools.schemas()
+  assert(type(schemas) == "table", "render_tools_section: schemas must be a table")
   local ok_json, json = pcall(vim.json.encode, schemas)
   local tools_tok = ok_json and tok(json) or 0
   add("## Tools — cached prefix")
@@ -120,16 +102,30 @@ function M.build(agent)
   end
   if vim.trim(line) ~= "" then add(line) end
   add("")
+  return tools_tok
+end
 
-  -- ── Transcript ─────────────────────────────────────────────────────────────
+---Render the transcript size line.
+---@return integer trans_tok token subtotal for the message transcript
+local function render_transcript_section(add, agent, compact)
+  assert(type(add) == "function", "render_transcript_section: add sink required")
   local msgs = (agent and agent.messages) or {}
+  assert(type(msgs) == "table", "render_transcript_section: messages must be a table")
   local trans_tok = compact.estimate_tokens(msgs)
   add("## Transcript — rolling cache, newest turn full price")
   add(row(("%d messages"):format(#msgs), trans_tok))
   if #msgs > 0 then add("      → mostly cache-read at ~10% after each message's first turn") end
   add("")
+  return trans_tok
+end
 
-  -- ── Totals + cache economics ────────────────────────────────────────────────
+---Render the grand totals plus the per-provider cache economics.
+local function render_totals_section(add, system_total, tools_tok, trans_tok, provider)
+  assert(type(add) == "function", "render_totals_section: add sink required")
+  assert(
+    type(system_total) == "number" and type(tools_tok) == "number" and type(trans_tok) == "number",
+    "render_totals_section: numeric token subtotals required"
+  )
   add(string.rep("═", 48))
   local prefix = system_total + tools_tok
   add(row("cached prefix (system + tools)", prefix))
@@ -141,6 +137,47 @@ function M.build(agent)
   end
   add(row("total context", prefix + trans_tok))
   add("")
+end
+
+---@param agent table|nil the active agent (nil = no session, so a fresh render)
+---@return string[] lines markdown lines for a ui.float
+---@return string raw_system the exact system prompt bytes (also appended to lines)
+function M.build(agent)
+  local agentmod = require("advantage.agent")
+  local memory = require("advantage.memory")
+  local tools = require("advantage.tools")
+  local compact = require("advantage.compact")
+  local config = require("advantage.config")
+
+  local model = resolve_model(agent, config)
+
+  -- The memory block that will actually be sent: the agent's session-frozen
+  -- block, or a fresh render when there is no session. Passing it through the
+  -- real system_prompt builder means the bytes shown are byte-for-byte the bytes
+  -- sent — including the frozen-vs-disk state.
+  local frozen = agent and agent:_memory_prompt_block() or nil
+  local sys_parts = agentmod.system_prompt_parts(frozen)
+  local raw_system = agentmod.system_prompt(frozen)
+  assert(type(raw_system) == "string", "context_preview: system_prompt must return a string")
+
+  local lines = {}
+  local function add(l)
+    lines[#lines + 1] = l
+  end
+
+  add("# Context preview")
+  add("")
+  add("The exact packet advantage sends the model each turn. The system prompt and")
+  add("tool schemas are the cached prefix; the transcript grows and only its newest")
+  add("turn is billed at full price.")
+  add("")
+  add(("Model: %s  ·  %s"):format(model.ref, model.label))
+  add("")
+
+  local system_total = render_system_section(add, agent, memory, frozen, sys_parts)
+  local tools_tok = render_tools_section(add, tools)
+  local trans_tok = render_transcript_section(add, agent, compact)
+  render_totals_section(add, system_total, tools_tok, trans_tok, model.provider)
 
   -- ── The exact bytes ─────────────────────────────────────────────────────────
   add(string.rep("─", 48))

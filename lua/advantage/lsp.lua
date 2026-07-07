@@ -32,8 +32,20 @@ end
 -- The encoding-string form of str_utfindex landed in 0.11; 0.10 only has the
 -- 2-arg (byte-index → utf-16) form. `vim.islist` is 0.11+ (was `tbl_islist`).
 local HAS_ENC_UTFINDEX = vim.fn.has("nvim-0.11") == 1
-local is_list = vim.islist or vim.tbl_islist
-local SymbolKind = (vim.lsp.protocol and vim.lsp.protocol.SymbolKind) or {}
+
+-- Pure result formatters live in lsp/format.lua; re-expose the test hooks and the
+-- treesitter outline on M so the request layer and the smoke suite keep their
+-- existing entry points (lsp._format_symbols, lsp.treesitter_symbols, …).
+local format = require("advantage.lsp.format")
+M._flatten_symbols = format.flatten_symbols
+M._format_flat = format.format_flat
+M._format_symbols = format.format_symbols
+M.treesitter_symbols = format.treesitter_symbols
+M._collect_locations = format.collect_locations
+M._format_locations = format.format_locations
+M._hover_text = format.hover_text
+M._collect_ws = format.collect_ws
+M._format_ws = format.format_ws
 
 ---Convert a 0-based BYTE column into the LSP `character` offset for `encoding`
 ---(the count of code units before that byte). A server using utf-16 (the
@@ -156,354 +168,6 @@ end
 
 ---Display `abs` relative to the project root when it lives inside it; otherwise
 ---keep it absolute (definitions legitimately land in deps/stdlib outside root).
-local function rel(root, abs)
-  if root and abs:sub(1, #root + 1) == root .. "/" then return abs:sub(#root + 2) end
-  return abs
-end
-
----Trimmed text of a file's 0-based line, from a loaded buffer if one exists (so
----unsaved edits are reflected) else the file on disk. `cache` memoizes the line
----array per path across one format pass.
-local function line_text(cache, abs, lnum0)
-  local lines = cache[abs]
-  if lines == nil then
-    local diagnostics = require("advantage.diagnostics")
-    local b = diagnostics.loaded_bufnr(abs)
-    if b then
-      lines = vim.api.nvim_buf_get_lines(b, 0, -1, false)
-    else
-      local f = io.open(abs, "r")
-      if f then
-        local c = f:read("*a")
-        f:close()
-        lines = vim.split(c, "\n", { plain = true })
-      else
-        lines = false
-      end
-    end
-    cache[abs] = lines
-  end
-  if lines and lines[lnum0 + 1] then
-    local s = vim.trim(lines[lnum0 + 1])
-    if #s > 160 then s = util.utf8_safe_sub(s, 160) .. "…" end
-    return s
-  end
-  return nil
-end
-
---------------------------------------------------------------------------------
--- Pure formatters (unit-tested without a live server)
---------------------------------------------------------------------------------
-
----A DocumentSymbol's declaration line (1-based) from whichever range it carries.
-local function symbol_line(s)
-  local rng = s.selectionRange or s.range or (s.location and s.location.range)
-  return rng and (rng.start.line + 1) or nil
-end
-
----Flatten a documentSymbol response — either hierarchical DocumentSymbol[] (with
----.children) or flat SymbolInformation[] — into a depth-tagged list.
-local function flatten_symbols(result, depth, out)
-  out = out or {}
-  for _, s in ipairs(result or {}) do
-    if type(s) == "table" and s.name then
-      out[#out + 1] = {
-        name = s.name,
-        kind = SymbolKind[s.kind] or "symbol",
-        line = symbol_line(s),
-        detail = s.detail,
-        depth = depth or 0,
-      }
-      if type(s.children) == "table" and #s.children > 0 then flatten_symbols(s.children, (depth or 0) + 1, out) end
-    end
-  end
-  return out
-end
-M._flatten_symbols = flatten_symbols
-
----Render an already-flattened {name, kind, line, depth, detail?} symbol list as an
----indented outline. Shared by the LSP path (M._format_symbols) and the treesitter
----fallback (both produce the same flat shape). Returns nil for an empty list.
----@param label string display name for the file
----@param flat {name:string, kind:string, line:integer?, depth:integer, detail:string?}[]
----@param max integer cap on symbol lines
----@param note string? optional suffix line (e.g. "outline via treesitter")
----@return string|nil
-function M._format_flat(label, flat, max, note)
-  if #flat == 0 then return nil end
-  local lines = { ("%s — %d symbol%s"):format(label, #flat, #flat == 1 and "" or "s") }
-  local shown = math.min(#flat, max)
-  for i = 1, shown do
-    local s = flat[i]
-    local detail = ""
-    if type(s.detail) == "string" and s.detail ~= "" then
-      local d = vim.trim(s.detail:gsub("%s+", " "))
-      if #d > 0 then
-        if #d > 60 then d = util.utf8_safe_sub(d, 60) .. "…" end
-        detail = "  " .. d
-      end
-    end
-    lines[#lines + 1] = ("%s%s %s  L%s%s"):format(string.rep("  ", s.depth or 0), s.kind, s.name, s.line or "?", detail)
-  end
-  if #flat > shown then
-    lines[#lines + 1] = ("  … +%d more symbol%s"):format(#flat - shown, #flat - shown == 1 and "" or "s")
-  end
-  if note then lines[#lines + 1] = "  (" .. note .. ")" end
-  return table.concat(lines, "\n")
-end
-
----Render a raw documentSymbol RESPONSE (from the LSP) as an outline.
----@return string|nil
-function M._format_symbols(label, result, max)
-  return M._format_flat(label, flatten_symbols(result), max)
-end
-
---------------------------------------------------------------------------------
--- Treesitter outline: instant, local, independent of the language server
---------------------------------------------------------------------------------
--- Node types that name a symbol, across the common grammars. Node types are
--- largely unique per grammar, so one flat map suffices; we only emit when the node
--- actually has a `name`, which drops anonymous inner nodes.
-local TS_KINDS = {
-  function_declaration = "Function",
-  function_definition = "Function",
-  function_item = "Function",
-  method_definition = "Method",
-  method_declaration = "Method",
-  method_spec = "Method",
-  class_declaration = "Class",
-  class_definition = "Class",
-  class_specifier = "Class",
-  interface_declaration = "Interface",
-  trait_item = "Interface",
-  type_alias_declaration = "Type",
-  type_declaration = "Type",
-  type_item = "Type",
-  struct_specifier = "Struct",
-  struct_item = "Struct",
-  enum_specifier = "Enum",
-  enum_declaration = "Enum",
-  enum_item = "Enum",
-  namespace_definition = "Namespace",
-  module = "Module",
-  impl_item = "Impl",
-}
-local TS_FUNC_VALUES = { arrow_function = true, function_expression = true, ["function"] = true }
--- Filetypes whose treesitter parser is named differently from the filetype (base
--- Neovim's get_lang returns the filetype verbatim for these, which then can't find
--- a parser). Notably typescriptreact → tsx.
-local FT_LANG = {
-  typescriptreact = "tsx",
-  javascriptreact = "javascript",
-  ["javascript.jsx"] = "javascript",
-  ["typescript.tsx"] = "tsx",
-}
-
----Extract a document outline from the buffer's TREESITTER parse — local, instant,
----and independent of the language server. This is why document_symbols/outline
----keeps working when the LSP server is slow, still indexing, or times out on
----navigation (a real failure mode: some servers serve diagnostics but block
----documentSymbol). Returns a flat {name, kind, line, depth} list, or nil when
----there's no treesitter parser for the buffer's language.
----@return {name:string, kind:string, line:integer, depth:integer}[]|nil
-function M.treesitter_symbols(bufnr)
-  if not (vim.treesitter and vim.treesitter.get_parser) then return nil end
-  local ft = (vim.bo[bufnr] and vim.bo[bufnr].filetype) or ""
-  -- A buffer we loaded ourselves may have no filetype yet (filetype detection
-  -- doesn't run in some headless modes), which would leave treesitter unable to
-  -- pick a parser — derive it from the filename so the outline still works.
-  if ft == "" then
-    local name = vim.api.nvim_buf_get_name(bufnr)
-    if name ~= "" then ft = vim.filetype.match({ filename = name, buf = bufnr }) or "" end
-  end
-  local lang = FT_LANG[ft]
-  if not lang and vim.treesitter.language and vim.treesitter.language.get_lang then
-    lang = vim.treesitter.language.get_lang(ft)
-  end
-  if lang == "" then lang = nil end
-  local ok, parser = pcall(vim.treesitter.get_parser, bufnr, lang)
-  if not ok or not parser then return nil end
-  local ok_p, trees = pcall(function()
-    return parser:parse()
-  end)
-  if not ok_p or not trees or not trees[1] then return nil end
-  local root = trees[1]:root()
-  local out = {}
-  local function name_of(node)
-    local nf = node:field("name")
-    if nf and nf[1] then
-      local ok_t, txt = pcall(vim.treesitter.get_node_text, nf[1], bufnr)
-      if ok_t and type(txt) == "string" and txt ~= "" then return (txt:gsub("%s+", " ")) end
-    end
-    return nil
-  end
-  local function walk(node, depth)
-    for child in node:iter_children() do
-      local t, emitted = child:type(), false
-      local kind = TS_KINDS[t]
-      if kind then
-        local nm = name_of(child)
-        if nm then
-          out[#out + 1] = { name = nm, kind = kind, line = child:start() + 1, depth = depth }
-          emitted = true
-        end
-      elseif t == "lexical_declaration" or t == "variable_declaration" then
-        -- const X = () => {} / a function expression — React components etc.
-        for decl in child:iter_children() do
-          if decl:type() == "variable_declarator" then
-            local val = decl:field("value")
-            local vt = val and val[1] and val[1]:type()
-            if vt and TS_FUNC_VALUES[vt] then
-              local nm = name_of(decl)
-              if nm then out[#out + 1] = { name = nm, kind = "Function", line = decl:start() + 1, depth = depth } end
-            end
-          end
-        end
-      end
-      walk(child, emitted and depth + 1 or depth)
-    end
-  end
-  walk(root, 0)
-  if #out == 0 then return nil end
-  return out
-end
-
----Normalize a definition/references response (Location | Location[] | LocationLink
----| LocationLink[], possibly one per client) into a deduped {uri, range} list.
-local function collect_locations(results)
-  local out, seen = {}, {}
-  for _, v in pairs(results or {}) do
-    local r = v and v.result
-    if type(r) == "table" then
-      if r.uri or r.targetUri then r = { r } end -- a single Location/LocationLink
-      if is_list(r) then
-        for _, loc in ipairs(r) do
-          local uri = loc.uri or loc.targetUri
-          local rng = loc.range or loc.targetSelectionRange or loc.targetRange
-          if uri then
-            local key = ("%s:%d:%d"):format(uri, rng and rng.start.line or -1, rng and rng.start.character or -1)
-            if not seen[key] then
-              seen[key] = true
-              out[#out + 1] = { uri = uri, range = rng }
-            end
-          end
-        end
-      end
-    end
-  end
-  return out
-end
-M._collect_locations = collect_locations
-
----Render a location list as `relpath:line:col  <line text>` rows, capped.
----@param header string e.g. "definition" or "references to add"
----@param locs table[] {uri, range}
----@param root string project root for relative display
----@param max integer
-function M._format_locations(header, locs, root, max)
-  local lines = { ("%s — %d result%s"):format(header, #locs, #locs == 1 and "" or "s") }
-  local shown = math.min(#locs, max)
-  local cache = {}
-  for i = 1, shown do
-    local loc = locs[i]
-    local abs = vim.uri_to_fname(loc.uri)
-    local l0 = (loc.range and loc.range.start.line) or 0
-    local c0 = (loc.range and loc.range.start.character) or 0
-    local ctx = line_text(cache, abs, l0)
-    lines[#lines + 1] = ("%s:%d:%d%s"):format(rel(root, abs), l0 + 1, c0 + 1, ctx and ("  " .. ctx) or "")
-  end
-  if #locs > shown then lines[#lines + 1] = ("  … +%d more"):format(#locs - shown) end
-  return table.concat(lines, "\n")
-end
-
----Extract plain text from a hover `contents` (MarkupContent | MarkedString |
----MarkedString[]). Capped so a giant doc comment can't blow out context.
-local function hover_text(contents)
-  local out
-  if type(contents) == "string" then
-    out = contents
-  elseif type(contents) == "table" then
-    if type(contents.value) == "string" then
-      out = contents.value
-    else
-      local parts = {}
-      for _, c in ipairs(contents) do
-        if type(c) == "string" then
-          parts[#parts + 1] = c
-        elseif type(c) == "table" and type(c.value) == "string" then
-          parts[#parts + 1] = c.value
-        end
-      end
-      out = table.concat(parts, "\n")
-    end
-  end
-  if not out then return nil end
-  out = vim.trim(out)
-  if out == "" then return nil end
-  if #out > 1600 then out = util.utf8_safe_sub(out, 1600) .. "\n… [hover truncated]" end
-  return out
-end
-M._hover_text = hover_text
-
----Merge a workspace/symbol response (SymbolInformation[] | WorkspaceSymbol[]).
-local function collect_ws(results)
-  local out = {}
-  for _, v in pairs(results or {}) do
-    for _, s in ipairs((v and v.result) or {}) do
-      if type(s) == "table" and s.name then out[#out + 1] = s end
-    end
-  end
-  return out
-end
-M._collect_ws = collect_ws
-
----Is this workspace symbol located inside the project root?
-local function ws_in_project(s, root)
-  local loc = s.location or {}
-  local abs = loc.uri and vim.uri_to_fname(loc.uri) or nil
-  return abs and root and abs:sub(1, #root + 1) == root .. "/" or false
-end
-
-function M._format_ws(query, syms, root, max)
-  if #syms == 0 then return nil end
-  -- A workspace index is usually dominated by stdlib/runtime/dependency symbols
-  -- (e.g. lua-language-server surfaces hundreds of vim/luv builtins for a common
-  -- name like "setup"), which are pure noise for navigating THIS repo. Show
-  -- project symbols first and collapse the external matches to a single count, so
-  -- the model gets the signal without wading through the library index.
-  local inproj, external = {}, 0
-  for _, s in ipairs(syms) do
-    if ws_in_project(s, root) then
-      inproj[#inproj + 1] = s
-    else
-      external = external + 1
-    end
-  end
-  -- If nothing is in-project, fall back to showing what we do have (external).
-  local list = #inproj > 0 and inproj or syms
-  local scope = #inproj > 0 and " in this project" or ""
-  local lines = { ("workspace symbols for %q — %d match%s%s"):format(query, #list, #list == 1 and "" or "es", scope) }
-  local shown = math.min(#list, max)
-  for i = 1, shown do
-    local s = list[i]
-    local loc = s.location or {}
-    local abs = loc.uri and vim.uri_to_fname(loc.uri) or nil
-    local disp = abs and rel(root, abs) or "?"
-    local rng = loc.range or s.range
-    local l = rng and (rng.start.line + 1) or "?"
-    local kind = SymbolKind[s.kind] or "symbol"
-    lines[#lines + 1] = ("%s %s  %s:%s"):format(kind, s.name, disp, tostring(l))
-  end
-  if #list > shown then lines[#lines + 1] = ("  … +%d more"):format(#list - shown) end
-  if #inproj > 0 and external > 0 then
-    lines[#lines + 1] = ("  (+%d match%s in external/stdlib files hidden — use a distinctive name, or document_symbols on the module)"):format(
-      external,
-      external == 1 and "" or "es"
-    )
-  end
-  return table.concat(lines, "\n")
-end
-
 --------------------------------------------------------------------------------
 -- Live request layer (async, bounded)
 --------------------------------------------------------------------------------
@@ -682,63 +346,78 @@ end
 -- Public tool backends: cb(text, is_error)
 --------------------------------------------------------------------------------
 
+---Answer document_symbols without the LSP — no server attached, navigation
+---latched, or no attached client supports documentSymbol (a diagnostics/lint-only
+---client does not, and asking anyway makes Neovim print "method not supported").
+---An outline is pure syntax, so treesitter covers all of these. Returns true when
+---it has answered via `cb`.
+local function document_symbols_offline(cb, bufnr, abs, clients, supports, ts_fn)
+  assert(type(cb) == "function" and type(ts_fn) == "function", "document_symbols_offline: callbacks required")
+  if not (#clients == 0 or M._nav_should_skip() or not supports) then return false end
+  local ts = ts_fn()
+  if ts then
+    cb(ts, false)
+    return true
+  end
+  if #clients == 0 then
+    no_server(bufnr, abs, cb)
+    return true
+  end
+  if not supports then
+    cb(
+      ("No attached language server provides document symbols for '%s' files, and no treesitter parser is available here — use read_file/grep."):format(
+        ft_of(bufnr, abs)
+      ),
+      false
+    )
+    return true
+  end
+  cb(nav_latch_msg(), false)
+  return true
+end
+
+---Merge a documentSymbol response and render it, falling back to treesitter on an
+---LSP error/timeout or an empty result so an outline still comes back.
+local function render_document_symbols(cb, label, ts_fn, results, rerr)
+  assert(type(cb) == "function" and type(ts_fn) == "function", "render_document_symbols: callbacks required")
+  if rerr then
+    local ts = ts_fn("outline via treesitter — the language server didn't respond")
+    if ts then return cb(ts, false) end
+    return cb("documentSymbol " .. rerr, true)
+  end
+  local merged = {}
+  for _, v in pairs(results or {}) do
+    for _, s in ipairs((v and v.result) or {}) do
+      merged[#merged + 1] = s
+    end
+  end
+  local text = M._format_symbols(label, merged, max_results())
+  if text then return cb(text, false) end
+  -- Server answered but with no symbols → try treesitter before giving up.
+  local ts = ts_fn()
+  if ts then return cb(ts, false) end
+  cb(("No symbols reported for %s (the server may still be indexing, or the file defines none)."):format(label), false)
+end
+
 function M.document_symbols(path, cwd, cb)
   M.note_lsp_use()
   local abs, err = resolve_input(path, cwd)
   if not abs then return cb(err, true) end
   ensure_ready(abs, function(bufnr, clients)
     if not bufnr then return cb("File not found: " .. tostring(path), true) end
-    local label = rel(cwd, abs)
+    local label = format.rel(cwd, abs)
     local function treesitter(note)
       local flat = M.treesitter_symbols(bufnr)
       return flat and M._format_flat(label, flat, max_results(), note) or nil
     end
-    -- Use treesitter (instant, local, no error) instead of the LSP when: no server
-    -- is attached; navigation is latched; OR no attached client actually supports
-    -- documentSymbol (a diagnostics/lint-only client does not — and requesting it
-    -- anyway makes Neovim print "method not supported by any server"). An outline is
-    -- pure syntax, so treesitter covers all of these cleanly.
     local supports = any_supports(clients, "documentSymbolProvider")
-    if #clients == 0 or M._nav_should_skip() or not supports then
-      local ts = treesitter()
-      if ts then return cb(ts, false) end
-      if #clients == 0 then return no_server(bufnr, abs, cb) end
-      if not supports then
-        return cb(
-          ("No attached language server provides document symbols for '%s' files, and no treesitter parser is available here — use read_file/grep."):format(
-            ft_of(bufnr, abs)
-          ),
-          false
-        )
-      end
-      return cb(nav_latch_msg(), false)
-    end
+    if document_symbols_offline(cb, bufnr, abs, clients, supports, treesitter) then return end
     request(
       bufnr,
       "textDocument/documentSymbol",
       { textDocument = { uri = vim.uri_from_bufnr(bufnr) } },
       function(results, rerr)
-        -- LSP errored/timed out → treesitter fallback (still an instant outline).
-        if rerr then
-          local ts = treesitter("outline via treesitter — the language server didn't respond")
-          if ts then return cb(ts, false) end
-          return cb("documentSymbol " .. rerr, true)
-        end
-        local merged = {}
-        for _, v in pairs(results or {}) do
-          for _, s in ipairs((v and v.result) or {}) do
-            merged[#merged + 1] = s
-          end
-        end
-        local text = M._format_symbols(label, merged, max_results())
-        if text then return cb(text, false) end
-        -- Server answered but with no symbols → try treesitter before giving up.
-        local ts = treesitter()
-        if ts then return cb(ts, false) end
-        cb(
-          ("No symbols reported for %s (the server may still be indexing, or the file defines none)."):format(label),
-          false
-        )
+        render_document_symbols(cb, label, treesitter, results, rerr)
       end
     )
   end)
@@ -841,7 +520,7 @@ local function location_query(method, header_fn, extra_params, path, cwd, line, 
     local params = position_params(vim.uri_from_bufnr(bufnr), posinfo, clients, extra_params)
     request(bufnr, method, params, function(results, rerr)
       if rerr then return cb(method:match("[^/]+$") .. " " .. rerr, true) end
-      local locs = collect_locations(results)
+      local locs = format.collect_locations(results)
       if #locs == 0 then
         return cb(("No %s found for the symbol at line %d."):format(header_fn("noun"), used_line), false)
       end
@@ -890,7 +569,7 @@ function M.hover(path, cwd, line, symbol, column, cb)
         if rerr then return cb("hover " .. rerr, true) end
         local text
         for _, v in pairs(results or {}) do
-          text = v and v.result and hover_text(v.result.contents)
+          text = v and v.result and format.hover_text(v.result.contents)
           if text then break end
         end
         if not text then return cb(("No hover info for the symbol at line %d."):format(used_line), false) end
@@ -929,7 +608,7 @@ function M.workspace_symbol(query, cwd, cb)
   if M._nav_should_skip() then return cb(nav_latch_msg(), false) end
   request(bufnr, "workspace/symbol", { query = query }, function(results, rerr)
     if rerr then return cb("workspace/symbol " .. rerr, true) end
-    local syms = collect_ws(results)
+    local syms = format.collect_ws(results)
     local text = M._format_ws(query, syms, cwd, max_results())
     if not text then return cb(("No workspace symbols match %q."):format(query), false) end
     cb(text, false)

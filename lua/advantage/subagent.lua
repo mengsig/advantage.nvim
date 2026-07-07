@@ -285,111 +285,140 @@ local function run_calls(calls, ctx, done)
   next_call()
 end
 
+-- The scout's report is spliced straight into the PARENT transcript, where it
+-- then costs input tokens on every subsequent parent turn until compaction. A
+-- verbose worker could bloat that unbounded, so cap it like every other tool
+-- output (character-safe so the cut never lands mid-UTF-8).
+local REPORT_CAP = 16000
+
+---Resolve model + provider for a sub-agent run using the precedence: explicit
+---tool arg → configured subagents.model → the parent's model. Returns the model
+---and provider, or (nil, nil, error_message) when the run can't proceed.
+local function resolve_subagent_model(input, ctx, cfg)
+  local model = input.model and config.resolve_model(input.model)
+  if not model and cfg.model then model = config.resolve_model(cfg.model) end
+  model = model or ctx.model
+  if not model then return nil, nil, "sub_agent has no model" end
+  local provider = providers.get(model.provider)
+  if not provider then return nil, nil, "Unknown sub-agent provider: " .. tostring(model.provider) end
+  return model, provider
+end
+
+---Deliver the scout's final report to the parent: capped and usage-annotated.
+local function finish_report(s, text, is_error)
+  assert(type(s) == "table" and type(s.cb) == "function", "finish_report: session with cb required")
+  if s.cancelled then return end
+  local util = require("advantage.util")
+  text = vim.trim(text or "")
+  if text == "" and not is_error then text = "Sub-agent finished without a text report." end
+  if #text > REPORT_CAP then text = util.utf8_safe_sub(text, REPORT_CAP) .. "\n… [sub-agent report truncated]" end
+  local suffix = (s.usage.input > 0 or s.usage.output > 0)
+      and ("\n\n[sub-agent usage: ↑%s ↓%s]"):format(util.fmt_tokens(s.usage.input), util.fmt_tokens(s.usage.output))
+    or ""
+  s.cb(text .. suffix, is_error or false)
+end
+
+-- Mutually recursive with on_step_complete (each tool round re-enters step).
+local step
+
+---Handle a completed model response: record blocks, then either report the final
+---text or run the requested tools and take another step.
+local function on_step_complete(s, blocks, stop_reason)
+  s.job = nil
+  if s.cancelled then return end
+  if #blocks > 0 then s.messages[#s.messages + 1] = { role = "assistant", content = blocks } end
+  local interim = text_from_blocks(blocks)
+  if interim ~= "" then s.last_text = interim end
+  local calls = {}
+  if stop_reason == "tool_use" then
+    for _, b in ipairs(blocks) do
+      if b.type == "tool_use" then calls[#calls + 1] = b end
+    end
+  end
+  if #calls == 0 then return finish_report(s, text_from_blocks(blocks), false) end
+  run_calls(calls, s.ctx, function(results)
+    s.messages[#s.messages + 1] = { role = "user", content = results }
+    step(s)
+  end)
+end
+
+---Run one sub-agent turn against the provider stream.
+function step(s)
+  assert(type(s) == "table" and type(s.provider) == "table", "step: session with provider required")
+  if s.cancelled then return end
+  s.turn = s.turn + 1
+  if s.turn > s.max_turns then
+    -- Don't throw away the investigation: return the newest interim findings the
+    -- sub-agent produced, flagged incomplete, instead of nothing.
+    local partial = s.last_text ~= "" and ("\n\nBest partial findings so far:\n" .. s.last_text) or ""
+    return finish_report(
+      s,
+      ("Sub-agent hit its %d-turn limit before a final report.%s"):format(s.max_turns, partial),
+      true
+    )
+  end
+
+  s.job = s.provider.stream({
+    model = s.model,
+    system = system_prompt(),
+    messages = s.messages,
+    tools = readonly_tools(),
+    on = {
+      text = function() end,
+      thinking = function() end,
+      tool_start = function() end,
+      auth = function() end,
+      usage = function(i, o, cached)
+        s.usage.input = s.usage.input + (i or 0)
+        s.usage.output = s.usage.output + (o or 0)
+        require("advantage.usage").record(s.model, i or 0, o or 0, cached)
+      end,
+      complete = function(blocks, stop_reason)
+        on_step_complete(s, blocks, stop_reason)
+      end,
+      error = function(msg)
+        s.job = nil
+        finish_report(s, "Sub-agent error: " .. tostring(msg), true)
+      end,
+    },
+  })
+end
+
 ---@param input {prompt:string, model?:string, max_turns?:integer}
 ---@param ctx {cwd:string, model?:table, system?:string}
 ---@param cb fun(output:string, is_error:boolean)
 function M.run(input, ctx, cb)
+  assert(type(ctx) == "table" and type(ctx.cwd) == "string", "subagent.run: ctx.cwd required")
+  assert(type(cb) == "function", "subagent.run: cb callback required")
   local cfg = config.options.subagents or {}
   if cfg.enabled == false then return cb("Sub-agents are disabled by config.subagents.enabled = false", true) end
   local prompt = vim.trim(tostring(input.prompt or ""))
   if prompt == "" then return cb("sub_agent prompt is required", true) end
 
-  -- Model precedence: explicit tool arg → configured subagents.model (a cheap/fast
-  -- model for read-only fan-out) → the parent's model.
-  local model = input.model and config.resolve_model(input.model)
-  if not model and cfg.model then model = config.resolve_model(cfg.model) end
-  model = model or ctx.model
-  if not model then return cb("sub_agent has no model", true) end
-  local provider = providers.get(model.provider)
-  if not provider then return cb("Unknown sub-agent provider: " .. tostring(model.provider), true) end
+  local model, provider, err = resolve_subagent_model(input, ctx, cfg)
+  if not model then return cb(err or "sub_agent has no model", true) end
 
   local max_turns = math.max(1, math.min(tonumber(input.max_turns or cfg.max_turns or 6) or 6, 12))
-  local messages = {
-    { role = "user", content = { { type = "text", text = prompt } } },
+  local s = {
+    ctx = ctx,
+    cb = cb,
+    model = model,
+    provider = provider,
+    messages = { { role = "user", content = { { type = "text", text = prompt } } } },
+    max_turns = max_turns,
+    turn = 0,
+    cancelled = false,
+    job = nil, ---@type table?
+    usage = { input = 0, output = 0 }, -- accumulated across turns
+    last_text = "", -- newest interim findings, so a turn-limit stop isn't wasted
   }
-  local turn, cancelled, job = 0, false, nil
-  local usage = { input = 0, output = 0 }
-  local last_text = "" -- newest interim findings, so a turn-limit stop isn't wasted
 
-  -- The scout's report is spliced straight into the PARENT transcript, where it
-  -- then costs input tokens on every subsequent parent turn until compaction. A
-  -- verbose worker could bloat that unbounded, so cap it like every other tool
-  -- output (character-safe so the cut never lands mid-UTF-8).
-  local REPORT_CAP = 16000
-
-  local function finish(text, is_error)
-    if cancelled then return end
-    text = vim.trim(text or "")
-    if text == "" and not is_error then text = "Sub-agent finished without a text report." end
-    if #text > REPORT_CAP then
-      text = require("advantage.util").utf8_safe_sub(text, REPORT_CAP) .. "\n… [sub-agent report truncated]"
-    end
-    local suffix = (usage.input > 0 or usage.output > 0)
-        and ("\n\n[sub-agent usage: ↑%s ↓%s]"):format(
-          require("advantage.util").fmt_tokens(usage.input),
-          require("advantage.util").fmt_tokens(usage.output)
-        )
-      or ""
-    cb(text .. suffix, is_error or false)
-  end
-
-  local function step()
-    if cancelled then return end
-    turn = turn + 1
-    if turn > max_turns then
-      -- Don't throw away the investigation: return the newest interim findings the
-      -- sub-agent produced, flagged incomplete, instead of nothing.
-      local partial = last_text ~= "" and ("\n\nBest partial findings so far:\n" .. last_text) or ""
-      return finish(("Sub-agent hit its %d-turn limit before a final report.%s"):format(max_turns, partial), true)
-    end
-
-    job = provider.stream({
-      model = model,
-      system = system_prompt(),
-      messages = messages,
-      tools = readonly_tools(),
-      on = {
-        text = function() end,
-        thinking = function() end,
-        tool_start = function() end,
-        auth = function() end,
-        usage = function(i, o, cached)
-          usage.input = usage.input + (i or 0)
-          usage.output = usage.output + (o or 0)
-          require("advantage.usage").record(model, i or 0, o or 0, cached)
-        end,
-        complete = function(blocks, stop_reason)
-          job = nil
-          if cancelled then return end
-          if #blocks > 0 then messages[#messages + 1] = { role = "assistant", content = blocks } end
-          local interim = text_from_blocks(blocks)
-          if interim ~= "" then last_text = interim end
-          local calls = {}
-          if stop_reason == "tool_use" then
-            for _, b in ipairs(blocks) do
-              if b.type == "tool_use" then calls[#calls + 1] = b end
-            end
-          end
-          if #calls == 0 then return finish(text_from_blocks(blocks), false) end
-          run_calls(calls, ctx, function(results)
-            messages[#messages + 1] = { role = "user", content = results }
-            step()
-          end)
-        end,
-        error = function(msg)
-          job = nil
-          finish("Sub-agent error: " .. tostring(msg), true)
-        end,
-      },
-    })
-  end
-
-  step()
+  step(s)
 
   return {
     stop = function()
-      cancelled = true
-      if job and job.stop then job.stop() end
+      s.cancelled = true
+      if s.job and s.job.stop then s.job.stop() end
     end,
   }
 end

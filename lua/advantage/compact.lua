@@ -256,46 +256,29 @@ local function adjust_cut_for_tool_pairs(messages, cut)
   return cut
 end
 
----Shared prep for both compaction paths: pick the cut point (respecting
----tool_use/tool_result pairing), split into older/recent, peel off any pinned
----turns (kept verbatim), and peel off a prior carried-forward summary so repeat
----compaction extends it instead of nesting or re-truncating it. Returns nil if
----there isn't enough history to bother with.
----@param messages table[] canonical messages
----@return {older: table[], recent: table[], carry: string|nil, pinned: table[]}|nil
-local function prepare_split(messages, opts)
-  local keep = math.max(2, opts.keep_recent_messages or 16)
-  if #messages <= keep + 1 then return nil end
-
-  local cut = #messages - keep
-
-  -- Also bound the retained recent window by a token budget: the message-count
-  -- cap alone can retain far more than the compaction threshold when recent
-  -- messages are large (e.g. a few big file reads), leaving the transcript above
-  -- threshold and re-triggering compaction every turn. Walk newest→oldest,
-  -- keeping messages while they fit `keep_recent_tokens`, but always retain at
-  -- least 2 for coherence; then take whichever bound (count or tokens) cuts more.
-  local budget = opts.keep_recent_tokens
-  if type(budget) == "number" and budget > 0 then
-    local acc, tok_cut = 0, #messages
-    for i = #messages, 1, -1 do
-      acc = acc + M.estimate_tokens({ messages[i] })
-      if acc > budget and (#messages - i + 1) > 2 then break end
-      tok_cut = i - 1
-    end
-    if tok_cut > cut then cut = tok_cut end
+-- Also bound the retained recent window by a token budget: the message-count
+-- cap alone can retain far more than the compaction threshold when recent
+-- messages are large (e.g. a few big file reads), leaving the transcript above
+-- threshold and re-triggering compaction every turn. Walk newest→oldest, keeping
+-- messages while they fit `keep_recent_tokens`, but always retain at least 2 for
+-- coherence; then take whichever bound (count or tokens) cuts more.
+local function bound_cut_by_tokens(messages, cut, budget)
+  if not (type(budget) == "number" and budget > 0) then return cut end
+  local acc, tok_cut = 0, #messages
+  for i = #messages, 1, -1 do
+    acc = acc + M.estimate_tokens({ messages[i] })
+    if acc > budget and (#messages - i + 1) > 2 then break end
+    tok_cut = i - 1
   end
+  return tok_cut > cut and tok_cut or cut
+end
 
-  cut = adjust_cut_for_tool_pairs(messages, cut)
-  if cut <= 0 then return nil end
-  local older = vim.deepcopy(vim.list_slice(messages, 1, cut))
-  local recent = strip_replay_only_blocks(vim.list_slice(messages, cut + 1, #messages))
-
-  -- Pin the original task (and any explicitly pinned turn) verbatim: it must
-  -- survive compaction unparaphrased and untruncated so the agent never drifts
-  -- from what it was asked to do. Legacy sessions saved before the pin flag
-  -- existed have no marker, so adopt a leading, non-summary user turn as the
-  -- task — old transcripts are protected too.
+-- Pin the original task (and any explicitly pinned turn) verbatim: it must
+-- survive compaction unparaphrased and untruncated so the agent never drifts
+-- from what it was asked to do. Legacy sessions saved before the pin flag existed
+-- have no marker, so adopt a leading, non-summary user turn as the task — old
+-- transcripts are protected too. Removes leading pinned turns and returns them.
+local function peel_pinned(older)
   if
     type(older[1]) == "table"
     and older[1].role == "user"
@@ -308,21 +291,45 @@ local function prepare_split(messages, opts)
   while type(older[1]) == "table" and older[1].pinned do
     pinned[#pinned + 1] = table.remove(older, 1)
   end
+  return pinned
+end
 
-  local carry = nil
-  if is_summary_message(older[1]) then
-    -- Peel the carried summary. splice_summary folds the summary block into the
-    -- first retained user message, so on re-compaction that message also carries
-    -- its original (post-summary) blocks — keep those as ordinary older content
-    -- to be re-summarized instead of dropping them with the whole message.
-    local first = older[1]
-    carry = first.content[1].text --[[@as string]]
-    if #first.content > 1 then
-      first.content = vim.list_slice(first.content, 2)
-    else
-      table.remove(older, 1)
-    end
+-- Peel the carried summary. splice_summary folds the summary block into the first
+-- retained user message, so on re-compaction that message also carries its
+-- original (post-summary) blocks — keep those as ordinary older content to be
+-- re-summarized instead of dropping them with the whole message.
+local function peel_carry(older)
+  if not is_summary_message(older[1]) then return nil end
+  local first = older[1]
+  local carry = first.content[1].text --[[@as string]]
+  if #first.content > 1 then
+    first.content = vim.list_slice(first.content, 2)
+  else
+    table.remove(older, 1)
   end
+  return carry
+end
+
+---Shared prep for both compaction paths: pick the cut point (respecting
+---tool_use/tool_result pairing), split into older/recent, peel off any pinned
+---turns (kept verbatim), and peel off a prior carried-forward summary so repeat
+---compaction extends it instead of nesting or re-truncating it. Returns nil if
+---there isn't enough history to bother with.
+---@param messages table[] canonical messages
+---@return {older: table[], recent: table[], carry: string|nil, pinned: table[]}|nil
+local function prepare_split(messages, opts)
+  assert(type(messages) == "table" and type(opts) == "table", "prepare_split: messages and opts tables required")
+  local keep = math.max(2, opts.keep_recent_messages or 16)
+  if #messages <= keep + 1 then return nil end
+
+  local cut = bound_cut_by_tokens(messages, #messages - keep, opts.keep_recent_tokens)
+  cut = adjust_cut_for_tool_pairs(messages, cut)
+  if cut <= 0 then return nil end
+
+  local older = vim.deepcopy(vim.list_slice(messages, 1, cut))
+  local recent = strip_replay_only_blocks(vim.list_slice(messages, cut + 1, #messages))
+  local pinned = peel_pinned(older)
+  local carry = peel_carry(older)
   return { older = older, recent = recent, carry = carry, pinned = pinned }
 end
 
@@ -499,6 +506,45 @@ local function resolve_summarizer(opts, active_model)
 end
 M._resolve_summarizer = resolve_summarizer
 
+---Handle the summarizer's completion: assemble the summary text, guard against a
+---summary that grew the transcript (fall back to the heuristic), and settle via
+---on_done. `s` bundles the split, token baseline, resolved model, opts and usage.
+local function finish_llm_summary(s, blocks, stop_reason)
+  assert(type(s) == "table" and type(s.split) == "table", "finish_llm_summary: session with split required")
+  assert(type(s.on_done) == "function", "finish_llm_summary: on_done callback required")
+  local text = {}
+  for _, b in ipairs(blocks or {}) do
+    if type(b) == "table" and b.type == "text" and b.text then text[#text + 1] = b.text end
+  end
+  local summary = vim.trim(table.concat(text, "\n"))
+  if summary == "" then
+    return s.on_done(nil, nil, "summarizer returned no text (stop_reason: " .. tostring(stop_reason) .. ")")
+  end
+  local compacted = splice_summary(s.split.recent, frame_llm_summary(summary, s.resolved.label), s.split.pinned)
+  local after_tokens = M.estimate_tokens(compacted)
+  if s.before_tokens >= LLM_GROWTH_GUARD_MIN_TOKENS and after_tokens > s.before_tokens then
+    local fallback_summary = summarize_messages(s.split.older, s.opts.summary_max_chars or 12000, s.split.carry)
+    local fallback = splice_summary(s.split.recent, fallback_summary, s.split.pinned)
+    return s.on_done(fallback, {
+      before_tokens = s.before_tokens,
+      after_tokens = M.estimate_tokens(fallback),
+      compacted_messages = #s.split.older,
+      mode = "heuristic",
+      model = s.resolved,
+      usage = s.usage,
+      reason = "llm_summary_increased_context",
+    }, nil)
+  end
+  s.on_done(compacted, {
+    before_tokens = s.before_tokens,
+    after_tokens = after_tokens,
+    compacted_messages = #s.split.older,
+    mode = "llm",
+    model = s.resolved,
+    usage = s.usage,
+  }, nil)
+end
+
 ---Spend one model call to write a real semantic summary of the older half of
 ---the transcript, then splice it in exactly like the heuristic path does. Used
 ---when the selected mode is `"llm"` (manual `context.compact_mode` or silent
@@ -529,7 +575,14 @@ function M.summarize_with_llm(messages, opts, on_done, active_model)
   end
 
   local transcript = serialize_transcript(split.older, split.carry)
-  local usage = { input = 0, output = 0, cached = 0 }
+  local s = {
+    split = split,
+    before_tokens = before_tokens,
+    resolved = resolved,
+    opts = opts,
+    on_done = on_done,
+    usage = { input = 0, output = 0, cached = 0 },
+  }
 
   return provider.stream({
     -- Keep the summarizer cheap/fast regardless of which provider it resolves
@@ -544,42 +597,10 @@ function M.summarize_with_llm(messages, opts, on_done, active_model)
       thinking = function() end,
       tool_start = function() end,
       usage = function(inp, out, cached)
-        usage.input, usage.output, usage.cached = inp or 0, out or 0, cached or 0
+        s.usage.input, s.usage.output, s.usage.cached = inp or 0, out or 0, cached or 0
       end,
       complete = function(blocks, stop_reason)
-        local text = {}
-        for _, b in ipairs(blocks or {}) do
-          if type(b) == "table" and b.type == "text" and b.text then text[#text + 1] = b.text end
-        end
-        local summary = vim.trim(table.concat(text, "\n"))
-        if summary == "" then
-          on_done(nil, nil, "summarizer returned no text (stop_reason: " .. tostring(stop_reason) .. ")")
-          return
-        end
-        local compacted = splice_summary(split.recent, frame_llm_summary(summary, resolved.label), split.pinned)
-        local after_tokens = M.estimate_tokens(compacted)
-        if before_tokens >= LLM_GROWTH_GUARD_MIN_TOKENS and after_tokens > before_tokens then
-          local fallback_summary = summarize_messages(split.older, opts.summary_max_chars or 12000, split.carry)
-          local fallback = splice_summary(split.recent, fallback_summary, split.pinned)
-          on_done(fallback, {
-            before_tokens = before_tokens,
-            after_tokens = M.estimate_tokens(fallback),
-            compacted_messages = #split.older,
-            mode = "heuristic",
-            model = resolved,
-            usage = usage,
-            reason = "llm_summary_increased_context",
-          }, nil)
-          return
-        end
-        on_done(compacted, {
-          before_tokens = before_tokens,
-          after_tokens = after_tokens,
-          compacted_messages = #split.older,
-          mode = "llm",
-          model = resolved,
-          usage = usage,
-        }, nil)
+        finish_llm_summary(s, blocks, stop_reason)
       end,
       error = function(msg)
         on_done(nil, nil, msg)

@@ -122,13 +122,10 @@ local function parse_token(token)
 end
 M._parse_token = parse_token
 
----Expand `@path` / `@path:L10-20` mentions: returns the text with the
----mentioned files (or line ranges) inlined as fenced blocks, plus the list of
----files that matched.
----@return string, {name:string, path:string, size:integer, lo?:integer, hi?:integer}[]
-function M.expand_mentions(text, cwd)
-  cwd = cwd or uv.cwd()
-  local allow_outside = ((require("advantage.config").options or {}).tools or {}).allow_outside_root
+---Scan `text` for `@path` mentions that resolve to real, contained files.
+---@return table[] files each { name, rel, path, size, lo, hi }
+local function collect_mentions(text, cwd, allow_outside)
+  assert(type(text) == "string", "collect_mentions: text must be a string")
   local seen, files = {}, {}
   for raw in text:gmatch("@([%w%._%-/:#]+)") do
     local token = raw:gsub("[.,;:!?]+$", "")
@@ -145,57 +142,76 @@ function M.expand_mentions(text, cwd)
       end
     end
   end
+  return files
+end
+
+---Append the rendered block (fenced content or a read_file pointer) for one
+---mentioned file to `out`.
+local function render_attachment(out, file)
+  assert(type(out) == "table", "render_attachment: out list required")
+  assert(type(file) == "table" and type(file.path) == "string", "render_attachment: resolved file required")
+  local ft = vim.filetype.match({ filename = file.path }) or ""
+  if file.lo and file.size > 2 * 1024 * 1024 then
+    -- Guard against slurping a huge file just to inline a few lines: point the
+    -- agent at read_file with the exact offset/limit instead of loading it all.
+    out[#out + 1] = ("`%s` (%.1f MB) is too large to inline a range — read it with read_file (offset=%d, limit=%d)."):format(
+      file.name,
+      file.size / 1048576,
+      file.lo,
+      file.hi - file.lo + 1
+    )
+  elseif file.lo then
+    -- inline just the requested line range, with enough metadata for the
+    -- agent to edit exactly those lines
+    local f = io.open(file.path, "r")
+    local content = f and f:read("*a") or ""
+    if f then f:close() end
+    local lines = vim.split(content, "\n", { plain = true })
+    if lines[#lines] == "" then table.remove(lines) end
+    local total = #lines
+    local lo = math.max(1, math.min(file.lo, total))
+    local hi = math.max(lo, math.min(file.hi, total))
+    local chunk = table.concat(vim.list_slice(lines, lo, hi), "\n")
+    if #chunk > MAX_INLINE then
+      out[#out + 1] = ("`%s` is too large to inline — read it with the read_file tool (offset=%d, limit=%d)."):format(
+        file.name,
+        lo,
+        hi - lo + 1
+      )
+    else
+      out[#out + 1] = ("```%s %s:L%d-%d (of %d lines)"):format(ft, file.rel, lo, hi, total)
+      out[#out + 1] = chunk
+      out[#out + 1] = "```"
+      out[#out + 1] = ("The user is pointing you at lines %d-%d of %s."):format(lo, hi, file.rel)
+    end
+  elseif file.size > MAX_INLINE then
+    out[#out + 1] = ("`%s` (%.1f KB) is too large to inline — read it with the read_file tool."):format(
+      file.name,
+      file.size / 1024
+    )
+  else
+    local f = io.open(file.path, "r")
+    local content = f and f:read("*a") or ""
+    if f then f:close() end
+    out[#out + 1] = ("```%s %s"):format(ft, file.name)
+    out[#out + 1] = (content:gsub("\n$", ""))
+    out[#out + 1] = "```"
+  end
+end
+
+---Expand `@path` / `@path:L10-20` mentions: returns the text with the
+---mentioned files (or line ranges) inlined as fenced blocks, plus the list of
+---files that matched.
+---@return string, {name:string, path:string, size:integer, lo?:integer, hi?:integer}[]
+function M.expand_mentions(text, cwd)
+  cwd = cwd or uv.cwd()
+  local allow_outside = ((require("advantage.config").options or {}).tools or {}).allow_outside_root
+  local files = collect_mentions(text, cwd, allow_outside)
   if #files == 0 then return text, files end
   local out = { text, "", "Attached files:" }
   for _, file in ipairs(files) do
     out[#out + 1] = ""
-    local ft = vim.filetype.match({ filename = file.path }) or ""
-    if file.lo and file.size > 2 * 1024 * 1024 then
-      -- Guard against slurping a huge file just to inline a few lines: point the
-      -- agent at read_file with the exact offset/limit instead of loading it all.
-      out[#out + 1] = ("`%s` (%.1f MB) is too large to inline a range — read it with read_file (offset=%d, limit=%d)."):format(
-        file.name,
-        file.size / 1048576,
-        file.lo,
-        file.hi - file.lo + 1
-      )
-    elseif file.lo then
-      -- inline just the requested line range, with enough metadata for the
-      -- agent to edit exactly those lines
-      local f = io.open(file.path, "r")
-      local content = f and f:read("*a") or ""
-      if f then f:close() end
-      local lines = vim.split(content, "\n", { plain = true })
-      if lines[#lines] == "" then table.remove(lines) end
-      local total = #lines
-      local lo = math.max(1, math.min(file.lo, total))
-      local hi = math.max(lo, math.min(file.hi, total))
-      local chunk = table.concat(vim.list_slice(lines, lo, hi), "\n")
-      if #chunk > MAX_INLINE then
-        out[#out + 1] = ("`%s` is too large to inline — read it with the read_file tool (offset=%d, limit=%d)."):format(
-          file.name,
-          lo,
-          hi - lo + 1
-        )
-      else
-        out[#out + 1] = ("```%s %s:L%d-%d (of %d lines)"):format(ft, file.rel, lo, hi, total)
-        out[#out + 1] = chunk
-        out[#out + 1] = "```"
-        out[#out + 1] = ("The user is pointing you at lines %d-%d of %s."):format(lo, hi, file.rel)
-      end
-    elseif file.size > MAX_INLINE then
-      out[#out + 1] = ("`%s` (%.1f KB) is too large to inline — read it with the read_file tool."):format(
-        file.name,
-        file.size / 1024
-      )
-    else
-      local f = io.open(file.path, "r")
-      local content = f and f:read("*a") or ""
-      if f then f:close() end
-      out[#out + 1] = ("```%s %s"):format(ft, file.name)
-      out[#out + 1] = (content:gsub("\n$", ""))
-      out[#out + 1] = "```"
-    end
+    render_attachment(out, file)
   end
   return table.concat(out, "\n"), files
 end

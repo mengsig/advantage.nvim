@@ -187,7 +187,83 @@ end
 
 M._make_handler = make_handler
 
+---Build request headers and the system blocks for a resolved credential.
+---A cache breakpoint on the last system block caches the whole static prefix
+---(tools, then system, in Anthropic's cache ordering) so it is read from cache
+---on every turn instead of re-billed.
+---@return string[] headers, table system
+local function build_headers(pcfg, req, cred)
+  assert(type(cred) == "table" and cred.mode ~= nil, "anthropic.build_headers: resolved credential required")
+  local headers = {
+    "content-type: application/json",
+    "anthropic-version: " .. pcfg.version,
+  }
+  local betas = {}
+  local system
+  if cred.mode == "oauth" then
+    headers[#headers + 1] = "authorization: Bearer " .. cred.token
+    betas[#betas + 1] = "oauth-2025-04-20"
+    system = {
+      { type = "text", text = OAUTH_IDENTITY },
+      { type = "text", text = req.system, cache_control = CACHE_CONTROL },
+    }
+  else
+    headers[#headers + 1] = "x-api-key: " .. cred.key
+    system = { { type = "text", text = req.system, cache_control = CACHE_CONTROL } }
+  end
+  -- Parity with the real CLI: keep thinking blocks flowing between tool calls
+  -- so multi-tool turns stay reasoned end-to-end instead of resetting.
+  if req.model.thinking ~= false and pcfg.interleaved_thinking ~= false then
+    betas[#betas + 1] = "interleaved-thinking-2025-05-14"
+  end
+  if #betas > 0 then headers[#headers + 1] = "anthropic-beta: " .. table.concat(betas, ",") end
+  return headers, system
+end
+
+---Apply the model's thinking config to the request body in place, trimming the
+---budget to guarantee headroom for the visible answer.
+local function apply_thinking(body, req)
+  if req.model.thinking == false then return end
+  if type(req.model.thinking) == "table" then
+    -- copy: the trim below may adjust budget_tokens, and req.model.thinking is
+    -- shared config that must not be mutated across turns.
+    body.thinking = vim.deepcopy(req.model.thinking)
+  elseif req.model.thinking_budget then
+    body.thinking = { type = "enabled", budget_tokens = req.model.thinking_budget }
+  else
+    body.thinking = { type = "adaptive", display = "summarized" }
+  end
+  -- Thinking tokens count against max_tokens. A fixed budget close to max_tokens
+  -- (e.g. the 32k "ultrathink" preset under a 32k cap) would leave ~no room for
+  -- the actual answer. Guarantee ANSWER_HEADROOM tokens for the visible reply by
+  -- trimming the budget to fit under max_tokens rather than growing max_tokens
+  -- (which could exceed the model's hard output ceiling and 400). Adaptive
+  -- thinking has no fixed budget, so it is untouched.
+  local ANSWER_HEADROOM = 8192
+  local budget = type(body.thinking) == "table" and body.thinking.budget_tokens or nil
+  if budget and budget + ANSWER_HEADROOM > body.max_tokens then
+    body.thinking.budget_tokens = math.max(1024, body.max_tokens - ANSWER_HEADROOM)
+  end
+end
+
+---Assemble the full /v1/messages request body from the request + system blocks.
+local function build_body(pcfg, req, system)
+  local messages = sanitize_messages(req.messages)
+  apply_message_cache(messages)
+  local body = {
+    model = req.model.id,
+    max_tokens = pcfg.max_tokens,
+    stream = true,
+    system = system,
+    messages = messages,
+    tools = req.tools,
+  }
+  apply_thinking(body, req)
+  return body
+end
+
 function M.stream(req)
+  assert(type(req) == "table" and type(req.on) == "table", "anthropic.stream: req with on handlers required")
   local pcfg = config.options.providers.anthropic
   local cancelled, inner, reauthed = false, nil, false
   local attempt
@@ -198,68 +274,8 @@ function M.stream(req)
       if not cred then return req.on.error(autherr) end
       if req.on.auth then req.on.auth(cred.badge) end
 
-      local headers = {
-        "content-type: application/json",
-        "anthropic-version: " .. pcfg.version,
-      }
-      -- A cache breakpoint on the last system block caches the whole static
-      -- prefix (tools, then system, in Anthropic's cache ordering) so it is read
-      -- from cache on every turn instead of re-billed.
-      local betas = {}
-      local system
-      if cred.mode == "oauth" then
-        headers[#headers + 1] = "authorization: Bearer " .. cred.token
-        betas[#betas + 1] = "oauth-2025-04-20"
-        system = {
-          { type = "text", text = OAUTH_IDENTITY },
-          { type = "text", text = req.system, cache_control = CACHE_CONTROL },
-        }
-      else
-        headers[#headers + 1] = "x-api-key: " .. cred.key
-        system = { { type = "text", text = req.system, cache_control = CACHE_CONTROL } }
-      end
-      -- Parity with the real CLI: keep thinking blocks flowing between tool calls
-      -- so multi-tool turns stay reasoned end-to-end instead of resetting.
-      if req.model.thinking ~= false and pcfg.interleaved_thinking ~= false then
-        betas[#betas + 1] = "interleaved-thinking-2025-05-14"
-      end
-      if #betas > 0 then headers[#headers + 1] = "anthropic-beta: " .. table.concat(betas, ",") end
-
-      local messages = sanitize_messages(req.messages)
-      apply_message_cache(messages)
-
-      local body = {
-        model = req.model.id,
-        max_tokens = pcfg.max_tokens,
-        stream = true,
-        system = system,
-        messages = messages,
-        tools = req.tools,
-      }
-      if req.model.thinking ~= false then
-        if type(req.model.thinking) == "table" then
-          -- copy: the trim below may adjust budget_tokens, and req.model.thinking
-          -- is shared config that must not be mutated across turns.
-          body.thinking = vim.deepcopy(req.model.thinking)
-        elseif req.model.thinking_budget then
-          body.thinking = { type = "enabled", budget_tokens = req.model.thinking_budget }
-        else
-          body.thinking = { type = "adaptive", display = "summarized" }
-        end
-        -- Thinking tokens count against max_tokens. A fixed budget close to
-        -- max_tokens (e.g. the 32k "ultrathink" preset under a 32k cap) would leave
-        -- ~no room for the actual answer. Guarantee ANSWER_HEADROOM tokens for the
-        -- visible reply by trimming the budget to fit under the configured
-        -- max_tokens, rather than growing max_tokens (which could exceed the
-        -- model's hard output ceiling and 400). Adaptive thinking has no fixed
-        -- budget, so it is untouched.
-        local ANSWER_HEADROOM = 8192
-        local budget = type(body.thinking) == "table" and body.thinking.budget_tokens or nil
-        if budget and budget + ANSWER_HEADROOM > body.max_tokens then
-          body.thinking.budget_tokens = math.max(1024, body.max_tokens - ANSWER_HEADROOM)
-        end
-      end
-
+      local headers, system = build_headers(pcfg, req, cred)
+      local body = build_body(pcfg, req, system)
       local on_event, is_completed = make_handler(req.on)
 
       inner = util.request_sse({

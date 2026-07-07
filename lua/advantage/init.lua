@@ -555,6 +555,80 @@ end
 ---View / manage the per-repo learned memory (also `/context`).
 ---`context` shows it; `context verify` flags facts whose paths vanished;
 ---`context forget <text>` drops matching facts.
+---`/context init` — claude /init parity: one agent pass that explores the repo
+---and fills the memory via remember/save_skill, instead of organic learning only.
+local function context_init(memory)
+  if not memory.enabled() then
+    return ui.notify("memory is disabled (config.memory.enabled = false)", vim.log.levels.WARN)
+  end
+  memory.bootstrap()
+  M.ask(memory.init_prompt())
+end
+
+---`/context curate` — compression pass: the agent rewrites its memory tighter and
+---extracts procedural bullets into skills (index-only cost).
+local function context_curate(memory)
+  if not memory.enabled() then
+    return ui.notify("memory is disabled (config.memory.enabled = false)", vim.log.levels.WARN)
+  end
+  M.ask(memory.curate_prompt())
+end
+
+---`/context verify` — flag learned facts whose referenced paths no longer exist.
+local function context_verify(memory)
+  local stale = memory.verify()
+  if #stale == 0 then return ui.notify("repo memory: every referenced path still resolves ✓") end
+  local lines = { "# stale facts — referenced paths no longer exist", "" }
+  for _, s in ipairs(stale) do
+    lines[#lines + 1] = ("- [%s] %s"):format(s.section, s.bullet)
+    lines[#lines + 1] = ("    ↳ missing: %s"):format(s.missing)
+  end
+  ui.float({ title = "advantage · memory verify", lines = lines, filetype = "markdown", footer = "q close" })
+end
+
+---`/context preview` — show the exact context packet (system prompt + tools +
+---transcript) with the cache boundary drawn and a token breakdown; nothing sent.
+local function context_preview()
+  local lines = require("advantage.context_preview").build(current)
+  ui.float({
+    title = "advantage · context preview",
+    lines = lines,
+    filetype = "markdown",
+    footer = "q close · cached prefix billed ~10% after turn 1",
+  })
+end
+
+---`/context forget <text>` — drop matching facts and unfreeze the memory block.
+local function context_forget(memory, args)
+  local pattern = table.concat(vim.list_slice(args, 2), " ")
+  if pattern == "" then return ui.notify("usage: /context forget <text to match>", vim.log.levels.WARN) end
+  local n = memory.forget(pattern)
+  -- drop the frozen memory block so the forgotten fact leaves the live prefix
+  if n > 0 and current then current._memory_block = nil end
+  ui.notify(
+    n > 0 and ("forgot %d fact%s matching %q"):format(n, n == 1 and "" or "s", pattern)
+      or ("no facts matched %q"):format(pattern)
+  )
+end
+
+---`/context` (default) — show the rendered memory block, or an empty-state hint.
+local function context_show(memory)
+  local block = memory.render()
+  local lines = (block ~= "" and vim.split(block, "\n", { plain = true }))
+    or {
+      "Repo memory is empty.",
+      "",
+      "Run /context init to have the agent learn this repo now,",
+      "or let it fill in as you work. Stored under " .. memory.root() .. "/.advantage/",
+    }
+  ui.float({
+    title = "advantage · memory",
+    lines = lines,
+    filetype = "markdown",
+    footer = "q close · /context init · curate · verify · preview · forget <text>",
+  })
+end
+
 function M.context(arg)
   ensure_init()
   local memory = require("advantage.memory")
@@ -562,72 +636,17 @@ function M.context(arg)
   local action = args[1] or "show"
 
   if action == "init" then
-    -- claude /init parity: one agent pass that explores the repo and fills
-    -- the memory via remember/save_skill, instead of waiting for organic learning
-    if not memory.enabled() then
-      ui.notify("memory is disabled (config.memory.enabled = false)", vim.log.levels.WARN)
-      return
-    end
-    memory.bootstrap()
-    M.ask(memory.init_prompt())
+    context_init(memory)
   elseif action == "curate" then
-    -- compression pass: the agent rewrites its memory tighter and extracts
-    -- procedural bullets into skills (index-only cost)
-    if not memory.enabled() then
-      ui.notify("memory is disabled (config.memory.enabled = false)", vim.log.levels.WARN)
-      return
-    end
-    M.ask(memory.curate_prompt())
+    context_curate(memory)
   elseif action == "verify" then
-    local stale = memory.verify()
-    if #stale == 0 then
-      ui.notify("repo memory: every referenced path still resolves ✓")
-      return
-    end
-    local lines = { "# stale facts — referenced paths no longer exist", "" }
-    for _, s in ipairs(stale) do
-      lines[#lines + 1] = ("- [%s] %s"):format(s.section, s.bullet)
-      lines[#lines + 1] = ("    ↳ missing: %s"):format(s.missing)
-    end
-    ui.float({ title = "advantage · memory verify", lines = lines, filetype = "markdown", footer = "q close" })
+    context_verify(memory)
   elseif action == "preview" then
-    -- show the exact context packet (system prompt + tools + transcript) with the
-    -- cache boundary drawn and a per-section token breakdown — nothing is sent
-    local lines = require("advantage.context_preview").build(current)
-    ui.float({
-      title = "advantage · context preview",
-      lines = lines,
-      filetype = "markdown",
-      footer = "q close · cached prefix billed ~10% after turn 1",
-    })
+    context_preview()
   elseif action == "forget" then
-    local pattern = table.concat(vim.list_slice(args, 2), " ")
-    if pattern == "" then
-      ui.notify("usage: /context forget <text to match>", vim.log.levels.WARN)
-      return
-    end
-    local n = memory.forget(pattern)
-    -- drop the frozen memory block so the forgotten fact leaves the live prefix
-    if n > 0 and current then current._memory_block = nil end
-    ui.notify(
-      n > 0 and ("forgot %d fact%s matching %q"):format(n, n == 1 and "" or "s", pattern)
-        or ("no facts matched %q"):format(pattern)
-    )
+    context_forget(memory, args)
   else
-    local block = memory.render()
-    local lines = (block ~= "" and vim.split(block, "\n", { plain = true }))
-      or {
-        "Repo memory is empty.",
-        "",
-        "Run /context init to have the agent learn this repo now,",
-        "or let it fill in as you work. Stored under " .. memory.root() .. "/.advantage/",
-      }
-    ui.float({
-      title = "advantage · memory",
-      lines = lines,
-      filetype = "markdown",
-      footer = "q close · /context init · curate · verify · preview · forget <text>",
-    })
+    context_show(memory)
   end
 end
 
@@ -635,6 +654,72 @@ end
 function M.help()
   ensure_init()
   ui.show_help()
+end
+
+---`:Advantage add` — attach the current file, a visual range, or a netrw
+---selection, depending on the command's range and buffer.
+local function cmd_add(opts)
+  assert(type(opts) == "table", "cmd_add: command opts table required")
+  if not (opts.range and opts.range > 0) then return M.add_file() end
+  if is_netrw_buffer(0) then
+    local files, skipped = netrw_line_files(opts.line1, opts.line2)
+    if #files == 0 then
+      local msg = skipped > 0 and "no regular files in selected netrw lines" or "no netrw files selected"
+      return ui.notify(msg, vim.log.levels.WARN)
+    end
+    for _, file in ipairs(files) do
+      M.attach(file)
+    end
+    local extra = skipped > 0 and ("; skipped " .. skipped .. " non-file item" .. (skipped == 1 and "" or "s")) or ""
+    return ui.notify("added " .. #files .. " netrw file" .. (#files == 1 and "" or "s") .. extra)
+  end
+  -- ranged form: :'<,'>Advantage add → @file:L10-20
+  local name = vim.fn.fnamemodify(vim.api.nvim_buf_get_name(0), ":.")
+  if name == "" then return ui.notify("current buffer has no file on disk", vim.log.levels.WARN) end
+  ui.add_mention(
+    opts.line1 == opts.line2 and ("%s:L%d"):format(name, opts.line1)
+      or ("%s:L%d-%d"):format(name, opts.line1, opts.line2)
+  )
+end
+
+---`:Advantage ask <text>` — send the remaining args, optionally appending the
+---visually-selected range as a fenced code block.
+local function cmd_ask(opts, args)
+  assert(type(opts) == "table" and type(args) == "table", "cmd_ask: opts and args tables required")
+  local text = table.concat(vim.list_slice(args, 2), " ")
+  if opts.range and opts.range > 0 then
+    local lines = vim.api.nvim_buf_get_lines(0, opts.line1 - 1, opts.line2, false)
+    local name = vim.fn.fnamemodify(vim.api.nvim_buf_get_name(0), ":.")
+    text = text
+      .. ("\n\n```%s %s#L%d-L%d\n%s\n```"):format(
+        vim.bo.filetype or "",
+        name,
+        opts.line1,
+        opts.line2,
+        table.concat(lines, "\n")
+      )
+  end
+  if vim.trim(text) ~= "" then M.ask(text) end
+end
+
+---`:Advantage yolo [on|off]` — set or toggle the auto-approve-everything mode.
+local function cmd_yolo(args)
+  local want = args[2]
+  if want == "on" or want == "off" then
+    -- set the opposite, then toggle: keeps all messaging in one place
+    config.options.tools.yolo = want == "off"
+  end
+  M.toggle_yolo()
+end
+
+---`:Advantage attach [path]` — attach a named file, or open the file picker.
+local function cmd_attach(args)
+  local path = args[2]
+  if path and path ~= "" then
+    M.attach(path)
+  else
+    M.pick_files()
+  end
 end
 
 ---@private for :Advantage
@@ -663,12 +748,7 @@ function M._command(opts)
   elseif sub == "review" or sub == "diff" then
     M.review()
   elseif sub == "yolo" then
-    local want = args[2]
-    if want == "on" or want == "off" then
-      -- set the opposite, then toggle: keeps all messaging in one place
-      config.options.tools.yolo = want == "off"
-    end
-    M.toggle_yolo()
+    cmd_yolo(args)
   elseif sub == "effort" then
     if args[2] then
       M.set_effort(args[2])
@@ -676,59 +756,13 @@ function M._command(opts)
       M.pick_effort()
     end
   elseif sub == "add" then
-    if opts.range and opts.range > 0 then
-      if is_netrw_buffer(0) then
-        local files, skipped = netrw_line_files(opts.line1, opts.line2)
-        if #files == 0 then
-          local msg = skipped > 0 and "no regular files in selected netrw lines" or "no netrw files selected"
-          ui.notify(msg, vim.log.levels.WARN)
-          return
-        end
-        for _, file in ipairs(files) do
-          M.attach(file)
-        end
-        local extra = skipped > 0 and ("; skipped " .. skipped .. " non-file item" .. (skipped == 1 and "" or "s"))
-          or ""
-        ui.notify("added " .. #files .. " netrw file" .. (#files == 1 and "" or "s") .. extra)
-      else
-        -- ranged form: :'<,'>Advantage add → @file:L10-20
-        local name = vim.fn.fnamemodify(vim.api.nvim_buf_get_name(0), ":.")
-        if name == "" then
-          ui.notify("current buffer has no file on disk", vim.log.levels.WARN)
-          return
-        end
-        ui.add_mention(
-          opts.line1 == opts.line2 and ("%s:L%d"):format(name, opts.line1)
-            or ("%s:L%d-%d"):format(name, opts.line1, opts.line2)
-        )
-      end
-    else
-      M.add_file()
-    end
+    cmd_add(opts)
   elseif sub == "files" then
     M.pick_files()
   elseif sub == "attach" then
-    local path = args[2]
-    if path and path ~= "" then
-      M.attach(path)
-    else
-      M.pick_files()
-    end
+    cmd_attach(args)
   elseif sub == "ask" then
-    local text = table.concat(vim.list_slice(args, 2), " ")
-    if opts.range and opts.range > 0 then
-      local lines = vim.api.nvim_buf_get_lines(0, opts.line1 - 1, opts.line2, false)
-      local name = vim.fn.fnamemodify(vim.api.nvim_buf_get_name(0), ":.")
-      text = text
-        .. ("\n\n```%s %s#L%d-L%d\n%s\n```"):format(
-          vim.bo.filetype or "",
-          name,
-          opts.line1,
-          opts.line2,
-          table.concat(lines, "\n")
-        )
-    end
-    if vim.trim(text) ~= "" then M.ask(text) end
+    cmd_ask(opts, args)
   else
     ui.notify("unknown subcommand: " .. sub, vim.log.levels.WARN)
   end
