@@ -161,8 +161,8 @@ function M.open(agent)
     }
   end
 
-  vim.ui.select(entries, {
-    prompt = "review agent changes",
+  require("advantage.ui.picker").select(entries, {
+    prompt = "advantage · review",
     format_item = function(e)
       return e.label
     end,

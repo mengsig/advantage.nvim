@@ -1,8 +1,8 @@
 # ✦ advantage.nvim
 
-A coding-agent **harness** that lives inside Neovim. Not a wrapper around a CLI —
-advantage runs its own agent loop: it streams from the model, executes tools in
-your editor, feeds results back, and repeats until the task is done.
+Not a chatbot. Not a CLI bolted onto your editor. advantage is a full agent loop
+*forged into* Neovim — it streams from the model, seizes your editor's tools,
+feeds on the fallout, and keeps swinging until the task is dead.
 
 - **Runs on your subscription.** Uses your **Claude Code login** (Pro/Max) or your
   **Codex / ChatGPT login** — no API key needed. Env API keys work as a fallback.
@@ -19,19 +19,22 @@ your editor, feeds results back, and repeats until the task is done.
   every call site, a file's outline or a type signature in a handful of tokens
   instead of grepping and reading whole files. This is the single biggest token
   saver here and something a CLI harness structurally can't do.
-- **A UI that respects your colorscheme.** No hardcoded palette: the accent,
-  washes and dim tones are derived from *your* theme at runtime. Quiet lowercase
-  headers, animated tool cards, dimmed streaming reasoning, token/cost meta per
-  turn.
+- **A UI that respects your colorscheme.** No hardcoded palette: the panel is a
+  quiet surface a few percent off your background, the prompt a slightly deeper
+  field with a `❯` gutter caret, and the accent, washes and dim tones are all
+  derived from *your* theme at runtime. One accent, used sparingly: finished
+  tool calls fade into the transcript, only the live action carries color, and
+  each exchange opens on a hairline.
 
 ```
-▍ you                                                    14:02
+──────────────────────────────────────────────────────────
+▍ you                                                 14:02
 add a --json flag to the export command
 
-▍ ✦ opus 4.8                                  ↑12.4k ↓1.1k · 41s
+✦ opus 4.8                                  ↑12.4k ↓1.1k · 41s
 I'll look at the current flag handling first.
 
-  ● read_file  src/cli/export.lua
+  · read_file  src/cli/export.lua
   ⠹ bash  just test cli
 
 Added the flag and threaded it through the formatter…

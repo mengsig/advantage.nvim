@@ -116,8 +116,8 @@ function M.pick_checkpoint(data, cb)
   for i = #cps, 1, -1 do
     items[#items + 1] = { kind = "rewind", cp = cps[i], n = i }
   end
-  vim.ui.select(items, {
-    prompt = "resume — pick a point (rewind forks a copy)",
+  require("advantage.ui.picker").select(items, {
+    prompt = "advantage · resume — pick a point (rewind forks a copy)",
     format_item = function(item)
       if item.kind == "recent" then return ("▸ most recent  ·  %d messages"):format(#(data.messages or {})) end
       return ("↶ retry from #%d  ·  %s"):format(item.n, item.cp.preview)
@@ -136,8 +136,8 @@ function M.pick(cb)
     require("advantage.ui.chat").notify("no saved sessions for this project", vim.log.levels.INFO)
     return cb(nil)
   end
-  vim.ui.select(sessions, {
-    prompt = "resume session",
+  require("advantage.ui.picker").select(sessions, {
+    prompt = "advantage · resume",
     format_item = function(item)
       local age = os.time() - (item.updated_at or 0)
       local when = age < 3600 and math.floor(age / 60) .. "m ago"

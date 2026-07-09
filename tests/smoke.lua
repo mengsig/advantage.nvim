@@ -1468,7 +1468,7 @@ do
   local text = table.concat(lines, "\n")
   check(text:find("▍ you", 1, true) ~= nil, "user header rendered")
   check(text:find("considering the request…", 1, true) ~= nil, "thinking streamed")
-  check(text:find("● bash", 1, true) ~= nil, "tool card rendered with ok status")
+  check(text:find("  · bash", 1, true) ~= nil, "tool card rendered with ok status")
   check(text:find("agent%-was%-here") ~= nil, "final answer rendered")
 
   -- transcript shape: user, assistant(tool_use), user(tool_result), assistant(text)

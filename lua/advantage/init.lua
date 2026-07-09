@@ -109,8 +109,8 @@ end
 function M.pick_model()
   ensure_init()
   local items = config.options.models
-  vim.ui.select(items, {
-    prompt = "model",
+  require("advantage.ui.picker").select(items, {
+    prompt = "advantage · model",
     format_item = function(m)
       return ("%s  ·  %s"):format(m.label or m.ref, m.ref)
     end,
@@ -324,7 +324,7 @@ function M.pick_files()
     ui.notify("no project files found", vim.log.levels.WARN)
     return
   end
-  vim.ui.select(files, { prompt = "add file to chat" }, function(choice)
+  require("advantage.ui.picker").select(files, { prompt = "advantage · add file" }, function(choice)
     if choice then M.attach(choice) end
   end)
 end
@@ -486,8 +486,8 @@ function M.pick_effort()
 
   if agent.model.provider == "openai" then
     local items = OPENAI_EFFORT_ITEMS
-    vim.ui.select(items, {
-      prompt = "reasoning effort",
+    require("advantage.ui.picker").select(items, {
+      prompt = "advantage · reasoning effort",
       format_item = function(x)
         local selected = x.value == nil and agent.model.reasoning_effort == nil
           or agent.model.reasoning_effort == x.value
@@ -503,8 +503,8 @@ function M.pick_effort()
   if agent.model.provider == "anthropic" then
     local current = agent.model.thinking
     local items = ANTHROPIC_EFFORT_ITEMS
-    vim.ui.select(items, {
-      prompt = "Claude thinking",
+    require("advantage.ui.picker").select(items, {
+      prompt = "advantage · thinking",
       format_item = function(x)
         local selected = false
         if x.value == false then
@@ -535,6 +535,7 @@ function M.usage()
     lines = lines,
     filetype = "",
     footer = "q close",
+    dim_labels = 14, -- the two-space gutter + 12-char label column
   })
 end
 

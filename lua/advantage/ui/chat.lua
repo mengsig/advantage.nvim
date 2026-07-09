@@ -40,7 +40,6 @@ local show_welcome = render.show_welcome
 local ensure_timer = render.ensure_timer
 local stop_timer = render.stop_timer
 local input_placeholder = render.input_placeholder
-local update_input_winbar = render.update_input_winbar
 local resize_input = render.resize_input
 
 ---Scroll the transcript without leaving the prompt.
@@ -85,7 +84,6 @@ function M.attach_image(item)
     api.nvim_buf_set_lines(S.input_buf, 0, -1, false, lines)
   end
   input_placeholder()
-  update_input_winbar()
   resize_input()
   M.notify("attached " .. item.name .. " — delete its [image: …] chip to remove it")
 end
@@ -115,7 +113,6 @@ function M.set_prompt(text)
   local lines = vim.split(text or "", "\n", { plain = true })
   api.nvim_buf_set_lines(S.input_buf, 0, -1, false, lines)
   input_placeholder()
-  update_input_winbar()
   resize_input()
   if util.win_valid(S.input_win) then
     api.nvim_set_current_win(S.input_win)
@@ -201,7 +198,6 @@ local function submit(mode)
   local function clear_input()
     api.nvim_buf_set_lines(S.input_buf, 0, -1, false, {})
     input_placeholder()
-    update_input_winbar()
     resize_input()
   end
 
@@ -253,7 +249,8 @@ local function help_lines()
     "  ⏎        send now (before next tool call if running)",
     "  ⌃s       queue until the agent is completely done",
     "  ⇧⏎ ⌃j    newline           ⇥    jump to chat",
-    "  @        complete a project file mention",
+    "  @        complete a project file mention (fuzzy)",
+    "  ⇥ ⇧⇥     cycle the @file menu · ⏎ accepts",
     "  ⌃v       paste — attaches clipboard images",
     "  ⌃u ⌃d    scroll the chat (normal mode)",
     "",
@@ -303,17 +300,21 @@ local function jump_turn(dir)
   if not util.win_valid(S.win) then return end
   local row = api.nvim_win_get_cursor(S.win)[1]
   local lines = api.nvim_buf_get_lines(S.buf, 0, -1, false)
+  -- turn headers: "▍ you" (user) and "✦ model" (assistant)
+  local function is_head(line)
+    return line:sub(1, #"▍") == "▍" or line:sub(1, #(ICON .. " ")) == ICON .. " "
+  end
   local target
   if dir > 0 then
     for i = row + 1, #lines do
-      if lines[i]:sub(1, #"▍") == "▍" then
+      if is_head(lines[i]) then
         target = i
         break
       end
     end
   else
     for i = row - 1, 1, -1 do
-      if lines[i]:sub(1, #"▍") == "▍" then
+      if is_head(lines[i]) then
         target = i
         break
       end
@@ -377,13 +378,21 @@ end
 local function map_input_keys()
   assert(util.buf_valid(S.input_buf), "map_input_keys: input buffer must exist")
   map(S.input_buf, "i", "<CR>", function()
-    if vim.fn.pumvisible() == 1 then
-      -- accept the @file completion instead of sending
+    if vim.fn.pumvisible() == 1 and vim.fn.complete_info({ "selected" }).selected >= 0 then
+      -- accept the highlighted @file completion instead of sending; with
+      -- nothing highlighted, Enter means send (the menu closes on its own)
       api.nvim_feedkeys(api.nvim_replace_termcodes("<C-y>", true, false, true), "n", false)
       return
     end
     submit("instant")
   end, "send now")
+  -- cycle the @file menu with Tab / Shift-Tab while it's open
+  map(S.input_buf, "i", "<Tab>", function()
+    return vim.fn.pumvisible() == 1 and "<C-n>" or "<Tab>"
+  end, "next completion", { expr = true })
+  map(S.input_buf, "i", "<S-Tab>", function()
+    return vim.fn.pumvisible() == 1 and "<C-p>" or "<S-Tab>"
+  end, "previous completion", { expr = true })
   map(S.input_buf, "n", "<CR>", function()
     submit("instant")
   end, "send now")
@@ -411,14 +420,47 @@ local function map_input_keys()
   map(S.input_buf, "n", "<C-d>", function()
     scroll_chat("<C-d>")
   end, "scroll chat down")
-  -- `@` pops project-file completion for mentions
+  -- `@` pops project-file completion for mentions. The user's completeopt is
+  -- overridden while the menu is open: `noselect` so the first file is never
+  -- inserted uninvited (type to filter, Tab/⌃n to pick, ⏎ to accept — then
+  -- `@` again for the next file), `fuzzy` where this Neovim supports it.
+  local saved_completeopt
+  local function popup_file_menu()
+    -- Anchor on the `@` being completed: fast typing (or a paste) can land
+    -- more characters before this scheduled popup runs, so never assume the
+    -- cursor still sits right after the `@`. Whatever was typed after it
+    -- becomes the initial filter base.
+    local col = api.nvim_win_get_cursor(0)[2]
+    local line = api.nvim_get_current_line()
+    local at = line:sub(1, col):find("@[^%s@]*$")
+    if not at then return end
+    -- complete() only filters keys typed AFTER the menu opens, so an existing
+    -- base must be fuzzy-filtered by hand or the menu shows every file
+    local base = line:sub(at + 1, col)
+    local files = require("advantage.attach").project_files(400)
+    if base ~= "" then files = vim.fn.matchfuzzy(files, base) end
+    if #files == 0 then return end
+    if saved_completeopt == nil then saved_completeopt = vim.o.completeopt end
+    if not pcall(api.nvim_set_option_value, "completeopt", "menu,menuone,noselect,fuzzy", {}) then
+      vim.o.completeopt = "menu,menuone,noselect" -- fuzzy needs 0.11+
+    end
+    api.nvim_create_autocmd({ "CompleteDone", "InsertLeave" }, {
+      buffer = S.input_buf,
+      once = true,
+      callback = function()
+        if saved_completeopt then
+          vim.o.completeopt = saved_completeopt
+          saved_completeopt = nil
+        end
+      end,
+    })
+    vim.fn.complete(at + 1, files)
+  end
   map(S.input_buf, "i", "@", function()
     vim.schedule(function()
       if api.nvim_get_current_buf() ~= S.input_buf or not vim.fn.mode():find("i") then return end
-      local files = require("advantage.attach").project_files(400)
-      if #files == 0 then return end
-      local col = api.nvim_win_get_cursor(0)[2]
-      vim.fn.complete(col + 1, files)
+      if #require("advantage.attach").project_files(400) == 0 then return end
+      popup_file_menu()
     end)
     return "@"
   end, "file mention", { expr = true })
@@ -483,7 +525,14 @@ function M.open(focus)
   opt("concealcursor", "nc", S.win)
   opt("winfixwidth", true, S.win)
   opt("fillchars", "eob: ", S.win)
-  opt("statuscolumn", "", S.win)
+  -- the panel is its own quiet surface, with a 1-col breathing gutter
+  opt("statuscolumn", "%#AdvPanel# ", S.win)
+  opt(
+    "winhighlight",
+    "Normal:AdvPanel,NormalNC:AdvPanel,EndOfBuffer:AdvPanel,SignColumn:AdvPanel"
+      .. ",WinSeparator:AdvPanelBorder,WinBar:AdvPanelBar,WinBarNC:AdvPanelBar,CursorLine:AdvPanel",
+    S.win
+  )
 
   S.input_win = api.nvim_open_win(S.input_buf, false, {
     split = "below",
@@ -496,7 +545,14 @@ function M.open(focus)
   opt("winfixheight", true, S.input_win)
   opt("wrap", true, S.input_win)
   opt("fillchars", "eob: ", S.input_win)
-  update_input_winbar()
+  -- the prompt reads as a field: a deeper surface with a ❯ caret in the gutter
+  opt("statuscolumn", "%#AdvPromptSign#%{(v:virtnum == 0 && v:lnum == 1) ? '❯ ' : '  '}", S.input_win)
+  opt(
+    "winhighlight",
+    "Normal:AdvPanelField,NormalNC:AdvPanelField,EndOfBuffer:AdvPanelField"
+      .. ",SignColumn:AdvPanelField,WinSeparator:AdvPanelBorder,CursorLine:AdvPanelField",
+    S.input_win
+  )
 
   update_winbar()
   show_welcome()
@@ -555,6 +611,14 @@ function M.user_message(text, images)
   local head = "▍ you"
   append({ "", head })
   local row = last_row()
+  -- a hairline above each exchange gives the transcript its rhythm
+  if row > 1 then
+    local w = util.win_valid(S.win) and math.max(8, api.nvim_win_get_width(S.win) - 2) or 60
+    api.nvim_buf_set_extmark(S.buf, ns, row, 0, {
+      virt_lines = { { { string.rep("─", w), "AdvRule" } } },
+      virt_lines_above = true,
+    })
+  end
   api.nvim_buf_set_extmark(S.buf, ns, row, 0, {
     end_row = row,
     end_col = #head,
@@ -608,7 +672,7 @@ function M.begin_assistant(label)
   S.model_label = label or S.model_label
   S.mode, S.last_kind = nil, "header"
   S.think_mark, S.think_start = nil, nil
-  local head = "▍ " .. ICON .. " " .. (label or "assistant")
+  local head = ICON .. " " .. (label or "assistant")
   append({ "", head })
   local row = last_row()
   api.nvim_buf_set_extmark(S.buf, ns, row, 0, {
@@ -745,6 +809,13 @@ function M.notice(text)
       hl_group = "AdvNotice",
     })
   end
+  -- the ▸ marker carries the accent so notices read as quiet signposts
+  api.nvim_buf_set_extmark(S.buf, ns, start_row, 2, {
+    end_row = start_row,
+    end_col = 2 + #"▸",
+    hl_group = "AdvNoticeMark",
+    priority = 130,
+  })
   autoscroll()
 end
 
@@ -813,6 +884,9 @@ end
 -- floats --------------------------------------------------------------------
 
 ---Generic informational float (help, previews).
+---`opts.footer` may be a string (rendered as a hint) or a list of
+---`{text, hl}` chunks; `opts.dim_labels = n` softly dims the first `n` columns
+---of every content line, for label/value dashboards.
 function M.float(opts)
   local buf = api.nvim_create_buf(false, true)
   opts.lines = normalize_lines(opts.lines)
@@ -820,10 +894,25 @@ function M.float(opts)
   vim.bo[buf].modifiable = false
   vim.bo[buf].bufhidden = "wipe"
   if opts.filetype and opts.filetype ~= "" then vim.bo[buf].filetype = opts.filetype end
+  local footer
+  if type(opts.footer) == "table" then
+    footer = { { " ", "AdvFloatHint" } }
+    vim.list_extend(footer, opts.footer)
+    footer[#footer + 1] = { " ", "AdvFloatHint" }
+  elseif opts.footer then
+    footer = { { " " .. opts.footer .. " ", "AdvFloatHint" } }
+  end
   local width = 20
   for _, l in ipairs(opts.lines) do
     width = math.max(width, api.nvim_strwidth(l) + 2)
   end
+  -- never truncate the title or the footer key hints
+  width = math.max(width, api.nvim_strwidth(opts.title or "") + 4)
+  local footer_w = 0
+  for _, chunk in ipairs(footer or {}) do
+    footer_w = footer_w + api.nvim_strwidth(chunk[1])
+  end
+  width = math.max(width, footer_w)
   width = math.min(width, math.floor(vim.o.columns * 0.8))
   -- Clamp to >=1: an empty `lines` (e.g. a permission preview with no body) would
   -- otherwise ask nvim_open_win for height 0 and throw, dropping the card.
@@ -838,11 +927,29 @@ function M.float(opts)
     border = config.options.ui.border,
     title = { { " " .. (opts.title or "advantage") .. " ", "AdvFloatTitle" } },
     title_pos = "center",
-    footer = opts.footer and { { " " .. opts.footer .. " ", "AdvFloatHint" } } or nil,
-    footer_pos = opts.footer and "center" or nil,
+    footer = footer,
+    footer_pos = footer and "center" or nil,
   })
   opt("wrap", false, win)
   opt("cursorline", false, win)
+  opt(
+    "winhighlight",
+    "NormalFloat:AdvPanel,FloatBorder:AdvFloatBorder,FloatTitle:AdvFloatTitle"
+      .. ",FloatFooter:AdvFloatHint,EndOfBuffer:AdvPanel",
+    win
+  )
+  if opts.dim_labels then
+    for row, l in ipairs(opts.lines) do
+      local upto = math.min(#l, opts.dim_labels)
+      if upto > 0 then
+        api.nvim_buf_set_extmark(buf, ns_extra, row - 1, 0, {
+          end_row = row - 1,
+          end_col = upto,
+          hl_group = "AdvFloatLabel",
+        })
+      end
+    end
+  end
   for _, key in ipairs({ "q", "<Esc>" }) do
     vim.keymap.set("n", key, function()
       if util.win_valid(win) then api.nvim_win_close(win, true) end
@@ -865,7 +972,16 @@ function M.confirm(preview, cb)
     title = preview.title or "allow?",
     lines = preview.lines or {},
     filetype = preview.filetype,
-    footer = "a allow · A always · d deny · c deny + comment",
+    footer = {
+      { "a", "AdvFloatKey" },
+      { " allow · ", "AdvFloatHint" },
+      { "A", "AdvFloatKey" },
+      { " always · ", "AdvFloatHint" },
+      { "d", "AdvFloatKey" },
+      { " deny · ", "AdvFloatHint" },
+      { "c", "AdvFloatKey" },
+      { " comment", "AdvFloatHint" },
+    },
   })
   local maps = {
     a = "allow",

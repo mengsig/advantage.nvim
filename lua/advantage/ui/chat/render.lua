@@ -1,6 +1,6 @@
 ---@brief Rendering + status layer for the chat UI. Turns view state (state.S)
 ---into on-screen bytes: the winbar/status line, tool cards, the spinner timer, the
----welcome banner, the prompt placeholder/winbar, and the streamed-text writer. It
+---welcome banner, the prompt placeholder, and the streamed-text writer. It
 ---sits above state.lua (whose primitives it writes through) and below chat.lua
 ---(the controller/API, which calls these). It never calls back into chat.lua.
 local util = require("advantage.util")
@@ -19,32 +19,29 @@ local R = {}
 -- winbar / status ---------------------------------------------------------
 
 local function winbar_text()
-  local left = ("%%#AdvBarIcon# %s %%#AdvBarTitle#advantage %%#AdvBarFaint#·%%#AdvBarInfo# %s"):format(
-    ICON,
-    esc_bar(S.model_label)
-  )
-  if S.auth_badge then left = left .. (" %%#AdvBarFaint#(%s)"):format(esc_bar(S.auth_badge)) end
+  local left = ("%%#AdvBarIcon# %s %%#AdvBarTitle#%s"):format(ICON, esc_bar(S.model_label))
+  if S.auth_badge then left = left .. (" %%#AdvBarFaint#· %s"):format(esc_bar(S.auth_badge)) end
   if config.options.tools.yolo then left = left .. " %#AdvBarDanger#⚡ yolo" end
   local right = ""
-  if S.queue_count > 0 then right = ("%%#AdvBarInfo#⧗ %d queued "):format(S.queue_count) end
+  if S.queue_count > 0 then right = ("%%#AdvBarInfo#⧗ %d queued  "):format(S.queue_count) end
   if S.usage.input > 0 or S.usage.output > 0 then
     right = right
-      .. ("%%#AdvBarInfo#↑%s ↓%s "):format(util.fmt_tokens(S.usage.input), util.fmt_tokens(S.usage.output))
+      .. ("%%#AdvBarFaint#↑%s ↓%s  "):format(util.fmt_tokens(S.usage.input), util.fmt_tokens(S.usage.output))
   end
   if S.status == "streaming" then
-    right = right .. ("%%#AdvBarBusy#%s streaming "):format(FRAMES[S.spinner])
+    right = right .. ("%%#AdvBarBusy#%s "):format(FRAMES[S.spinner])
   elseif S.status == "tool" then
     right = right .. ("%%#AdvBarBusy#%s %s "):format(FRAMES[S.spinner], esc_bar(S.status_detail or "tool"))
   elseif S.status == "waiting" then
-    right = right .. ("%%#AdvBarBusy#● approve %s? "):format(esc_bar(S.status_detail or ""))
+    right = right .. ("%%#AdvBarBusy#◇ approve %s? "):format(esc_bar(S.status_detail or ""))
   elseif S.status == "compacting" then
     local c = S.compact or {}
     local frac = 0
     if c.t0 and c.est and c.est > 0 then frac = math.min(0.95, (uv.now() - c.t0) / c.est) end
     if c.done then frac = 1 end
-    local width = 12
+    local width = 10
     local filled = math.floor(frac * width + 0.5)
-    local bar = string.rep("█", filled) .. string.rep("░", width - filled)
+    local bar = string.rep("━", filled) .. string.rep("╌", width - filled)
     right = right .. ("%%#AdvBarBusy#compacting %s %d%%%% "):format(bar, math.floor(frac * 100 + 0.5))
   end
   return left .. " %=" .. right
@@ -54,19 +51,30 @@ function R.update_winbar()
   if util.win_valid(S.win) then opt("winbar", winbar_text(), S.win) end
 end
 
-local function tool_line(t)
-  local icons = {
-    pending = { "·", "AdvToolPending" },
-    waiting = { "◇", "AdvToolRunning" },
-    running = { FRAMES[S.spinner], "AdvToolRunning" },
-    ok = { "●", "AdvToolOk" },
-    error = { "✗", "AdvToolErr" },
-    denied = { "◌", "AdvToolDenied" },
+---Per-status tool-line style: live actions carry the accent, finished ones
+---recede into the transcript, only failures keep a loud color.
+local function tool_style(status)
+  local styles = {
+    pending = { icon = "·", icon_hl = "AdvToolGhost", line = "AdvToolGhost", name = "AdvToolGhost" },
+    waiting = { icon = "◇", icon_hl = "AdvToolWaiting", line = "AdvToolFaint", name = "AdvToolActiveName" },
+    running = {
+      icon = FRAMES[S.spinner],
+      icon_hl = "AdvToolSpinner",
+      line = "AdvToolFaint",
+      name = "AdvToolActiveName",
+    },
+    ok = { icon = "·", icon_hl = "AdvToolOkDot", line = "AdvToolGhost", name = "AdvToolGhost" },
+    error = { icon = "✗", icon_hl = "AdvToolErr", line = "AdvToolFaint", name = "AdvToolErr" },
+    denied = { icon = "◌", icon_hl = "AdvToolDenied", line = "AdvToolDenied", name = "AdvToolDenied" },
   }
-  local icon = icons[t.status or "pending"] or icons.pending
-  local text = ("  %s %s"):format(icon[1], one_line(t.name or "?"))
+  return styles[status or "pending"] or styles.pending
+end
+
+local function tool_line(t)
+  local style = tool_style(t.status)
+  local text = ("  %s %s"):format(style.icon, one_line(t.name or "?"))
   if t.detail and t.detail ~= "" then text = text .. "  " .. one_line(t.detail) end
-  return text, icon[2]
+  return text, style
 end
 R.tool_line = tool_line
 
@@ -77,27 +85,33 @@ function R.redraw_tool(id)
   if not pos or #pos == 0 then return end
   local row = pos[1]
   local old = api.nvim_buf_get_lines(S.buf, row, row + 1, false)[1] or ""
-  local text, hl = tool_line(t)
+  local text, style = tool_line(t)
   buf_write(function()
     api.nvim_buf_set_text(S.buf, row, 0, row, #old, { text })
   end)
-  -- restore the row anchor and style the line
+  -- restore the row anchor and layer: base line color, icon, then the name
   t.mark = api.nvim_buf_set_extmark(S.buf, ns, row, 0, { id = t.mark, right_gravity = false })
   t.hl_mark = api.nvim_buf_set_extmark(S.buf, ns, row, 0, {
     id = t.hl_mark,
     end_row = row,
     end_col = #text,
-    hl_group = hl,
+    hl_group = style.line,
     priority = 150,
   })
-  -- bold tool name over the base color
-  local prefix = text:match("^  [^%s]+ ")
-  if prefix and t.name then
-    t.name_mark = api.nvim_buf_set_extmark(S.buf, ns, row, #prefix, {
+  t.icon_mark = api.nvim_buf_set_extmark(S.buf, ns, row, 2, {
+    id = t.icon_mark,
+    end_row = row,
+    end_col = 2 + #style.icon,
+    hl_group = style.icon_hl,
+    priority = 160,
+  })
+  local name_from = 2 + #style.icon + 1
+  if t.name then
+    t.name_mark = api.nvim_buf_set_extmark(S.buf, ns, row, name_from, {
       id = t.name_mark,
       end_row = row,
-      end_col = #prefix + #t.name,
-      hl_group = "AdvToolName",
+      end_col = math.min(name_from + #t.name, #text),
+      hl_group = style.name,
       priority = 160,
     })
   end
@@ -143,25 +157,30 @@ end
 
 -- welcome -----------------------------------------------------------------
 
+---Centered, composed opening screen: mark, wordmark, model, and a whisper of keys.
 function R.show_welcome()
   if not util.buf_valid(S.buf) then return end
   local lc = api.nvim_buf_line_count(S.buf)
   local first = api.nvim_buf_get_lines(S.buf, 0, 1, false)[1]
   if lc > 1 or (first and first ~= "") then return end
-  local hints = {
-    { "", "" },
-    { "   " .. ICON .. " advantage", "AdvWelcome" },
-    { "", "" },
-    { "   model    " .. S.model_label, "AdvWelcomeDim" },
-    { "   send     ⏎        newline  ⇧⏎ / ⌃j", "AdvWelcomeDim" },
-    { "   files    @path    image    ⌃v (paste)", "AdvWelcomeDim" },
-    { "   usage    /usage   review   /review", "AdvWelcomeDim" },
-    { "   cancel   ⌃c       help     g?", "AdvWelcomeDim" },
-  }
-  local virt = {}
-  for _, h in ipairs(hints) do
-    virt[#virt + 1] = { { h[1], h[2] } }
+  -- panel width for centering (minus the 1-col statuscolumn gutter)
+  local w = util.win_valid(S.win) and (api.nvim_win_get_width(S.win) - 1) or 56
+  local function centered(text, hl)
+    local pad = math.max(0, math.floor((w - api.nvim_strwidth(text)) / 2))
+    return { { string.rep(" ", pad) .. text, hl } }
   end
+  local virt = {
+    { { "", "" } },
+    { { "", "" } },
+    centered(ICON, "AdvAccent"),
+    { { "", "" } },
+    centered("advantage", "AdvWelcome"),
+    centered(S.model_label ~= "" and S.model_label or "…", "AdvWelcomeDim"),
+    { { "", "" } },
+    { { "", "" } },
+    centered("⏎ send · @ file · ⌃v image", "AdvWelcomeDim"),
+    centered("/ commands · g? help", "AdvWelcomeDim"),
+  }
   -- reuse the extmark id so repeated opens never stack duplicate banners
   S.welcome_mark = api.nvim_buf_set_extmark(S.buf, ns_extra, 0, 0, {
     id = S.welcome_mark,
@@ -177,35 +196,24 @@ function R.input_placeholder()
   local lines = api.nvim_buf_get_lines(S.input_buf, 0, -1, false)
   if #lines == 1 and lines[1] == "" then
     api.nvim_buf_set_extmark(S.input_buf, ns_extra, 0, 0, {
-      virt_text = { { "describe a task…  (@ file · ⌃v image · / commands)", "AdvWelcomeDim" } },
+      virt_text = { { "describe a task…  ⏎ send · @ file · / commands", "AdvWelcomeDim" } },
       virt_text_pos = "overlay",
     })
   end
 end
 
-local function input_winbar_text()
-  local left = "%#AdvBarFaint# ❯ prompt"
-  if #S.attachments > 0 then
-    left = left .. ("%%#AdvBarInfo# · %d image%s"):format(#S.attachments, #S.attachments == 1 and "" or "s")
-  end
-  return left .. " %=%#AdvBarFaint#⏎ send · g? keys "
-end
-
-function R.update_input_winbar()
-  if util.win_valid(S.input_win) then opt("winbar", input_winbar_text(), S.input_win) end
-end
-
 ---Grow/shrink the prompt window with its content (wrapped display lines).
 function R.resize_input()
   if not (util.win_valid(S.input_win) and util.buf_valid(S.input_buf)) then return end
-  local width = math.max(1, api.nvim_win_get_width(S.input_win))
+  -- the ❯ gutter (statuscolumn) takes 2 cells of every line
+  local width = math.max(1, api.nvim_win_get_width(S.input_win) - 2)
   local h = 0
   for _, l in ipairs(api.nvim_buf_get_lines(S.input_buf, 0, -1, false)) do
     h = h + math.max(1, math.ceil(api.nvim_strwidth(l) / width))
   end
   local min_h = config.options.ui.input_height
   local max_h = math.max(min_h, math.floor(vim.o.lines * 0.4))
-  h = math.min(math.max(h + 1, min_h), max_h) -- +1 for the winbar
+  h = math.min(math.max(h, min_h), max_h)
   if api.nvim_win_get_height(S.input_win) ~= h then api.nvim_win_set_height(S.input_win, h) end
 end
 

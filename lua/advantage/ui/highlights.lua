@@ -1,5 +1,10 @@
 ---@brief Highlight groups derived from the active colorscheme, so the panel
 ---looks native to any theme while keeping its own identity.
+---
+---The system: the panel is its own quiet surface (a few percent off Normal),
+---the prompt is a slightly deeper field, and exactly one accent color is used
+---— for the brand mark, the user bar, and whatever is *live* right now.
+---Finished work recedes to ghost text; only errors keep their color.
 local M = {}
 
 local function get_color(names, attr)
@@ -41,17 +46,25 @@ local function resolve_palette(cfg, dark)
   else
     accent = get_color({ "Function", "Title", "Directory" }, "fg") or (dark and 0x8ec1a8 or 0x3a7a5e)
   end
+  local ok_c = get_color({ "DiagnosticOk", "String" }, "fg") or 0x89b482
   return {
     bg = bg,
     fg = fg,
     warn = get_color({ "DiagnosticWarn", "WarningMsg" }, "fg") or 0xd8a657,
     err = get_color({ "DiagnosticError", "ErrorMsg" }, "fg") or 0xd75f5f,
-    ok_c = get_color({ "DiagnosticOk", "String" }, "fg") or 0x89b482,
+    ok_c = ok_c,
     comment = get_color({ "Comment" }, "fg") or (dark and 0x6b6f85 or 0x8a8a92),
     accent_hex = hex(accent),
+    -- surfaces: the panel sits a few percent off Normal, the prompt field a
+    -- little deeper — enough to read as places, never enough to shout
+    panel = blend(fg, bg, dark and 0.035 or 0.04),
+    field = blend(fg, bg, dark and 0.075 or 0.075),
     soft = blend(accent, bg, dark and 0.16 or 0.12), -- tinted header wash
     faint = blend(fg, bg, 0.45),
     ghost = blend(fg, bg, 0.28),
+    hairline = blend(fg, bg, 0.12),
+    border = blend(fg, bg, 0.25),
+    ok_dim = blend(ok_c, bg, 0.55), -- success trace on finished tool lines
   }
 end
 
@@ -60,31 +73,58 @@ local function highlight_groups(p)
   assert(type(p) == "table" and p.accent_hex ~= nil, "highlight_groups: resolved palette required")
   return {
     AdvAccent = { fg = p.accent_hex },
+
+    -- surfaces
+    AdvPanel = { bg = p.panel },
+    AdvPanelField = { bg = p.field },
+    AdvPanelBar = { bg = p.panel },
+    AdvPanelBorder = { fg = p.hairline, bg = p.panel },
+    AdvPromptSign = { fg = p.accent_hex, bg = p.field, bold = true },
+
+    -- transcript
     AdvUserHead = { fg = hex(p.fg), bg = p.soft, bold = true },
     AdvUserBar = { fg = p.accent_hex, bg = p.soft, bold = true },
     AdvAssistHead = { fg = p.accent_hex, bold = true },
     AdvMeta = { fg = p.ghost, italic = true },
     AdvThinking = { fg = hex(p.comment), italic = true },
-    AdvToolPending = { fg = p.faint },
-    AdvToolRunning = { fg = hex(p.warn) },
-    AdvToolOk = { fg = hex(p.ok_c) },
+    AdvRule = { fg = p.hairline },
+    AdvNotice = { fg = p.faint, italic = true },
+    AdvNoticeMark = { fg = p.accent_hex },
+
+    -- tool lines: live = accent, finished = ghost, failed = error color
+    AdvToolGhost = { fg = p.ghost },
+    AdvToolFaint = { fg = p.faint },
+    AdvToolSpinner = { fg = p.accent_hex },
+    AdvToolWaiting = { fg = p.accent_hex, bold = true },
+    AdvToolActiveName = { fg = hex(p.fg) },
+    AdvToolOkDot = { fg = p.ok_dim },
     AdvToolErr = { fg = hex(p.err) },
     AdvToolDenied = { fg = p.ghost, strikethrough = true },
-    AdvToolName = { fg = hex(p.fg), bold = true },
-    AdvToolDetail = { fg = p.faint },
-    AdvToolOutput = { fg = p.faint },
+    AdvToolOutput = { fg = p.ghost },
+
+    -- welcome
     AdvWelcome = { fg = p.accent_hex, bold = true },
     AdvWelcomeDim = { fg = p.ghost },
-    AdvBarIcon = { fg = p.accent_hex, bold = true },
-    AdvBarTitle = { fg = hex(p.fg), bold = true },
-    AdvBarFaint = { fg = p.ghost },
-    AdvBarInfo = { fg = p.faint },
-    AdvBarBusy = { fg = hex(p.warn), bold = true },
-    AdvBarDanger = { fg = hex(p.err), bold = true },
-    AdvFloatTitle = { fg = p.accent_hex, bold = true },
-    AdvFloatHint = { fg = p.ghost, italic = true },
-    AdvRule = { fg = blend(p.fg, p.bg, 0.12) },
-    AdvNotice = { fg = hex(p.warn), italic = true },
+
+    -- winbar
+    AdvBarIcon = { fg = p.accent_hex, bg = p.panel, bold = true },
+    AdvBarTitle = { fg = hex(p.fg), bg = p.panel, bold = true },
+    AdvBarFaint = { fg = p.ghost, bg = p.panel },
+    AdvBarInfo = { fg = p.faint, bg = p.panel },
+    AdvBarBusy = { fg = p.accent_hex, bg = p.panel },
+    AdvBarDanger = { fg = hex(p.err), bg = p.panel, bold = true },
+
+    -- picker
+    AdvPickerSel = { bg = p.soft },
+    AdvPickerBar = { fg = p.accent_hex, bg = p.soft, bold = true },
+    AdvPickerMatch = { fg = p.accent_hex, bold = true },
+
+    -- floats
+    AdvFloatTitle = { fg = p.accent_hex, bg = p.panel, bold = true },
+    AdvFloatBorder = { fg = p.border, bg = p.panel },
+    AdvFloatHint = { fg = p.ghost, bg = p.panel, italic = true },
+    AdvFloatKey = { fg = p.accent_hex, bg = p.panel, bold = true },
+    AdvFloatLabel = { fg = p.ghost },
   }
 end
 
