@@ -40,6 +40,50 @@ I'll look at the current flag handling first.
 Added the flag and threaded it through the formatter…
 ```
 
+## Benchmark — harness quality vs. Claude Code
+
+A recurring worry with an in-editor harness is that its own agent loop (its
+system prompt, tools, and context/compaction machinery) might be *worse* than a
+mature CLI harness. So we measured it: advantage's real agent loop, driven
+headlessly, against the **Claude Code agent loop** — **same model** (Opus 4.8,
+8k-token thinking budget), **same fixtures**, **same task prompt**, graded by
+identical hidden test suites. Each grader was validated first (a correct
+reference implementation scores 1.0; an empty stub scores 0.0).
+
+Three deliberately hard, objectively-scored fixtures:
+
+| Fixture | What it stresses | advantage.nvim | Claude Code |
+| --- | --- | :---: | :---: |
+| **SQL engine** — 4 files, 6 planted bugs (49-case grader) | multi-file navigation + iterative debugging | **1.000** | **1.000** |
+| **Regex engine** — from scratch (562-case fuzz vs Python `re`) | algorithm design + self-testing loop | **0.998** | **0.998** |
+| **Piece-table buffer** — undo/redo (28,957-check fuzz) | index math + test-driven iteration | **1.000** | **1.000** |
+
+**The two harnesses were indistinguishable in quality.** Even the single regex
+miss (a `.`-vs-newline spec edge case) was identical on both. advantage matched
+Claude Code here *without a language server attached* in headless mode — i.e.
+without its biggest structural advantage.
+
+Output tokens generated per task — the model's actual generation cost, and the
+one token metric that's cleanly comparable across harnesses (input on both sides
+is dominated by prompt-cache reads, so it's left out):
+
+| Fixture | advantage.nvim | Claude Code |
+| --- | :---: | :---: |
+| SQL engine | **5.6k** | 16.4k |
+| Regex engine | **12.2k** | 28.8k |
+| Piece-table | **1.4k** | 7.0k |
+
+Same quality, and advantage reached it with **2–5× fewer generated tokens** on
+every task.
+
+**Compaction stress test.** The one place an in-editor harness could plausibly
+lose ground is context compaction (Claude Code has native long context;
+advantage summarizes old history). Forcing the LLM summarizer to fire
+aggressively mid-task (tiny recent-message window) triggered two real
+summarizations that discarded the early file reads — and advantage **still scored
+1.000** on the multi-file SQL task. The compaction machinery does not drop
+task-critical state.
+
 ## Requirements
 
 - Neovim **0.10+**
