@@ -101,6 +101,26 @@ end
 ---nvim_buf_is_loaded over the pcall result so that transient autocmd noise
 ---doesn't permanently fail "could not open" a file that's actually sitting
 ---in a valid buffer.
+---Load `bufnr` without ever raising an interactive swap-file (E325) prompt.
+---These buffers are ephemeral and read-only, so a stale/foreign swap file is
+---irrelevant: we disable swap for the buffer before loading, and additionally
+---auto-answer any SwapExists with "edit anyway" so an existing swap owned by
+---another process can never block the headless agent on a modal prompt.
+local function bufload_no_swap(bufnr)
+  pcall(function()
+    vim.bo[bufnr].swapfile = false
+  end)
+  local au = vim.api.nvim_create_autocmd("SwapExists", {
+    callback = function()
+      vim.v.swapchoice = "e"
+    end,
+  })
+  -- bufload is synchronous, so the guard covers exactly this load and nothing else.
+  local ok = pcall(vim.fn.bufload, bufnr)
+  pcall(vim.api.nvim_del_autocmd, au)
+  return ok
+end
+
 local function ensure_bufnr(path)
   local b = loaded_bufnr(path)
   if b then return b end
@@ -110,7 +130,7 @@ local function ensure_bufnr(path)
   pcall(function()
     vim.bo[bufnr].buflisted = false
   end)
-  if not pcall(vim.fn.bufload, bufnr) and not vim.api.nvim_buf_is_loaded(bufnr) then return nil end
+  if not bufload_no_swap(bufnr) and not vim.api.nvim_buf_is_loaded(bufnr) then return nil end
   return bufnr
 end
 

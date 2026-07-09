@@ -3,3 +3,5 @@ AGENTS.md
 .claude/
 .nvime/
 .advantage/
+*/.navgraph/*
+.navgraph/
