@@ -10,8 +10,8 @@ local S = {}
 
 ---@class SkillsDeps
 ---@field mem table facade module (live _session, root(), enabled(), render())
----@field read_file fun(path: string): string|nil
----@field write_file fun(path: string, content: string): boolean
+---@field read_file fun(path: string, max_bytes?: integer): string|nil, boolean
+---@field write_file fun(path: string, content: string): boolean|nil, string|nil
 ---@field tokens fun(s: string?): integer
 ---@field opts fun(): table
 ---@field skills_dir fun(): string
@@ -59,9 +59,29 @@ end
 -- parses every SKILL.md. Keyed by a cheap stat signature (paths + mtime + size)
 -- so an add/remove/content-edit invalidates it; save_skill clears it explicitly.
 local _skills_cache = { sig = nil, value = nil }
+local SKILL_INDEX_READ_BYTES = 16 * 1024
+local SKILL_BODY_HARD_MAX_BYTES = 256 * 1024
+
+local function skill_body_cap()
+  local value = tonumber(deps.opts().skill_body_budget_tokens) or 8000
+  if value ~= value or value == math.huge or value == -math.huge then value = 8000 end
+  return math.max(1024, math.min(SKILL_BODY_HARD_MAX_BYTES, math.floor(math.max(1, value) * 4)))
+end
 
 local function skill_roots()
-  return { deps.skills_dir(), deps.mem.root() .. "/.claude/skills" }
+  local out = {}
+  local candidates = { deps.mem.root() .. "/.claude/skills" }
+  local primary = deps.skills_dir()
+  if primary then table.insert(candidates, 1, primary) end
+  for _, path in ipairs(candidates) do
+    local safe = path and deps.mem.contain(path) or nil
+    if safe then out[#out + 1] = safe end
+  end
+  return out
+end
+
+local function safe_skill_path(root, entry)
+  return deps.mem.contain(root .. "/" .. entry .. "/SKILL.md")
 end
 
 local function skills_signature()
@@ -72,9 +92,16 @@ local function skills_signature()
       while true do
         local entry = uv.fs_scandir_next(dir)
         if not entry then break end
-        local p = root .. "/" .. entry .. "/SKILL.md"
-        local st = uv.fs_stat(p)
-        if st then parts[#parts + 1] = ("%s:%d:%d"):format(p, st.mtime and st.mtime.sec or 0, st.size or 0) end
+        local p = safe_skill_path(root, entry)
+        local st = p and uv.fs_stat(p) or nil
+        if st then
+          parts[#parts + 1] = ("%s:%d:%d:%d"):format(
+            p,
+            st.mtime and st.mtime.sec or 0,
+            st.mtime and st.mtime.nsec or 0,
+            st.size or 0
+          )
+        end
       end
     end
   end
@@ -96,14 +123,17 @@ function S.scan_skills()
       while true do
         local entry = uv.fs_scandir_next(dir)
         if not entry then break end
-        local skill_path = root .. "/" .. entry .. "/SKILL.md"
-        local text = deps.read_file(skill_path)
+        local skill_path = safe_skill_path(root, entry)
+        -- Indexing needs only frontmatter. Never read a giant runbook body merely
+        -- to discover its name and one-line description.
+        local text = skill_path and deps.read_file(skill_path, SKILL_INDEX_READ_BYTES) or nil
         if text and not seen[entry] then
           local name, desc = S.parse_skill(text)
           name = name or entry
           if not seen[name] then
             seen[name] = true
-            out[#out + 1] = { name = name, description = desc or "", path = skill_path }
+            local st = uv.fs_stat(skill_path)
+            out[#out + 1] = { name = name, description = desc or "", path = skill_path, bytes = st and st.size or 0 }
           end
         end
       end
@@ -126,7 +156,13 @@ function S.use_skill(name)
   local session = deps.mem._session
   for _, s in ipairs(S.scan_skills()) do
     if s.name == name then
-      local _, _, body = S.parse_skill(deps.read_file(s.path) or "")
+      local cap = skill_body_cap()
+      local text, file_truncated = deps.read_file(s.path, cap + SKILL_INDEX_READ_BYTES)
+      local _, _, body = S.parse_skill(text or "")
+      if file_truncated or #body > cap then
+        local marker = "\n… [skill body truncated at safety limit]"
+        body = require("advantage.util").utf8_safe_sub(body, math.max(0, cap - #marker)) .. marker
+      end
       if body then
         session.loaded[name] = true
         session.skill_loads = session.skill_loads + 1
@@ -180,14 +216,20 @@ function S.save_skill(name, description, body)
   -- Reject empty and dot-only names ("."/".."): "%w._-" keeps dots, so ".." would
   -- resolve to `.advantage/skills/../SKILL.md` (outside the skills dir).
   if name == "" or name:match("^%.+$") then return false, "invalid skill name" end
-  local text = ("---\nname: %s\ndescription: %s\n---\n\n%s\n"):format(
-    name,
-    tostring(description or ""),
-    vim.trim(tostring(body or ""))
-  )
-  local ok = deps.write_file(deps.skills_dir() .. "/" .. name .. "/SKILL.md", text)
+  description = vim.trim(tostring(description or ""):gsub("%s+", " "))
+  if #description > 500 then description = require("advantage.util").utf8_safe_sub(description, 500) end
+  body = vim.trim(tostring(body or ""))
+  local cap = skill_body_cap()
+  if #body > cap then
+    return false, ("skill body exceeds the %d-byte safety limit; split it into focused skills"):format(cap)
+  end
+  local text = ("---\nname: %s\ndescription: %s\n---\n\n%s\n"):format(name, description, body)
+  local root = deps.skills_dir()
+  local path = root and deps.mem.contain(root .. "/" .. name .. "/SKILL.md") or nil
+  if not path then return false, "skill path escapes the project root" end
+  local ok, err = deps.write_file(path, text)
   _skills_cache.sig = nil -- new/updated skill: force a re-scan next time
-  return ok, ok and nil or "write failed"
+  return ok, ok and nil or (err or "write failed")
 end
 
 return S

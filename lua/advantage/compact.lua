@@ -19,6 +19,7 @@
 ---logic (`prepare_split`) and the same splice-back-in logic (`splice_summary`),
 ---so the resulting message shape is identical regardless of which mode wrote it.
 local M = {}
+local uv = vim.uv or vim.loop
 
 local SUMMARY_PREFIX = "Conversation context summary (auto-compacted by advantage.nvim)."
 
@@ -44,9 +45,27 @@ local function block_text(block)
   elseif block.type == "image" then
     return "[image attachment]"
   elseif block.type == "thinking" then
-    return "[assistant thinking omitted]"
+    -- Only readable thinking belongs in a semantic summary. The signature is
+    -- opaque replay state: it counts toward the live request (via measured
+    -- usage) but feeding ciphertext to a summarizer wastes its context budget.
+    return block.thinking or "[thinking omitted]"
+  elseif block.type == "redacted_thinking" then
+    return "[redacted thinking omitted]"
   elseif block.type == "openai_reasoning" then
-    return "[OpenAI reasoning item omitted]"
+    local summary = block.item and block.item.summary
+    if type(summary) == "string" then return summary end
+    if type(summary) == "table" then
+      local readable = {}
+      for _, part in ipairs(summary) do
+        if type(part) == "string" then
+          readable[#readable + 1] = part
+        elseif type(part) == "table" and type(part.text) == "string" then
+          readable[#readable + 1] = part.text
+        end
+      end
+      if #readable > 0 then return table.concat(readable, "\n") end
+    end
+    return "[encrypted reasoning omitted]"
   end
   return "[" .. tostring(block.type or "unknown") .. "]"
 end
@@ -57,12 +76,12 @@ local function message_chars(msg)
   local content = content_blocks(msg)
   for _, b in ipairs(content) do
     n = n + #block_text(b)
-    -- Image payloads are sent verbatim (base64) and dominate request size, but
-    -- block_text collapses them to a placeholder. Count the real bytes so a
-    -- conversation carrying images actually triggers compaction/eviction.
-    if type(b) == "table" and b.type == "image" and b.source and type(b.source.data) == "string" then
-      n = n + #b.source.data
-    end
+    -- Base64 bytes are HTTP payload size, not language-model tokens. Vision
+    -- providers price images from decoded dimensions/tiles, so treating a 5 MB
+    -- PNG as ~1.7M tokens triggers destructive compaction immediately. Use a
+    -- bounded conservative allowance until provider-specific dimensions are
+    -- tracked alongside attachments.
+    if type(b) == "table" and b.type == "image" then n = n + 4096 * 4 end
   end
   return n
 end
@@ -71,9 +90,27 @@ function M.estimate_tokens(messages)
   if type(messages) ~= "table" then messages = {} end
   local chars = 0
   for _, msg in ipairs(messages) do
-    chars = chars + message_chars(msg) + 16
+    local estimated = math.ceil((message_chars(msg) + 16) / 4)
+    -- Providers report the true output-token count, including hidden reasoning
+    -- that cannot be reconstructed from a summarized/redacted block. Store it on
+    -- assistant messages and never estimate that response lower than measured.
+    local measured = type(msg) == "table" and type(msg.usage) == "table" and msg.usage.output or nil
+    chars = chars + math.max(estimated, tonumber(measured) or 0) * 4
   end
   return math.ceil(chars / 4)
+end
+
+---Estimate a static request fragment (system instructions, tool schemas, etc.)
+---with the same conservative chars/4 heuristic used for the transcript.
+function M.estimate_value_tokens(value)
+  local text
+  if type(value) == "string" then
+    text = value
+  else
+    local ok, encoded = pcall(vim.json.encode, value)
+    text = ok and encoded or vim.inspect(value)
+  end
+  return math.ceil(#text / 4)
 end
 
 -- Character-safe byte truncation. Shared with the tool-output and memory paths
@@ -108,14 +145,7 @@ local function summarize_messages(messages, max_chars, carry)
   -- but hold the whole summary under a hard ceiling so repeated compaction is bounded.
   local ceiling = math.min((carry and carry ~= "") and (#carry + max_chars) or max_chars, 4 * max_chars)
   local total = #table.concat(lines, "\n")
-  local function add(line)
-    if total >= ceiling then return false end
-    if total + #line + 1 > ceiling then line = utf8_safe_sub(line, math.max(0, ceiling - total - 2)) .. "…" end
-    lines[#lines + 1] = line
-    total = total + #line + 1
-    return total < ceiling
-  end
-
+  local candidates = {}
   for i, msg in ipairs(messages) do
     msg = type(msg) == "table" and msg or { role = "?", content = { msg } }
     local role = msg.role or "?"
@@ -125,9 +155,34 @@ local function summarize_messages(messages, max_chars, carry)
     for _, block in ipairs(content) do
       parts[#parts + 1] = trim_one_line(block_text(block), 900)
     end
-    if not add(prefix .. table.concat(parts, " | ")) then break end
+    candidates[#candidates + 1] = prefix .. table.concat(parts, " | ")
   end
-  if total >= ceiling then lines[#lines + 1] = "[summary truncated]" end
+
+  -- The pinned task/carry already preserves the beginning. Spend the remaining
+  -- summary budget on the newest aged-out work, because that is the state the
+  -- next turn must resume. Emit selected lines in chronological order.
+  local selected, omitted = {}, false
+  for i = #candidates, 1, -1 do
+    local line = candidates[i]
+    local room = ceiling - total - 1
+    if room <= 1 then
+      omitted = true
+      break
+    end
+    if #line > room then
+      if #selected == 0 then
+        selected[#selected + 1] = utf8_safe_sub(line, math.max(0, room - 1)) .. "…"
+        total = ceiling
+      end
+      omitted = true
+      break
+    end
+    table.insert(selected, 1, line)
+    total = total + #line + 1
+  end
+  if #selected < #candidates then omitted = true end
+  if omitted then lines[#lines + 1] = "[earlier aged-out messages omitted to preserve the newest work]" end
+  vim.list_extend(lines, selected)
   return table.concat(lines, "\n")
 end
 
@@ -144,6 +199,7 @@ local function strip_replay_only_blocks(messages)
       out[#out + 1] = msg
     else
       local content = {}
+      local changed = false
       for _, block in ipairs(content_blocks(msg)) do
         -- OpenAI encrypted reasoning items are only safe to replay with the
         -- exact preceding context they were produced from.  After compaction we
@@ -155,14 +211,75 @@ local function strip_replay_only_blocks(messages)
           -- would require its paired reasoning item (rs_…) to precede it. We just
           -- dropped that reasoning item, so detach the id and replay the call as a
           -- fresh client-provided function_call (Responses API rejects it otherwise).
-          if type(copy) == "table" and copy.type == "tool_use" then copy.openai_item_id = nil end
+          if type(copy) == "table" and copy.type == "tool_use" and copy.openai_item_id ~= nil then
+            copy.openai_item_id = nil
+            changed = true
+          end
+          if type(copy) == "table" and copy.type == "text" and copy.openai_item ~= nil then
+            copy.openai_item = nil
+            changed = true
+          end
           content[#content + 1] = copy
+        else
+          changed = true
         end
       end
-      if #content > 0 then out[#out + 1] = { role = msg.role, content = content } end
+      if #content > 0 then
+        local copy = vim.deepcopy(msg)
+        copy.content = content
+        -- Measured output included the private blocks we just removed. Keeping
+        -- that floor would make compaction appear not to shrink at all.
+        if changed then copy.usage = nil end
+        out[#out + 1] = copy
+      end
     end
   end
   return out
+end
+
+---Detach model/provider-private replay artifacts while preserving visible text
+---and tool history. Signed Claude thinking and encrypted Responses items are
+---valid only for the generation/model that produced them; carrying them through
+---a mid-session model switch can make an otherwise valid next request fail.
+---@return table[] messages_copy, integer removed_or_detached
+function M.detach_provider_state(messages)
+  local out, changed = {}, 0
+  for _, msg in ipairs(messages or {}) do
+    if type(msg) ~= "table" then
+      out[#out + 1] = msg
+    else
+      local content = {}
+      local message_changed = false
+      for _, block in ipairs(content_blocks(msg)) do
+        if
+          type(block) == "table"
+          and (block.type == "thinking" or block.type == "redacted_thinking" or block.type == "openai_reasoning")
+        then
+          changed = changed + 1
+          message_changed = true
+        else
+          local copy = vim.deepcopy(block)
+          if type(copy) == "table" and copy.type == "tool_use" and copy.openai_item_id ~= nil then
+            copy.openai_item_id = nil
+            changed = changed + 1
+            message_changed = true
+          elseif type(copy) == "table" and copy.type == "text" and copy.openai_item ~= nil then
+            copy.openai_item = nil
+            changed = changed + 1
+            message_changed = true
+          end
+          content[#content + 1] = copy
+        end
+      end
+      if #content > 0 then
+        local copy = vim.deepcopy(msg)
+        copy.content = content
+        if message_changed then copy.usage = nil end
+        out[#out + 1] = copy
+      end
+    end
+  end
+  return out, changed
 end
 
 local function has_tool_use(msg, id)
@@ -200,7 +317,7 @@ local function find_tool_use_message(messages, last_idx, id)
 end
 
 ---Effective auto-compaction threshold in tokens, resolved from the active model.
----The trigger is the SMALLER of two bounds:
+---The trigger is the smallest of three bounds:
 ---  * a fraction of the model's `context_window` (`compact_fraction`) — so a small
 ---    window compacts before it overflows, and a large one isn't compacted at the
 ---    same absolute count as a small one; and
@@ -208,20 +325,30 @@ end
 ---    0.75 × 1M ≈ 750k tokens of context every turn is ruinously expensive and
 ---    would also overflow the cheap summarizer. The cap keeps large-window models
 ---    from ever holding an absurd amount of raw context.
+---  * the request envelope after the static system/tool prefix, requested output,
+---    and a safety margin are reserved — so the provider never sees input+output
+---    exceed its context limit before this transcript-only guard fires.
 ---Falls back to 120000 when neither the window nor the cap is known. Pure and
 ---deterministic so the agent can resolve it once and hand the number to the
 ---model-agnostic compaction functions (and so it is unit-testable).
 ---@param cfg table context config
 ---@param model table|nil the active model (may carry `context_window`)
+---@param request_reserve? number static-prefix plus requested-output tokens
 ---@return number tokens
-function M.resolve_threshold(cfg, model)
+function M.resolve_threshold(cfg, model, request_reserve)
   cfg = type(cfg) == "table" and cfg or {}
   local cap = type(cfg.compact_at_tokens) == "number" and cfg.compact_at_tokens or nil
   local window = model and model.context_window
   local by_window = nil
   if type(window) == "number" and window > 0 then by_window = math.floor(window * (cfg.compact_fraction or 0.75)) end
-  if by_window and cap then return math.min(by_window, cap) end
-  return by_window or cap or 120000
+  local by_request = nil
+  if type(window) == "number" and window > 0 and type(request_reserve) == "number" then
+    by_request = math.max(1, math.floor(window - request_reserve - (cfg.request_safety_tokens or 8192)))
+  end
+  local threshold = by_window or cap or by_request or 120000
+  if cap then threshold = math.min(threshold, cap) end
+  if by_request then threshold = math.min(threshold, by_request) end
+  return threshold
 end
 
 ---Token budget for the retained recent window, as a fraction of the *resolved
@@ -260,14 +387,14 @@ end
 -- cap alone can retain far more than the compaction threshold when recent
 -- messages are large (e.g. a few big file reads), leaving the transcript above
 -- threshold and re-triggering compaction every turn. Walk newest→oldest, keeping
--- messages while they fit `keep_recent_tokens`, but always retain at least 2 for
+-- messages while they fit `keep_recent_tokens`, but always retain at least 1 for
 -- coherence; then take whichever bound (count or tokens) cuts more.
 local function bound_cut_by_tokens(messages, cut, budget)
   if not (type(budget) == "number" and budget > 0) then return cut end
   local acc, tok_cut = 0, #messages
   for i = #messages, 1, -1 do
     acc = acc + M.estimate_tokens({ messages[i] })
-    if acc > budget and (#messages - i + 1) > 2 then break end
+    if acc > budget and (#messages - i + 1) > 1 then break end
     tok_cut = i - 1
   end
   return tok_cut > cut and tok_cut or cut
@@ -289,7 +416,19 @@ local function peel_pinned(older)
   end
   local pinned = {}
   while type(older[1]) == "table" and older[1].pinned do
-    pinned[#pinned + 1] = table.remove(older, 1)
+    local msg = table.remove(older, 1)
+    if type(msg.original_text) == "string" then
+      local content = {}
+      -- Uploaded/clipboard images cannot be reconstructed from a filename. Keep
+      -- task-defining vision inputs with the pinned original turn; dropping them
+      -- at first compaction irreversibly changes the task.
+      for _, block in ipairs(content_blocks(msg)) do
+        if type(block) == "table" and block.type == "image" then content[#content + 1] = vim.deepcopy(block) end
+      end
+      content[#content + 1] = { type = "text", text = msg.original_text }
+      msg.content = content
+    end
+    pinned[#pinned + 1] = msg
   end
   return pinned
 end
@@ -320,9 +459,12 @@ end
 local function prepare_split(messages, opts)
   assert(type(messages) == "table" and type(opts) == "table", "prepare_split: messages and opts tables required")
   local keep = math.max(2, opts.keep_recent_messages or 16)
-  if #messages <= keep + 1 then return nil end
+  local token_pressure = type(opts.keep_recent_tokens) == "number"
+    and opts.keep_recent_tokens > 0
+    and M.estimate_tokens(messages) > opts.keep_recent_tokens
+  if #messages <= keep + 1 and not token_pressure then return nil end
 
-  local cut = bound_cut_by_tokens(messages, #messages - keep, opts.keep_recent_tokens)
+  local cut = bound_cut_by_tokens(messages, math.max(0, #messages - keep), opts.keep_recent_tokens)
   cut = adjust_cut_for_tool_pairs(messages, cut)
   if cut <= 0 then return nil end
 
@@ -450,20 +592,37 @@ local function serialize_transcript(messages, carry)
     })
   end
   local total = #table.concat(lines, "\n")
+  local candidates = {}
   for i, msg in ipairs(messages) do
     msg = type(msg) == "table" and msg or { role = "?", content = { msg } }
     local parts = {}
     for _, block in ipairs(content_blocks(msg)) do
       parts[#parts + 1] = trim_block(block_text(block), LLM_BLOCK_CHAR_CAP)
     end
-    local line = ("%02d %s: %s"):format(i, msg.role or "?", table.concat(parts, " | "))
-    if total + #line + 1 > LLM_TRANSCRIPT_CHAR_CAP then
-      lines[#lines + 1] = "[remaining older history omitted to fit the summarizer's context]"
+    candidates[#candidates + 1] = ("%02d %s: %s"):format(i, msg.role or "?", table.concat(parts, " | "))
+  end
+  local selected, omitted = {}, false
+  for i = #candidates, 1, -1 do
+    local line = candidates[i]
+    local room = LLM_TRANSCRIPT_CHAR_CAP - total - 1
+    if room <= 1 then
+      omitted = true
       break
     end
-    lines[#lines + 1] = line
+    if #line > room then
+      if #selected == 0 then
+        selected[#selected + 1] = utf8_safe_sub(line, math.max(0, room - 1)) .. "…[truncated]"
+        total = LLM_TRANSCRIPT_CHAR_CAP
+      end
+      omitted = true
+      break
+    end
+    table.insert(selected, 1, line)
     total = total + #line + 1
   end
+  if #selected < #candidates then omitted = true end
+  if omitted then lines[#lines + 1] = "[earlier aged-out history omitted to preserve the newest work]" end
+  vim.list_extend(lines, selected)
   return table.concat(lines, "\n")
 end
 
@@ -482,21 +641,47 @@ end
 
 local DEFAULT_SUMMARIZERS = {
   anthropic = "anthropic/claude-haiku-4-5",
-  openai = "openai/gpt-5.6-luna",
 }
+local unavailable_summarizers = {}
+local UNAVAILABLE_TTL_SECONDS = 60
+
+local function temporarily_unavailable(ref)
+  local at = unavailable_summarizers[ref]
+  if not at then return false end
+  local now = uv.hrtime() / 1e9
+  if now - at >= UNAVAILABLE_TTL_SECONDS then
+    unavailable_summarizers[ref] = nil
+    return false
+  end
+  return true
+end
 
 ---Choose the model that writes the summary. An explicit `summarizer_model` wins;
----otherwise pick a cheap model in the ACTIVE model's provider family so a
+---otherwise pick the configured model in the ACTIVE model's provider family so a
 ---Codex/OpenAI-only user (with no Claude credentials) never triggers a Claude
 ---request on `/compact`, and vice-versa. Last resort: the active model itself.
 ---@return table|nil resolved
 local function resolve_summarizer(opts, active_model)
   local config = require("advantage.config")
-  if opts.summarizer_model and opts.summarizer_model ~= "" then return config.resolve_model(opts.summarizer_model) end
+  if opts.summarizer_model and opts.summarizer_model ~= "" then
+    if
+      temporarily_unavailable(opts.summarizer_model)
+      and active_model
+      and opts.summarizer_model:match("^([^/]+)/") == active_model.provider
+    then
+      return active_model
+    end
+    local active_ref = active_model and (active_model.provider .. "/" .. active_model.id)
+    if opts.summarizer_model == active_ref then return active_model end
+    return config.resolve_model(opts.summarizer_model)
+  end
   local provider = active_model and active_model.provider
   local map = opts.summarizer_models or DEFAULT_SUMMARIZERS
   local ref = provider and map[provider]
+  if ref and temporarily_unavailable(ref) then return active_model end
   if ref then
+    local active_ref = active_model and (active_model.provider .. "/" .. active_model.id)
+    if ref == active_ref then return active_model end
     local m = config.resolve_model(ref)
     if m then return m end
   end
@@ -509,9 +694,34 @@ M._resolve_summarizer = resolve_summarizer
 ---Handle the summarizer's completion: assemble the summary text, guard against a
 ---summary that grew the transcript (fall back to the heuristic), and settle via
 ---on_done. `s` bundles the split, token baseline, resolved model, opts and usage.
+local function finish_with_heuristic(s, reason)
+  local fallback_summary = summarize_messages(s.split.older, s.opts.summary_max_chars or 12000, s.split.carry)
+  local fallback = splice_summary(s.split.recent, fallback_summary, s.split.pinned)
+  return s.on_done(fallback, {
+    before_tokens = s.before_tokens,
+    after_tokens = M.estimate_tokens(fallback),
+    compacted_messages = #s.split.older,
+    mode = "heuristic",
+    model = s.resolved,
+    usage = s.usage,
+    reason = reason,
+    fallback_from = s.fallback_from,
+  }, nil)
+end
+
 local function finish_llm_summary(s, blocks, stop_reason)
   assert(type(s) == "table" and type(s.split) == "table", "finish_llm_summary: session with split required")
   assert(type(s.on_done) == "function", "finish_llm_summary: on_done callback required")
+  if
+    stop_reason == "max_tokens"
+    or stop_reason == "model_context_window_exceeded"
+    or stop_reason == "length"
+    or stop_reason == "incomplete"
+  then
+    -- A partial summary usually loses Pending Tasks / Next Step at the tail.
+    -- Never install it as authoritative state just because it contains text.
+    return finish_with_heuristic(s, "llm_summary_truncated")
+  end
   local text = {}
   for _, b in ipairs(blocks or {}) do
     if type(b) == "table" and b.type == "text" and b.text then text[#text + 1] = b.text end
@@ -523,17 +733,7 @@ local function finish_llm_summary(s, blocks, stop_reason)
   local compacted = splice_summary(s.split.recent, frame_llm_summary(summary, s.resolved.label), s.split.pinned)
   local after_tokens = M.estimate_tokens(compacted)
   if s.before_tokens >= LLM_GROWTH_GUARD_MIN_TOKENS and after_tokens > s.before_tokens then
-    local fallback_summary = summarize_messages(s.split.older, s.opts.summary_max_chars or 12000, s.split.carry)
-    local fallback = splice_summary(s.split.recent, fallback_summary, s.split.pinned)
-    return s.on_done(fallback, {
-      before_tokens = s.before_tokens,
-      after_tokens = M.estimate_tokens(fallback),
-      compacted_messages = #s.split.older,
-      mode = "heuristic",
-      model = s.resolved,
-      usage = s.usage,
-      reason = "llm_summary_increased_context",
-    }, nil)
+    return finish_with_heuristic(s, "llm_summary_increased_context")
   end
   s.on_done(compacted, {
     before_tokens = s.before_tokens,
@@ -542,6 +742,7 @@ local function finish_llm_summary(s, blocks, stop_reason)
     mode = "llm",
     model = s.resolved,
     usage = s.usage,
+    fallback_from = s.fallback_from,
   }, nil)
 end
 
@@ -584,29 +785,71 @@ function M.summarize_with_llm(messages, opts, on_done, active_model)
     usage = { input = 0, output = 0, cached = 0 },
   }
 
-  return provider.stream({
-    -- Keep the summarizer cheap/fast regardless of which provider it resolves
-    -- to: `thinking = false` is read by the anthropic provider, `reasoning_effort`
-    -- by the openai one — each ignores the field it doesn't understand.
-    model = { id = resolved.id, thinking = false, reasoning_effort = "minimal" },
-    system = SUMMARIZER_SYSTEM_PROMPT,
-    messages = { { role = "user", content = { { type = "text", text = transcript } } } },
-    tools = nil,
-    on = {
-      text = function() end,
-      thinking = function() end,
-      tool_start = function() end,
-      usage = function(inp, out, cached)
-        s.usage.input, s.usage.output, s.usage.cached = inp or 0, out or 0, cached or 0
-      end,
-      complete = function(blocks, stop_reason)
-        finish_llm_summary(s, blocks, stop_reason)
-      end,
-      error = function(msg)
-        on_done(nil, nil, msg)
-      end,
-    },
-  })
+  local inner, stopped, retried = nil, false, false
+  local function launch(model)
+    if stopped then return end
+    local p = providers.get(model.provider)
+    if not p then return on_done(nil, nil, "no provider for summarizer fallback " .. tostring(model.provider)) end
+    s.resolved = model
+    s.usage = { input = 0, output = 0, cached = 0 }
+    local summary_effort = opts.summarizer_effort or "inherit"
+    local reasoning_effort
+    if summary_effort == "inherit" then
+      reasoning_effort = model.reasoning_effort
+    else
+      reasoning_effort = summary_effort
+    end
+    inner = p.stream({
+      -- The default `inherit` deliberately carries a selected model override;
+      -- provider-level defaults are applied only when the model has none.
+      -- The configured Haiku summarizer stays on its no-thinking path.
+      model = {
+        id = model.id,
+        thinking = false,
+        thinking_mode = "manual",
+        reasoning_effort = reasoning_effort,
+      },
+      system = SUMMARIZER_SYSTEM_PROMPT,
+      messages = { { role = "user", content = { { type = "text", text = transcript } } } },
+      tools = nil,
+      reasoning_summary = false,
+      on = {
+        text = function() end,
+        thinking = function() end,
+        tool_start = function() end,
+        usage = function(inp, out, cached, details)
+          s.usage.input, s.usage.output, s.usage.cached = inp or 0, out or 0, cached or 0
+          s.usage.reasoning = details and details.reasoning or 0
+          s.usage.cache_write = details and details.cache_write or 0
+        end,
+        complete = function(blocks, stop_reason)
+          finish_llm_summary(s, blocks, stop_reason)
+        end,
+        error = function(msg)
+          local lower = tostring(msg):lower()
+          local can_fallback = not retried
+            and active_model
+            and active_model.provider == model.provider
+            and active_model.id ~= model.id
+            and (lower:find("model not found", 1, true) or lower:find("http 404", 1, true))
+          if can_fallback then
+            retried = true
+            s.fallback_from = model.label or model.id
+            unavailable_summarizers[model.provider .. "/" .. model.id] = uv.hrtime() / 1e9
+            return launch(active_model)
+          end
+          on_done(nil, nil, msg)
+        end,
+      },
+    })
+  end
+  launch(resolved)
+  return {
+    stop = function()
+      stopped = true
+      if inner and inner.stop then inner.stop() end
+    end,
+  }
 end
 
 M._SUMMARY_PREFIX = SUMMARY_PREFIX

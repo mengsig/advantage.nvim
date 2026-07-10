@@ -24,8 +24,51 @@ function S.resolve(path, ctx)
   return require("advantage.util").contain(path, ctx.cwd, tcfg.allow_outside_root)
 end
 
+---Return a cheap identity for a path. Lexical equality covers files that do not
+---exist yet; realpath catches symlink aliases; device+inode catches hard links.
+---Computing this only for modified buffers keeps the common read path cheap even
+---when a Neovim instance has thousands of loaded buffers.
+local function path_identity(path)
+  if type(path) ~= "string" or path == "" then return nil end
+  local normalized = vim.fs.normalize(path)
+  local real = uv.fs_realpath(normalized)
+  local st = uv.fs_stat(normalized)
+  return {
+    normalized = normalized,
+    real = real and vim.fs.normalize(real) or nil,
+    dev = st and st.dev or nil,
+    ino = st and st.ino or nil,
+  }
+end
+
+local function same_file(a, b)
+  if not (a and b) then return false end
+  if a.normalized == b.normalized then return true end
+  if a.real and b.real and a.real == b.real then return true end
+  return a.dev ~= nil and a.ino ~= nil and a.dev == b.dev and a.ino == b.ino
+end
+
+local function matching_modified_buffer(path)
+  local target = path_identity(path)
+  for _, buf in ipairs(vim.api.nvim_list_bufs()) do
+    -- Check the overwhelmingly-common false conditions before normalizing or
+    -- stat'ing a buffer name. This makes file reads O(modified buffers), not
+    -- O(all buffers), while still catching symlink/hard-link aliases.
+    if vim.api.nvim_buf_is_loaded(buf) and vim.bo[buf].modified then
+      local name = vim.api.nvim_buf_get_name(buf)
+      if name ~= "" and same_file(target, path_identity(name)) then return buf end
+    end
+  end
+end
+
 function S.read_all(path)
   assert(type(path) == "string" and path ~= "", "read_all: path must be a non-empty string")
+  local buf = matching_modified_buffer(path)
+  if buf then
+    local content = table.concat(vim.api.nvim_buf_get_lines(buf, 0, -1, false), "\n")
+    if vim.bo[buf].eol then content = content .. "\n" end
+    return content
+  end
   local f = io.open(path, "r")
   if not f then return nil end
   local content = f:read("*a")
@@ -37,22 +80,46 @@ function S.write_all(path, content)
   assert(type(path) == "string" and path ~= "", "write_all: path must be a non-empty string")
   assert(type(content) == "string", "write_all: content must be a string")
   vim.fn.mkdir(vim.fs.dirname(path), "p")
+  if matching_modified_buffer(path) then
+    return nil, "the file has unsaved Neovim changes; save or discard them before the agent edits it"
+  end
   -- Atomic write: temp file + rename so a crash, a full disk (ENOSPC), or a
   -- racing reader can never leave a half-written or truncated source file — and
   -- a failed write is reported, never silently swallowed as success. Preserve the
   -- existing file's mode when overwriting.
   local st = uv.fs_stat(path)
-  local tmp = path .. ".adv.tmp"
-  local f, oerr = io.open(tmp, "w")
-  if not f then return nil, oerr end
-  local ok_w, werr = f:write(content)
-  local ok_c = f:close()
-  if not ok_w or not ok_c then
-    os.remove(tmp)
-    return nil, werr or "write failed"
+  local mode = (st and st.mode) or 420
+  local tmp, fd, oerr
+  for attempt = 1, 8 do
+    tmp = ("%s.adv.%d.%x.tmp"):format(path, vim.fn.getpid(), (uv.hrtime() + attempt) % 0x7fffffff)
+    fd, oerr = uv.fs_open(tmp, "wx", mode) -- O_EXCL; never follow a planted symlink
+    if fd then break end
   end
-  if st and st.mode then pcall(uv.fs_chmod, tmp, st.mode) end
-  local ok_r, rerr = os.rename(tmp, path)
+  if not fd then return nil, oerr or "could not create an exclusive temporary file" end
+  -- open(2)'s mode is filtered by umask. Existing files must retain their exact
+  -- executable/read bits across the temp+rename replacement.
+  if st and st.mode then
+    local chmod_ok, chmod_err = uv.fs_chmod(tmp, st.mode)
+    if not chmod_ok then
+      uv.fs_close(fd)
+      os.remove(tmp)
+      return nil, chmod_err or "could not preserve file mode"
+    end
+  end
+  local offset, werr = 0, nil
+  while offset < #content do
+    local wrote
+    wrote, werr = uv.fs_write(fd, content:sub(offset + 1), offset)
+    if not wrote or wrote <= 0 then break end
+    offset = offset + wrote
+  end
+  local sync_ok, sync_err = uv.fs_fsync(fd)
+  uv.fs_close(fd)
+  if offset ~= #content or not sync_ok then
+    os.remove(tmp)
+    return nil, werr or sync_err or "write failed"
+  end
+  local ok_r, rerr = uv.fs_rename(tmp, path)
   if not ok_r then
     os.remove(tmp)
     return nil, rerr or "rename failed"
@@ -74,14 +141,22 @@ end
 function S.refresh_buffers(path)
   assert(type(path) == "string" and path ~= "", "refresh_buffers: path must be a non-empty string")
   vim.schedule(function()
+    local target = path_identity(path)
     for _, buf in ipairs(vim.api.nvim_list_bufs()) do
-      if vim.api.nvim_buf_is_loaded(buf) and vim.api.nvim_buf_get_name(buf) == path then
-        vim.api.nvim_buf_call(buf, function()
-          pcall(vim.cmd.checktime)
-        end)
+      if vim.api.nvim_buf_is_loaded(buf) and not vim.bo[buf].modified then
+        local name = vim.api.nvim_buf_get_name(buf)
+        if name ~= "" and same_file(target, path_identity(name)) then
+          vim.api.nvim_buf_call(buf, function()
+            pcall(vim.cmd.checktime)
+          end)
+        end
       end
     end
   end)
+end
+
+S._same_file = function(a, b)
+  return same_file(path_identity(a), path_identity(b))
 end
 
 ---Count one substantial work action and return the one-shot record-nudge suffix

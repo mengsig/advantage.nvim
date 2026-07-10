@@ -4,8 +4,13 @@
 local util = require("advantage.util")
 local config = require("advantage.config")
 local auth = require("advantage.auth")
+local effort_controls = require("advantage.effort")
 
 local M = {}
+
+-- A login pool can expose a model before all effort levels are enabled. Cache a
+-- server-advertised downgrade so later turns do not pay a failed Ultra request.
+local server_effort_caps = {}
 
 -- Seed once at load, not per call: reseeding on every uuid() correlated draws in
 -- the same ns bucket and perturbed the global RNG used elsewhere (session ids).
@@ -22,22 +27,16 @@ local function content_blocks(msg)
   return type(msg.content) == "table" and msg.content or { msg.content }
 end
 
-local function is_compaction_summary(block)
-  return type(block) == "table"
-    and block.type == "text"
-    and type(block.text) == "string"
-    and vim.startswith(block.text, "Conversation context summary (auto-compacted by advantage.nvim).")
-end
-
 ---Convert canonical (Anthropic-shaped) messages into Responses API input items.
 ---Convert one content block into a Responses API input item, or nil to skip it.
 ---Mutates seen_tool_calls to record which function_calls have appeared, so an
 ---orphan tool_result (whose call was dropped) is skipped rather than 400-ing.
-local function convert_block(block, role, seen_tool_calls, compacted)
+local function convert_block(block, role, seen_tool_calls)
   assert(type(block) == "table" and block.type ~= nil, "convert_block: normalized block required")
   assert(type(seen_tool_calls) == "table", "convert_block: seen_tool_calls set required")
   if block.type == "text" then
     if role == "assistant" then
+      if type(block.openai_item) == "table" then return block.openai_item end
       return { role = "assistant", content = { { type = "output_text", text = block.text } } }
     end
     return { role = "user", content = { { type = "input_text", text = block.text } } }
@@ -60,11 +59,10 @@ local function convert_block(block, role, seen_tool_calls, compacted)
       arguments = vim.json.encode(block.input or vim.empty_dict()),
       status = block.status or "completed",
     }
-    -- Once context has been compacted the paired encrypted reasoning item is
-    -- gone, so a function_call carrying its server-side id (fc_…) would be
-    -- rejected for lacking its required preceding reasoning item. Replay it as
-    -- a fresh client-provided call instead.
-    if block.openai_item_id and not compacted then item.id = block.openai_item_id end
+    -- compact.lua strips both replay-only reasoning and these server-side ids
+    -- from the retained window as one atomic operation. Fresh calls created after
+    -- a compaction summary must keep their ids so reasoning replay continues.
+    if block.openai_item_id then item.id = block.openai_item_id end
     return item
   elseif block.type == "tool_result" then
     if not seen_tool_calls[block.tool_use_id] then return nil end
@@ -75,7 +73,7 @@ local function convert_block(block, role, seen_tool_calls, compacted)
       call_id = block.tool_use_id,
       output = content or "",
     }
-  elseif block.type == "openai_reasoning" and block.item and not compacted then
+  elseif block.type == "openai_reasoning" and block.item then
     -- Replay reasoning items so codex models keep their chain across tool calls.
     -- Once context has been compacted the encrypted item no longer matches the
     -- exact prior transcript, and the Responses API may reject the request.
@@ -88,13 +86,11 @@ end
 local function to_input_items(messages)
   local items = {}
   local seen_tool_calls = {}
-  local compacted = false
   for _, msg in ipairs(type(messages) == "table" and messages or {}) do
     msg = type(msg) == "table" and msg or { role = "user", content = { msg } }
     for _, block in ipairs(content_blocks(msg)) do
       block = type(block) == "table" and block or { type = "text", text = tostring(block or "") }
-      if is_compaction_summary(block) then compacted = true end
-      local item = convert_block(block, msg.role, seen_tool_calls, compacted)
+      local item = convert_block(block, msg.role, seen_tool_calls)
       if item then items[#items + 1] = item end
     end
   end
@@ -118,6 +114,8 @@ end
 local function append_function_call(st, item)
   assert(type(st) == "table" and type(st.blocks) == "table", "append_function_call: state with blocks required")
   assert(type(item) == "table", "append_function_call: item must be a table")
+  -- Never execute a call whose JSON was cut off by an output-token limit.
+  if item.status and item.status ~= "completed" then return end
   st.has_tool_call = true
   local ok, input = pcall(vim.json.decode, item.arguments and item.arguments ~= "" and item.arguments or "{}")
   st.blocks[#st.blocks + 1] = {
@@ -138,7 +136,13 @@ local function append_message(st, item)
   for _, part in ipairs(item.content or {}) do
     if part.type == "output_text" then text[#text + 1] = part.text end
   end
-  if #text > 0 then st.blocks[#st.blocks + 1] = { type = "text", text = table.concat(text) } end
+  if #text > 0 then
+    local block = { type = "text", text = table.concat(text) }
+    -- An incomplete server item is useful transcript text, but cannot safely be
+    -- replayed as an authoritative Responses output item on the next request.
+    if not item.status or item.status == "completed" then block.openai_item = vim.deepcopy(item) end
+    st.blocks[#st.blocks + 1] = block
+  end
 end
 
 ---Dispatch a `response.output_item.done` item to the right block builder.
@@ -149,7 +153,7 @@ local function finish_output_item(st, item)
     append_function_call(st, item)
   elseif item.type == "message" then
     append_message(st, item)
-  elseif item.type == "reasoning" then
+  elseif item.type == "reasoning" and (not item.status or item.status == "completed") then
     st.blocks[#st.blocks + 1] = { type = "openai_reasoning", item = item }
   end
 end
@@ -157,13 +161,52 @@ end
 ---Build the streaming event handler. Exposed for tests via M._make_handler.
 ---Item-completion logic lives in the module-level helpers above so this
 ---dispatcher stays a short, flat switch over the Responses API event types.
-local function make_handler(on)
+local function make_handler(on, effective_effort)
   assert(type(on) == "table", "make_handler: on must be a table of callbacks")
   assert(
     type(on.complete) == "function" and type(on.error) == "function",
     "make_handler: on.complete and on.error are required callbacks"
   )
-  local st = { blocks = {}, usage = { input = 0, output = 0, cached = 0 }, completed = false, has_tool_call = false }
+  local st = {
+    blocks = {},
+    usage = { input = 0, output = 0, cached = 0 },
+    completed = false,
+    has_tool_call = false,
+    partial_text = {},
+  }
+
+  local function adopt_response_output(response)
+    if type(response) ~= "table" or type(response.output) ~= "table" or #response.output == 0 then return false end
+    st.blocks, st.has_tool_call = {}, false
+    for _, item in ipairs(response.output) do
+      finish_output_item(st, item)
+    end
+    return true
+  end
+
+  local function preserve_partial_text()
+    for _, block in ipairs(st.blocks) do
+      if block.type == "text" and block.text and block.text ~= "" then return end
+    end
+    local partial = table.concat(st.partial_text)
+    if partial ~= "" then st.blocks[#st.blocks + 1] = { type = "text", text = partial } end
+  end
+
+  local function finish_usage(response)
+    local u = (response and response.usage) or {}
+    local input_details = u.input_tokens_details or {}
+    local output_details = u.output_tokens_details or {}
+    st.usage.input = u.input_tokens or 0
+    st.usage.output = u.output_tokens or 0
+    st.usage.cached = input_details.cached_tokens or 0
+    st.usage.cache_write = input_details.cache_write_tokens or 0
+    st.usage.reasoning = output_details.reasoning_tokens or 0
+    on.usage(st.usage.input, st.usage.output, st.usage.cached, {
+      reasoning = st.usage.reasoning,
+      cache_write = st.usage.cache_write,
+      effort = effective_effort,
+    })
+  end
 
   local function on_event(name, d)
     if type(d) ~= "table" then return end
@@ -172,7 +215,10 @@ local function make_handler(on)
       local item = d.item or {}
       if item.type == "function_call" then on.tool_start(item.call_id or item.id, item.name) end
     elseif t == "response.output_text.delta" then
-      if d.delta and d.delta ~= "" then on.text(d.delta) end
+      if d.delta and d.delta ~= "" then
+        st.partial_text[#st.partial_text + 1] = d.delta
+        on.text(d.delta)
+      end
     elseif t == "response.reasoning_summary_text.delta" then
       if d.delta and d.delta ~= "" then on.thinking(d.delta) end
     elseif t == "response.output_item.done" then
@@ -180,18 +226,32 @@ local function make_handler(on)
     elseif t == "response.completed" then
       if not st.completed then
         st.completed = true
-        local u = (d.response and d.response.usage) or {}
-        st.usage.input = u.input_tokens or 0
-        st.usage.output = u.output_tokens or 0
-        st.usage.cached = (u.input_tokens_details and u.input_tokens_details.cached_tokens) or 0
-        on.usage(st.usage.input, st.usage.output, st.usage.cached)
+        if #st.blocks == 0 then adopt_response_output(d.response) end
+        finish_usage(d.response)
         on.complete(st.blocks, st.has_tool_call and "tool_use" or "end_turn", st.usage)
       end
-    elseif t == "response.failed" or t == "response.incomplete" then
+    elseif t == "response.incomplete" then
+      if not st.completed then
+        st.completed = true
+        local response = d.response or {}
+        local reason = response.incomplete_details and response.incomplete_details.reason
+        if reason == "max_output_tokens" or reason == "max_tokens" then
+          adopt_response_output(response)
+          preserve_partial_text()
+          finish_usage(response)
+          -- Preserve any completed text/tool items and the spend instead of
+          -- turning a quality-cap truncation into a transcript-losing error.
+          on.complete(st.blocks, st.has_tool_call and "tool_use" or "max_tokens", st.usage)
+        else
+          local err = response.error
+          on.error((err and err.message) or ("response incomplete: " .. tostring(reason or "unknown reason")))
+        end
+      end
+    elseif t == "response.failed" then
       if not st.completed then
         st.completed = true
         local err = d.response and d.response.error
-        on.error((err and err.message) or ("response " .. (t == "response.failed" and "failed" or "incomplete")))
+        on.error((err and err.message) or "response failed")
       end
     elseif t == "error" then
       if not st.completed then
@@ -215,6 +275,15 @@ local function build_body(pcfg, req)
   local otools = to_tools(req.tools)
   local effort = req.model.reasoning_effort
   if effort == nil then effort = pcfg.reasoning_effort end
+  -- Backward compatibility for sessions saved by the old picker, where `false`
+  -- meant "off" but accidentally omitted the reasoning object (which merely
+  -- restored the API default). Current sessions store the real API value `none`.
+  if effort == false then effort = "none" end
+  local parallel_tool_calls
+  if #otools > 0 then parallel_tool_calls = req.parallel_tool_calls end
+  local reasoning_summary = req.reasoning_summary
+  if reasoning_summary == nil then reasoning_summary = pcfg.reasoning_summary end
+  if reasoning_summary == false or effort == "none" then reasoning_summary = nil end
   return {
     model = req.model.id,
     input = to_input_items(req.messages),
@@ -225,20 +294,25 @@ local function build_body(pcfg, req)
     -- An explicit tool_choice (the sub-agent sets "none" on its report-only turn
     -- to force a text reply) wins; otherwise default to "auto" when tools exist.
     tool_choice = req.tool_choice or (#otools > 0 and "auto" or nil),
+    -- Permit a same-turn fan-out without requiring one: the model remains free
+    -- to emit a single tool call and wait for its result. Keep this request-driven
+    -- so config.subagents.parallel = false can disable the capability entirely.
+    parallel_tool_calls = parallel_tool_calls,
+    prompt_cache_key = req.prompt_cache_key,
     stream = true,
     store = false,
-    include = effort ~= false and { "reasoning.encrypted_content" } or nil,
-    reasoning = effort ~= false and {
+    include = effort ~= "none" and { "reasoning.encrypted_content" } or nil,
+    reasoning = {
       effort = effort,
-      summary = "auto",
-    } or nil,
+      summary = reasoning_summary,
+    },
   }
 end
 M._build_body = build_body
 
 ---Pick endpoint + headers for the credential mode. Mutates `body` for the
 ---API-key path (which caps output tokens). Returns url, headers.
-local function endpoint_for(cred, pcfg, body)
+local function endpoint_for(cred, pcfg, body, req)
   assert(type(cred) == "table" and cred.mode ~= nil, "openai.endpoint_for: resolved credential required")
   if cred.mode == "chatgpt" then
     return "https://chatgpt.com/backend-api/codex/responses",
@@ -249,10 +323,12 @@ local function endpoint_for(cred, pcfg, body)
         "chatgpt-account-id: " .. cred.account_id,
         "OpenAI-Beta: responses=experimental",
         "originator: codex_cli_rs",
-        "session_id: " .. uuid(),
+        -- Keep one stable conversation id across tool-loop requests. A fresh UUID
+        -- per request defeats the subscription backend's cache/session routing.
+        "session_id: " .. ((req and req.session_id) or uuid()),
       }
   end
-  body.max_output_tokens = pcfg.max_output_tokens
+  body.max_output_tokens = config.effective_max_output_tokens(req.model, "openai", "api_key") or pcfg.max_output_tokens
   return pcfg.base_url .. "/v1/responses",
     {
       "content-type: application/json",
@@ -263,7 +339,8 @@ end
 function M.stream(req)
   assert(type(req) == "table" and type(req.on) == "table", "openai.stream: req with on handlers required")
   local pcfg = config.options.providers.openai
-  local cancelled, inner, reauthed = false, nil, false
+  local cancelled, inner, reauthed, effort_retried = false, nil, false, false
+  local effort_override
   local attempt
 
   attempt = function(force)
@@ -272,9 +349,36 @@ function M.stream(req)
       if not cred then return req.on.error(autherr) end
       if req.on.auth then req.on.auth(cred.badge) end
 
-      local body = build_body(pcfg, req)
-      local url, headers = endpoint_for(cred, pcfg, body)
-      local on_event, is_completed = make_handler(req.on)
+      local effective_req = req
+      if req.model.reasoning_effort == false then
+        effective_req = vim.tbl_extend("force", {}, req, { model = vim.deepcopy(req.model) })
+        effective_req.model.reasoning_effort = cred.mode == "api_key" and "none" or "low"
+      end
+      if effort_override then
+        effective_req = vim.tbl_extend("force", {}, effective_req, { model = vim.deepcopy(effective_req.model) })
+        effective_req.model.reasoning_effort = effort_override
+      end
+      local cached_cap = server_effort_caps[cred.mode .. ":" .. tostring(effective_req.model.id)]
+      if
+        cached_cap and (effective_req.model.reasoning_effort == nil or effective_req.model.reasoning_effort == "ultra")
+      then
+        effective_req = vim.tbl_extend("force", {}, effective_req, { model = vim.deepcopy(effective_req.model) })
+        effective_req.model.reasoning_effort = cached_cap
+      end
+      local selected, effort_err = effort_controls.resolve_openai(effective_req.model, cred.mode, pcfg.reasoning_effort)
+      if effort_err then return req.on.error(effort_err) end
+      -- Freeze the resolved inherited value into this request. build_body is also
+      -- exported for unit tests and normally consults provider config itself; a
+      -- clone here prevents that generic path from undoing transport-aware
+      -- clamping (ultra→max/xhigh) after credentials have been resolved.
+      if effective_req.model.reasoning_effort ~= selected then
+        effective_req = vim.tbl_extend("force", {}, effective_req, { model = vim.deepcopy(effective_req.model) })
+        effective_req.model.reasoning_effort = selected
+      end
+
+      local body = build_body(pcfg, effective_req)
+      local url, headers = endpoint_for(cred, pcfg, body, effective_req)
+      local on_event, is_completed = make_handler(req.on, selected)
 
       inner = util.request_sse({
         url = url,
@@ -288,6 +392,34 @@ function M.stream(req)
           if status == 401 and not reauthed and not cancelled then
             reauthed = true
             return attempt(true)
+          end
+          -- The subscription catalogue can lag the local model metadata. In
+          -- particular, some login pools advertise Sol but reject `ultra` with
+          -- a 400 listing support only through xhigh. Recover once at the
+          -- deepest value the server explicitly advertised rather than losing
+          -- the entire coding turn.
+          local lower = tostring(msg):lower()
+          if
+            status == 400
+            and not effort_retried
+            and selected
+            and lower:find("invalid value", 1, true)
+            and lower:find("ultra", 1, true)
+            and lower:find("xhigh", 1, true)
+          then
+            effort_retried = true
+            effort_override = "xhigh"
+            server_effort_caps[cred.mode .. ":" .. tostring(effective_req.model.id)] = "xhigh"
+            vim.schedule(function()
+              vim.notify(
+                ("OpenAI %s rejected Ultra for %s; retrying at xhigh"):format(
+                  cred.mode == "chatgpt" and "login" or "API",
+                  tostring(effective_req.model.id)
+                ),
+                vim.log.levels.WARN
+              )
+            end)
+            return attempt(false)
           end
           req.on.error(msg)
         end),

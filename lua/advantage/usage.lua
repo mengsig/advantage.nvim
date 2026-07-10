@@ -15,7 +15,8 @@ end
 ---Append one usage record. Called once per API response. `cached` is the portion
 ---of `input` served from the prompt cache (billed at ~10%), tracked so the
 ---dashboard can show real cost instead of full-price input.
-function M.record(model, input, output, cached)
+---@param details? {reasoning?:number, cache_write?:number}
+function M.record(model, input, output, cached, details)
   assert(model == nil or type(model) == "table", "usage.record: model must be a table or nil")
   assert(input == nil or (type(input) == "number" and input >= 0), "usage.record: input tokens must be non-negative")
   assert(
@@ -33,6 +34,9 @@ function M.record(model, input, output, cached)
     i = input or 0,
     o = output or 0,
     c = (cached or 0) > 0 and cached or nil,
+    r = details and (details.reasoning or 0) > 0 and details.reasoning or nil,
+    w = details and (details.cache_write or 0) > 0 and details.cache_write or nil,
+    e = (details and details.effort) or (model and (model.reasoning_effort or model.effort) or nil),
   }
   local ok, line = pcall(vim.json.encode, rec)
   if not ok then return end
@@ -87,7 +91,7 @@ function M.stats(now)
   local today_start = midnight(0)
 
   local st = {
-    today = { input = 0, output = 0, total = 0, requests = 0, cached = 0 },
+    today = { input = 0, output = 0, total = 0, requests = 0, cached = 0, reasoning = 0, cache_write = 0 },
     last_hour = 0,
     days = {}, -- 7 entries, oldest first
     by_model = {}, -- today, model -> total
@@ -107,6 +111,8 @@ function M.stats(now)
       st.today.total = st.today.total + total
       st.today.requests = st.today.requests + 1
       st.today.cached = st.today.cached + (r.c or 0)
+      st.today.reasoning = st.today.reasoning + (r.r or 0)
+      st.today.cache_write = st.today.cache_write + (r.w or 0)
       st.by_model[r.m or "?"] = (st.by_model[r.m or "?"] or 0) + total
       st.first_today = math.min(st.first_today or r.t, r.t)
     end
@@ -153,11 +159,15 @@ local function add_totals(add, st, session_usage)
     )
   )
   if (st.today.cached or 0) > 0 then
-    -- cache reads bill at ~10%, so ~90% of cached input tokens are money saved
-    local saved = math.floor(st.today.cached * 0.9)
+    -- Approximate full-price-token equivalents: reads are heavily discounted,
+    -- while providers may charge a cache-creation premium. Report the net, not
+    -- an inflated read-only savings claim.
+    local saved = math.max(0, math.floor(st.today.cached * 0.9 - (st.today.cache_write or 0) * 0.25))
     local pct = st.today.input > 0 and math.floor(st.today.cached / st.today.input * 100 + 0.5) or 0
-    add("cached", ("%s of input (%d%%) · ~%s saved"):format(fmt(st.today.cached), pct, fmt(saved)))
+    local writes = (st.today.cache_write or 0) > 0 and (" · %s writes"):format(fmt(st.today.cache_write)) or ""
+    add("cached", ("%s of input (%d%%)%s · ~%s net saved"):format(fmt(st.today.cached), pct, writes, fmt(saved)))
   end
+  if (st.today.reasoning or 0) > 0 then add("reasoning", fmt(st.today.reasoning) .. " output tokens") end
   add("last hour", fmt(st.last_hour) .. " tokens")
   add("pace", fmt(st.pace) .. "/h")
   add("7 days", ("%s  %s total · avg %s/day"):format(sparkline(st.days), fmt(st.week_total), fmt(st.week_avg)))

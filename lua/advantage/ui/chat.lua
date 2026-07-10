@@ -42,6 +42,67 @@ local stop_timer = render.stop_timer
 local input_placeholder = render.input_placeholder
 local resize_input = render.resize_input
 
+-- Streaming providers can emit hundreds of tiny deltas per second. Rendering
+-- every delta separately repeatedly reads/replaces the tail line, updates the
+-- thinking extmark, and autoscrolls. Coalesce one short UI-frame's worth while
+-- keeping explicit boundaries synchronous so transcript ordering is exact.
+local STREAM_FLUSH_MS = 20
+local STREAM_FLUSH_BYTES = 32 * 1024
+
+local function stop_stream_timer()
+  local timer = S.stream_timer
+  S.stream_timer = nil
+  if not timer then return end
+  pcall(function()
+    timer:stop()
+    if not timer:is_closing() then timer:close() end
+  end)
+end
+
+local function flush_stream()
+  stop_stream_timer()
+  local parts, mode, buf = S.stream_parts, S.stream_mode, S.stream_buf
+  S.stream_parts, S.stream_bytes, S.stream_mode, S.stream_buf = {}, 0, nil, nil
+  if not parts or #parts == 0 then return end
+  -- A cleared/replaced transcript must never receive a late timer write. All
+  -- normal mode transitions call flush_stream first; the equality check is a
+  -- final guard against module reloads or unexpected external state changes.
+  if S.buf == buf and util.buf_valid(buf) and S.mode == mode then stream_chunk(table.concat(parts)) end
+end
+
+local function queue_stream(chunk)
+  if chunk == nil or chunk == "" then return end
+  -- Defensive boundary handling: callers below normally flush before changing
+  -- S.mode, but do not merge differently highlighted blocks if that invariant
+  -- is ever relaxed.
+  if S.stream_mode and (S.stream_mode ~= S.mode or S.stream_buf ~= S.buf) then flush_stream() end
+  S.stream_mode = S.mode
+  S.stream_buf = S.buf
+  S.stream_parts[#S.stream_parts + 1] = chunk
+  S.stream_bytes = S.stream_bytes + #chunk
+  if S.stream_bytes >= STREAM_FLUSH_BYTES then
+    flush_stream()
+    return
+  end
+  if S.stream_timer then return end
+  local timer = uv.new_timer()
+  S.stream_timer = timer
+  timer:start(
+    STREAM_FLUSH_MS,
+    0,
+    vim.schedule_wrap(function()
+      -- A synchronous boundary may already have drained this batch while the
+      -- timer callback was waiting on Neovim's main loop.
+      if S.stream_timer ~= timer then return end
+      flush_stream()
+    end)
+  )
+end
+
+-- Tool output is buffered per card below; this forward declaration lets close
+-- and clear drain pending frames before a buffer is hidden or replaced.
+local flush_tool_streams = function() end
+
 ---Scroll the transcript without leaving the prompt.
 local function scroll_chat(keys)
   if not util.win_valid(S.win) then return end
@@ -269,7 +330,7 @@ local function help_lines()
     "  /resume  resume session    /review  diff agent edits",
     "  /context repo memory + skills (init · curate · verify · preview · forget <text>)",
     "  /yolo    skip permissions",
-    "  /effort [mode]  tune thinking/reasoning (OpenAI: default/off/minimal/low/medium/high; Claude: adaptive/off/1k/4k/8k/10k/16k/32k)",
+    "  /effort [mode]  model-aware reasoning (run /effort to see the active model's supported levels)",
     "",
     "commands",
     "  :Advantage            toggle panel",
@@ -437,7 +498,7 @@ local function map_input_keys()
     -- complete() only filters keys typed AFTER the menu opens, so an existing
     -- base must be fuzzy-filtered by hand or the menu shows every file
     local base = line:sub(at + 1, col)
-    local files = require("advantage.attach").project_files(400)
+    local files = require("advantage.attach").project_files(400, require("advantage").cwd())
     if base ~= "" then files = vim.fn.matchfuzzy(files, base) end
     if #files == 0 then return end
     if saved_completeopt == nil then saved_completeopt = vim.o.completeopt end
@@ -459,7 +520,7 @@ local function map_input_keys()
   map(S.input_buf, "i", "@", function()
     vim.schedule(function()
       if api.nvim_get_current_buf() ~= S.input_buf or not vim.fn.mode():find("i") then return end
-      if #require("advantage.attach").project_files(400) == 0 then return end
+      if #require("advantage.attach").project_files(400, require("advantage").cwd()) == 0 then return end
       popup_file_menu()
     end)
     return "@"
@@ -564,6 +625,8 @@ function M.open(focus)
 end
 
 function M.close()
+  flush_stream()
+  flush_tool_streams()
   for _, win in ipairs({ S.input_win, S.win }) do
     if util.win_valid(win) then pcall(api.nvim_win_close, win, true) end
   end
@@ -583,6 +646,8 @@ end
 
 function M.clear()
   ensure_bufs()
+  flush_stream()
+  flush_tool_streams()
   api.nvim_buf_clear_namespace(S.buf, ns, 0, -1)
   api.nvim_buf_clear_namespace(S.buf, ns_extra, 0, -1)
   buf_write(function()
@@ -606,6 +671,7 @@ end
 
 function M.user_message(text, images)
   ensure_bufs()
+  flush_stream()
   S.mode, S.last_kind = nil, "user"
   S.follow = true -- sending a message snaps back to the live end
   local head = "▍ you"
@@ -669,6 +735,7 @@ end
 
 function M.begin_assistant(label)
   ensure_bufs()
+  flush_stream()
   S.model_label = label or S.model_label
   S.mode, S.last_kind = nil, "header"
   S.think_mark, S.think_start = nil, nil
@@ -690,27 +757,30 @@ end
 function M.stream_text(chunk)
   if not util.buf_valid(S.buf) then return end
   if S.mode ~= "text" then
+    flush_stream()
     start_block()
     S.mode = "text"
     S.last_kind = "text"
   end
-  stream_chunk(chunk)
+  queue_stream(chunk)
 end
 
 function M.stream_thinking(chunk)
   if not util.buf_valid(S.buf) then return end
   if S.mode ~= "thinking" then
+    flush_stream()
     start_block()
     S.mode = "thinking"
     S.last_kind = "text"
     S.think_start = last_row()
     S.think_mark = nil
   end
-  stream_chunk(chunk)
+  queue_stream(chunk)
 end
 
 function M.tool_begin(id, name)
   if not util.buf_valid(S.buf) then return end
+  flush_stream()
   S.mode = nil
   local line
   if S.last_kind == "tool" then
@@ -730,6 +800,10 @@ end
 
 ---@param patch {status?: string, detail?: string, name?: string}
 function M.tool_update(id, patch)
+  local pending = S.tool_streams[id]
+  if pending and patch.status and patch.status ~= "running" and patch.status ~= "pending" and pending.flush then
+    pending.flush()
+  end
   local t = S.tools[id]
   if not t then return end
   t.status = patch.status or t.status
@@ -742,8 +816,9 @@ end
 ---Append streamed tool output under the current tool card. This is intentionally
 ---plain transcript text (not part of model-visible history); the final tool
 ---result is still recorded by the agent when the tool exits.
-function M.tool_output(id, chunk)
-  if not util.buf_valid(S.buf) or not chunk or chunk == "" then return end
+local function append_tool_output(id, chunk, buf)
+  if S.buf ~= buf or not util.buf_valid(buf) then return end
+  flush_stream()
   local max = 6000
   if #chunk > max then chunk = util.utf8_safe_sub(chunk, max) .. "\n… [stream chunk truncated]" end
   local lines = vim.split(chunk:gsub("\r", ""), "\n", { plain = true })
@@ -768,9 +843,56 @@ function M.tool_output(id, chunk)
   autoscroll()
 end
 
+function M.tool_output(id, chunk)
+  if not util.buf_valid(S.buf) or not chunk or chunk == "" then return end
+  local batch = S.tool_streams[id]
+  if not batch or batch.buf ~= S.buf then
+    if batch and batch.flush then batch.flush() end
+    batch = { parts = {}, bytes = 0, buf = S.buf }
+    S.tool_streams[id] = batch
+    batch.flush = function()
+      if S.tool_streams[id] ~= batch then return end
+      S.tool_streams[id] = nil
+      if batch.timer then
+        local timer = batch.timer
+        batch.timer = nil
+        pcall(function()
+          timer:stop()
+          if not timer:is_closing() then timer:close() end
+        end)
+      end
+      if #batch.parts > 0 then append_tool_output(id, table.concat(batch.parts), batch.buf) end
+    end
+  end
+  batch.parts[#batch.parts + 1] = chunk
+  batch.bytes = batch.bytes + #chunk
+  if batch.bytes >= STREAM_FLUSH_BYTES then return batch.flush() end
+  if batch.timer then return end
+  local timer = uv.new_timer()
+  batch.timer = timer
+  timer:start(
+    STREAM_FLUSH_MS,
+    0,
+    vim.schedule_wrap(function()
+      if S.tool_streams[id] == batch and batch.timer == timer then batch.flush() end
+    end)
+  )
+end
+
+flush_tool_streams = function()
+  local pending = {}
+  for _, batch in pairs(S.tool_streams) do
+    pending[#pending + 1] = batch
+  end
+  for _, batch in ipairs(pending) do
+    if batch.flush then batch.flush() end
+  end
+end
+
 ---Right-aligned meta on the current turn's header; overwritten as the turn
 ---progresses so it always shows the cumulative turn cost.
 function M.message_meta(usage, elapsed_ns)
+  flush_stream()
   if not (S.header_mark and util.buf_valid(S.buf)) then return end
   local pos = api.nvim_buf_get_extmark_by_id(S.buf, ns, S.header_mark, {})
   if not pos or #pos == 0 then return end
@@ -791,6 +913,7 @@ end
 
 function M.notice(text)
   ensure_bufs()
+  flush_stream()
   S.mode = nil
   local parts = split_lines(text)
   local lines = { "" }
@@ -820,6 +943,7 @@ function M.notice(text)
 end
 
 function M.finish_turn()
+  flush_stream()
   S.mode = nil
 end
 
@@ -844,6 +968,7 @@ function M.compaction_done()
 end
 
 function M.set_status(status, detail)
+  if status == "idle" then flush_stream() end
   S.status = status
   S.status_detail = detail
   if status ~= "idle" then ensure_timer() end
@@ -875,6 +1000,11 @@ function M.set_model_label(label)
     clear_welcome()
     show_welcome()
   end
+end
+
+function M.set_effort_label(label)
+  S.effort_label = label
+  update_winbar()
 end
 
 function M.notify(msg, level)
@@ -1078,7 +1208,7 @@ function M.render_transcript(messages, model_label)
       end
     end
   end
-  S.mode = nil
+  M.finish_turn()
   M.set_status("idle")
 end
 

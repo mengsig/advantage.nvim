@@ -30,16 +30,31 @@ local function read_json(path)
 end
 
 local function write_json(path, tbl)
-  -- Atomic write with 0600 before the rename: a crash mid-write must never
-  -- corrupt the real `claude`/`codex` credential file (would force a re-login),
-  -- and the plaintext refresh token must never sit at a laxer umask.
-  local tmp = path .. ".tmp"
-  local f = io.open(tmp, "w")
-  if not f then return false end
-  f:write(vim.json.encode(tbl))
-  f:close()
-  pcall(uv.fs_chmod, tmp, 384) -- 0600
-  if not os.rename(tmp, path) then
+  -- Atomic write with an exclusive randomized temp at 0600: never follow a
+  -- planted `.tmp` symlink, expose a rotated refresh token through the umask, or
+  -- replace good credentials after a partial/full-disk write.
+  local content = vim.json.encode(tbl)
+  local tmp, fd
+  for attempt = 1, 8 do
+    tmp = ("%s.adv.%d.%x.tmp"):format(path, vim.fn.getpid(), (uv.hrtime() + attempt) % 0x7fffffff)
+    fd = uv.fs_open(tmp, "wx", 384) -- 0600
+    if fd then break end
+  end
+  if not fd then return false end
+  local offset = 0
+  while offset < #content do
+    local wrote = uv.fs_write(fd, content:sub(offset + 1), offset)
+    if not wrote or wrote <= 0 then break end
+    offset = offset + wrote
+  end
+  local synced = uv.fs_fsync(fd)
+  uv.fs_close(fd)
+  if offset ~= #content or not synced then
+    os.remove(tmp)
+    return false
+  end
+  local renamed = uv.fs_rename(tmp, path)
+  if not renamed then
     os.remove(tmp)
     return false
   end
@@ -81,14 +96,27 @@ end
 
 -- anthropic ---------------------------------------------------------------
 
+local anthropic_refresh_waiters = nil
 local function refresh_anthropic(oauth, cb)
+  if anthropic_refresh_waiters then
+    anthropic_refresh_waiters[#anthropic_refresh_waiters + 1] = cb
+    return
+  end
+  anthropic_refresh_waiters = { cb }
+  local function settle(value, err)
+    local waiters = anthropic_refresh_waiters or {}
+    anthropic_refresh_waiters = nil
+    for _, waiter in ipairs(waiters) do
+      waiter(value, err)
+    end
+  end
   post_json(ANTHROPIC_TOKEN_URL, {
     grant_type = "refresh_token",
     refresh_token = oauth.refreshToken,
     client_id = ANTHROPIC_CLIENT_ID,
   }, function(res, err)
     if not res or not res.access_token then
-      return cb(nil, "Claude token refresh failed (" .. (err or "no token") .. "). Run `claude` and /login again.")
+      return settle(nil, "Claude token refresh failed (" .. (err or "no token") .. "). Run `claude` and /login again.")
     end
     local updated = {
       accessToken = res.access_token,
@@ -111,7 +139,7 @@ local function refresh_anthropic(oauth, cb)
         )
       end)
     end
-    cb(updated)
+    settle(updated)
   end)
 end
 
@@ -154,7 +182,20 @@ local function codex_account_id(tokens)
   return auth_claim and auth_claim.chatgpt_account_id or nil
 end
 
+local codex_refresh_waiters = nil
 local function refresh_codex(auth_file, cb)
+  if codex_refresh_waiters then
+    codex_refresh_waiters[#codex_refresh_waiters + 1] = cb
+    return
+  end
+  codex_refresh_waiters = { cb }
+  local function settle(value, err)
+    local waiters = codex_refresh_waiters or {}
+    codex_refresh_waiters = nil
+    for _, waiter in ipairs(waiters) do
+      waiter(value, err)
+    end
+  end
   local tokens = auth_file.tokens
   post_json(OPENAI_TOKEN_URL, {
     client_id = OPENAI_CLIENT_ID,
@@ -163,7 +204,7 @@ local function refresh_codex(auth_file, cb)
     scope = "openid profile email",
   }, function(res, err)
     if not res or not res.access_token then
-      return cb(nil, "Codex token refresh failed (" .. (err or "no token") .. "). Run `codex login` again.")
+      return settle(nil, "Codex token refresh failed (" .. (err or "no token") .. "). Run `codex login` again.")
     end
     auth_file.tokens.access_token = res.access_token
     auth_file.tokens.id_token = res.id_token or tokens.id_token
@@ -179,16 +220,18 @@ local function refresh_codex(auth_file, cb)
         )
       end)
     end
-    cb(auth_file.tokens)
+    settle(auth_file.tokens)
   end)
 end
 
 ---@param cb fun(cred: {mode:string, token?:string, key?:string, account_id?:string, badge:string}|nil, err?:string)
 ---@param force boolean|nil force a token refresh even if the cached token looks valid (e.g. after a 401)
 function M.openai(cb, force)
+  local pcfg = (require("advantage.config").options.providers or {}).openai or {}
+  local requested_mode = pcfg.auth_mode or "auto"
   local auth_file = read_json(codex_auth_path())
   local tokens = auth_file and auth_file.tokens
-  if tokens and tokens.access_token and tokens.access_token ~= vim.NIL then
+  if requested_mode ~= "api_key" and tokens and tokens.access_token and tokens.access_token ~= vim.NIL then
     local account = codex_account_id(tokens)
     local claims = jwt_payload(tokens.access_token)
     local exp = claims and claims.exp or 0
@@ -204,7 +247,7 @@ function M.openai(cb, force)
           end
         end
         local key = require("advantage.config").api_key("openai")
-        if key then
+        if key and requested_mode ~= "chatgpt" then
           cb({ mode = "api_key", key = key, badge = "api" })
         else
           cb(nil, err or "Codex login is missing an account id. Run `codex login` again.")
@@ -218,8 +261,29 @@ function M.openai(cb, force)
     and auth_file.OPENAI_API_KEY ~= vim.NIL
     and auth_file.OPENAI_API_KEY
   ) or require("advantage.config").api_key("openai")
-  if key then return cb({ mode = "api_key", key = key, badge = "api" }) end
+  if key and requested_mode ~= "chatgpt" then return cb({ mode = "api_key", key = key, badge = "api" }) end
+  if requested_mode == "api_key" then
+    return cb(nil, "OpenAI auth_mode='api_key' but no API key was found in config or $OPENAI_API_KEY.")
+  elseif requested_mode == "chatgpt" then
+    return cb(nil, "OpenAI auth_mode='chatgpt' but no usable Codex login was found. Run `codex login` again.")
+  end
   cb(nil, "No Codex credentials. Log in with `codex login` (subscription) or export $OPENAI_API_KEY.")
+end
+
+---Best synchronous prediction of which OpenAI transport `openai()` will use.
+---Used only for model capability pickers and context-window budgeting; the real
+---credential resolver remains authoritative at request time.
+function M.openai_mode_hint()
+  local pcfg = (require("advantage.config").options.providers or {}).openai or {}
+  if pcfg.auth_mode == "api_key" then return "api_key" end
+  if pcfg.auth_mode == "chatgpt" then return "chatgpt" end
+  local file = read_json(codex_auth_path())
+  local tokens = file and file.tokens
+  if tokens and tokens.access_token and tokens.access_token ~= vim.NIL and codex_account_id(tokens) then
+    local claims = jwt_payload(tokens.access_token)
+    if (claims and (claims.exp or 0) > os.time() + 60) or tokens.refresh_token then return "chatgpt" end
+  end
+  return "api_key"
 end
 
 return M

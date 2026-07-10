@@ -14,6 +14,7 @@ return function(tool, s)
   tool({
     name = "sub_agent",
     safe = true,
+    feature = "subagents",
     description = "Spawn a read-only sub-agent for independent investigation. The sub-agent can read/search/list files and returns a concise report; it cannot edit files. Batch several sub_agent calls in a single response to run them concurrently — best for independent questions. Issue them one per turn only when a later investigation depends on an earlier result.",
     input_schema = {
       type = "object",
@@ -23,6 +24,10 @@ return function(tool, s)
         max_turns = {
           type = "integer",
           description = "Maximum sub-agent turns including tool loops (default from config, capped at 30). The final turn is always report-only, so give a package-wide investigation ample budget (e.g. 15-25).",
+        },
+        effort = {
+          type = "string",
+          description = "Scout reasoning effort (e.g. low/medium/high/xhigh, or inherit). Defaults to config.subagents.effort.",
         },
       },
       required = { "prompt" },

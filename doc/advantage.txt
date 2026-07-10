@@ -112,9 +112,27 @@ Full defaults live in `lua/advantage/config.lua`. Key options: >lua
 
     require("advantage").setup({
       default_model = "anthropic/claude-opus-4-8",
-      -- context_window scales compaction per model (adjust to your tier).
-      models = { { ref = "anthropic/claude-opus-4-8", label = "opus 4.8",
-                   context_window = 1000000 } },
+      -- OpenAI context_window is for login; api_context_window is raw API.
+      models = {
+        { ref = "anthropic/claude-opus-4-8", label = "opus 4.8",
+          context_window = 1000000, max_output_tokens = 128000,
+          thinking_mode = "adaptive",
+          effort_levels = { "low", "medium", "high", "xhigh", "max" } },
+        { ref = "openai/gpt-5.6-sol", label = "gpt-5.6 sol",
+          context_window = 372000, api_context_window = 1050000,
+          max_output_tokens = 128000,
+          reasoning_efforts = { "low", "medium", "high", "xhigh", "max", "ultra" },
+          api_reasoning_efforts = { "none", "low", "medium", "high", "xhigh", "max" } },
+      },
+      providers = {
+        anthropic = { max_tokens = 64000, interleaved_thinking = true },
+        openai = {
+          auth_mode = "auto",         -- "auto" | "chatgpt" | "api_key"
+          max_output_tokens = 64000, -- raw API request cap
+          reasoning_effort = "ultra", -- inherited, clamped per model/transport
+          reasoning_summary = "auto", -- "auto" | "concise" | "detailed" | false
+        },
+      },
       ui = { width = 0.42, input_height = 4, border = "rounded" },
       tools = {
         auto_approve = {},        -- e.g. { bash = true } (at your own risk)
@@ -124,26 +142,88 @@ Full defaults live in `lua/advantage/config.lua`. Key options: >lua
       },
       context = {
         auto_compact = true,
-        -- Auto-compact at min(compact_fraction × context_window, compact_at_tokens).
+        -- Also reserves output, system/tool schemas, and a safety margin.
         compact_fraction = 0.75,   -- % of the model window that triggers compaction
         compact_at_tokens = 200000, -- absolute cost ceiling on that trigger
+        request_safety_tokens = 8192,
         keep_recent_messages = 16, -- also bounded by keep_recent_fraction (tokens)
         keep_recent_fraction = 0.4, -- recent window kept, as a % of the threshold
         auto_compact_mode = "heuristic", -- silent auto-compact: "heuristic" | "llm"
         compact_mode = "llm",    -- manual /compact: "llm" | "heuristic"
-        summarizer_model = nil,    -- auto: Haiku for Claude, Luna for OpenAI/Codex
+        -- Auto: Haiku for Claude; active model for OpenAI/Codex. A pinned
+        -- model's 404 retries the active same-provider model before heuristic.
+        summarizer_model = nil,
         summarizer_models = {
           anthropic = "anthropic/claude-haiku-4-5",
-          openai = "openai/gpt-5.6-luna",
         },
+        summarizer_effort = "medium", -- balanced; "inherit" matches the live OpenAI level
       },
-      subagents = { enabled = true, max_turns = 12, parallel = true },
-      memory = { enabled = true, budget_tokens = 2000, skills_index_budget_tokens = 1200 },
+      subagents = {
+        enabled = true,
+        max_turns = 12,
+        max_per_turn = 12,       -- cumulative scouts in one parent turn
+        max_output_tokens = 16000, -- scout Anthropic/raw-API output ceiling
+        effort = "medium",        -- per call may override or use "inherit"
+        parallel = true,          -- supports fan-out; sequential calls remain valid
+        max_parallel = 4,         -- excess scouts queue
+        max_per_batch = 8,
+        max_result_bytes = 64000,
+      },
+      memory = { enabled = true, budget_tokens = 2000, skill_body_budget_tokens = 8000,
+                 skills_index_budget_tokens = 1200 },
       sessions = { autosave = true },
     })
 <
 Note: `models` and other list options are replaced wholesale when you supply
 them (not merged element-wise with the defaults).
+
+THINKING AND REASONING                              *advantage-effort-levels*
+
+`:Advantage effort [mode]` and `/effort [mode]` only offer values supported by
+the active model and OpenAI transport:
+
+- Modern Claude models use adaptive thinking plus `output_config.effort`
+  (`low` through `max`). Opus 4.8 is explicitly adaptive; Sonnet 5 is default-on
+  and uses an explicit disabled state for `off`; Fable 5 cannot be disabled.
+- Haiku 4.5 and older manual-thinking models use fixed budgets from 1k through
+  32k. Thinking and visible output share `providers.anthropic.max_tokens`.
+- OpenAI uses `reasoning.effort`. GPT-5.6 Sol/Terra login profiles support
+  `low` through `ultra`, Luna through `max`; raw API profiles use their separate
+  `api_reasoning_efforts`. `off` means explicit `none` and is only available
+  where supported. Omitting reasoning selects the provider default, so it is
+  not treated as off. The default provider effort is `ultra`; when inherited it
+  clamps downward to the deepest supported level (Luna `max`, GPT-5.5 `xhigh`,
+  raw-API Sol `max`). Explicit unsupported model overrides remain errors.
+
+OPENAI TRANSPORT                                    *advantage-openai-transport*
+
+`providers.openai.auth_mode = "auto"` prefers a usable Codex/ChatGPT login and
+falls back to an API key. Use `"chatgpt"` or `"api_key"` to require one path.
+The paths can expose different model catalogues and limits; built-in GPT-5.6
+models budget 372k context tokens for login and 1.05M for the raw API (GPT-5.5:
+272k login / 1.05M API). GPT-5.6/5.5 login requests reserve their native 128k
+output maximum for context safety; raw API requests send and reserve the
+configured 64k cap. OpenAI requests
+reuse a stable per-chat prompt-cache key and, on ChatGPT login, a stable session
+id across tool-loop turns.
+
+`providers.openai.reasoning_summary = "auto"` streams a provider-selected
+reasoning summary into the thinking UI. `"concise"` and `"detailed"` request a
+specific depth. Set it to false to omit summaries; scouts and compaction
+summarizers disable them automatically.
+
+SUB-AGENT EXECUTION                                  *advantage-subagents*
+
+Sub-agents are read-only scouts. The model may delegate one task and wait, or
+emit a same-turn batch. With `subagents.parallel = true`, batch members run
+concurrently; this advertises parallel support but never forces the model to use
+it. Set it false for sequential execution. Fan-out is bounded by
+`max_parallel`, `max_per_batch`, the cumulative `max_per_turn`, and the shared
+`max_result_bytes` result budget. `max_output_tokens` caps scout requests on
+Anthropic/raw-API transports. ChatGPT-login scouts retain the model's native
+output reserve and are bounded by the turn, delegation, result, and report caps.
+Scouts default to `subagents.effort` (`"medium"`); each call can override it or
+use `"inherit"` to retain the parent level.
 
 ==============================================================================
 7. TOOLS & SECURITY                                          *advantage-tools*

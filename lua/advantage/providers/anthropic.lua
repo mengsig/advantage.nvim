@@ -4,6 +4,7 @@
 local util = require("advantage.util")
 local config = require("advantage.config")
 local auth = require("advantage.auth")
+local effort = require("advantage.effort")
 
 local M = {}
 
@@ -36,7 +37,9 @@ local function sanitize_messages(messages)
         or block.type == "redacted_thinking"
         or block.type == "image"
       then
-        content[#content + 1] = block
+        local copy = vim.deepcopy(block)
+        copy.openai_item = nil
+        content[#content + 1] = copy
       end
     end
     if #content > 0 then
@@ -69,6 +72,13 @@ local function apply_message_cache(messages)
     if marks >= 2 then break end
     local content = messages[idx].content
     local ci = #content
+    -- Thinking/redacted_thinking blocks must be replayed byte-for-byte on the
+    -- latest assistant turn. Adding cache_control to one counts as modifying it
+    -- and the Messages API rejects the request, so mark the nearest ordinary
+    -- block instead (or continue to an older message when none exists).
+    while ci > 0 and (content[ci].type == "thinking" or content[ci].type == "redacted_thinking") do
+      ci = ci - 1
+    end
     if ci > 0 then
       content[ci] = vim.tbl_extend("force", {}, content[ci], { cache_control = CACHE_CONTROL })
       marks = marks + 1
@@ -81,9 +91,10 @@ M._apply_message_cache = apply_message_cache
 ---truncated/empty stream decodes to an empty object rather than crashing the turn.
 local function finalize_tool_use(current)
   assert(type(current) == "table", "finalize_tool_use: current block must be a table")
-  local ok, input = pcall(vim.json.decode, current._json ~= "" and current._json or "{}")
+  local raw = table.concat(current._json_parts or {})
+  local ok, input = pcall(vim.json.decode, raw ~= "" and raw or "{}")
   current.input = ok and input or vim.empty_dict()
-  current._json = nil
+  current._json_parts = nil
 end
 
 ---Begin a new content block from a `content_block_start` event.
@@ -91,15 +102,15 @@ local function start_block(st, on, cb)
   assert(type(st) == "table" and type(on) == "table", "start_block: state and callbacks required")
   cb = cb or {}
   if cb.type == "text" then
-    st.current = { type = "text", text = "" }
+    st.current = { type = "text", _text_parts = {} }
   elseif cb.type == "thinking" then
-    st.current = { type = "thinking", thinking = "", signature = "" }
+    st.current = { type = "thinking", _thinking_parts = {}, _signature_parts = {} }
   elseif cb.type == "redacted_thinking" then
     st.current = { type = "redacted_thinking", data = cb.data }
   elseif cb.type == "tool_use" then
-    st.current = { type = "tool_use", id = cb.id, name = cb.name, _json = "" }
+    st.current = { type = "tool_use", id = cb.id, name = cb.name, _json_parts = {} }
     on.tool_start(cb.id, cb.name)
-  else
+  elseif mode == "manual" then
     st.current = { type = cb.type }
   end
 end
@@ -111,15 +122,15 @@ local function apply_delta(st, on, delta)
   local current = st.current
   if not current then return end
   if delta.type == "text_delta" then
-    current.text = (current.text or "") .. delta.text
+    current._text_parts[#current._text_parts + 1] = delta.text or ""
     on.text(delta.text)
   elseif delta.type == "thinking_delta" then
-    current.thinking = (current.thinking or "") .. delta.thinking
+    current._thinking_parts[#current._thinking_parts + 1] = delta.thinking or ""
     if delta.thinking ~= "" then on.thinking(delta.thinking) end
   elseif delta.type == "signature_delta" then
-    current.signature = (current.signature or "") .. (delta.signature or "")
+    current._signature_parts[#current._signature_parts + 1] = delta.signature or ""
   elseif delta.type == "input_json_delta" then
-    current._json = (current._json or "") .. (delta.partial_json or "")
+    current._json_parts[#current._json_parts + 1] = delta.partial_json or ""
   end
 end
 
@@ -128,7 +139,16 @@ local function stop_block(st)
   assert(type(st) == "table" and type(st.blocks) == "table", "stop_block: state with blocks required")
   local current = st.current
   if not current then return end
-  if current.type == "tool_use" then finalize_tool_use(current) end
+  if current.type == "tool_use" then
+    finalize_tool_use(current)
+  elseif current.type == "text" then
+    current.text = table.concat(current._text_parts or {})
+    current._text_parts = nil
+  elseif current.type == "thinking" then
+    current.thinking = table.concat(current._thinking_parts or {})
+    current.signature = table.concat(current._signature_parts or {})
+    current._thinking_parts, current._signature_parts = nil, nil
+  end
   st.blocks[#st.blocks + 1] = current
   st.current = nil
 end
@@ -136,7 +156,7 @@ end
 ---Build the streaming event handler. Exposed for tests via M._make_handler.
 ---Per-event logic lives in the module-level helpers above so this dispatcher
 ---stays a short, flat switch over the Anthropic SSE event types.
-local function make_handler(on)
+local function make_handler(on, effective_effort)
   assert(type(on) == "table", "make_handler: on must be a table of callbacks")
   assert(
     type(on.complete) == "function" and type(on.error) == "function",
@@ -157,6 +177,7 @@ local function make_handler(on)
       local u = d.message and d.message.usage or {}
       st.usage.input = (u.input_tokens or 0) + (u.cache_read_input_tokens or 0) + (u.cache_creation_input_tokens or 0)
       st.usage.cached = u.cache_read_input_tokens or 0
+      st.usage.cache_write = u.cache_creation_input_tokens or 0
     elseif t == "content_block_start" then
       start_block(st, on, d.content_block or {})
     elseif t == "content_block_delta" then
@@ -166,10 +187,16 @@ local function make_handler(on)
     elseif t == "message_delta" then
       if d.delta and d.delta.stop_reason then st.stop_reason = d.delta.stop_reason end
       if d.usage and d.usage.output_tokens then st.usage.output = d.usage.output_tokens end
+      local details = d.usage and d.usage.output_tokens_details or {}
+      if details.thinking_tokens then st.usage.reasoning = details.thinking_tokens end
     elseif t == "message_stop" then
       if not st.completed then
         st.completed = true
-        on.usage(st.usage.input, st.usage.output, st.usage.cached)
+        on.usage(st.usage.input, st.usage.output, st.usage.cached, {
+          reasoning = st.usage.reasoning or 0,
+          cache_write = st.usage.cache_write or 0,
+          effort = effective_effort,
+        })
         on.complete(st.blocks, st.stop_reason or "end_turn", st.usage)
       end
     elseif t == "error" then
@@ -223,15 +250,36 @@ end
 ---Apply the model's thinking config to the request body in place, trimming the
 ---budget to guarantee headroom for the visible answer.
 local function apply_thinking(body, req)
-  if req.model.thinking == false then return end
-  if type(req.model.thinking) == "table" then
-    -- copy: the trim below may adjust budget_tokens, and req.model.thinking is
-    -- shared config that must not be mutated across turns.
-    body.thinking = vim.deepcopy(req.model.thinking)
-  elseif req.model.thinking_budget then
-    body.thinking = { type = "enabled", budget_tokens = req.model.thinking_budget }
-  else
-    body.thinking = { type = "adaptive", display = "summarized" }
+  local mode = effort.anthropic_mode(req.model)
+  local selected = req.model.thinking
+
+  if mode == "adaptive_always" then
+    -- Fable/Mythos 5 think adaptively without a thinking parameter and reject
+    -- attempts to disable it. output_config.effort below is their depth control.
+    if req.model.thinking_display then body.thinking = { type = "adaptive", display = req.model.thinking_display } end
+  elseif mode == "adaptive_default" then
+    -- Sonnet 5 thinks by default. Unlike older models, omission does NOT turn it
+    -- off; an explicit disabled object is required.
+    if selected == false then
+      body.thinking = { type = "disabled" }
+    elseif req.model.thinking_display then
+      body.thinking = { type = "adaptive", display = req.model.thinking_display }
+    end
+  elseif mode == "adaptive" then
+    -- Opus 4.6+ requires adaptive thinking and rejects legacy budget_tokens.
+    if selected ~= false then
+      body.thinking = { type = "adaptive", display = req.model.thinking_display or "summarized" }
+    end
+  elseif mode == "manual" then
+    -- Manual-thinking generations (Haiku 4.5 and older Claude 4) retain the
+    -- fixed-budget control. Copy before trimming so shared model config and saved
+    -- sessions are never mutated by request construction.
+    if type(selected) == "table" then
+      body.thinking = vim.deepcopy(selected)
+    elseif req.model.thinking_budget then
+      body.thinking = { type = "enabled", budget_tokens = req.model.thinking_budget }
+    end
+    if body.thinking and req.model.thinking_display then body.thinking.display = req.model.thinking_display end
   end
   -- Thinking tokens count against max_tokens. A fixed budget close to max_tokens
   -- (e.g. the 32k "ultrathink" preset under a 32k cap) would leave ~no room for
@@ -252,12 +300,15 @@ local function build_body(pcfg, req, system)
   apply_message_cache(messages)
   local body = {
     model = req.model.id,
-    max_tokens = pcfg.max_tokens,
+    max_tokens = config.effective_max_output_tokens(req.model, "anthropic") or pcfg.max_tokens,
     stream = true,
     system = system,
     messages = messages,
     tools = req.tools,
   }
+  local requested_effort = req.model.effort
+  if requested_effort == nil then requested_effort = pcfg.effort end
+  if requested_effort ~= nil then body.output_config = { effort = requested_effort } end
   -- Optional tool-use control (the sub-agent sets "none" on its report-only turn
   -- to force a text reply). Anthropic expects an object; "none" is compatible with
   -- interleaved thinking, unlike "any"/"tool".
@@ -281,7 +332,10 @@ function M.stream(req)
 
       local headers, system = build_headers(pcfg, req, cred)
       local body = build_body(pcfg, req, system)
-      local on_event, is_completed = make_handler(req.on)
+      local selected_effort = req.model.effort
+      if selected_effort == nil then selected_effort = pcfg.effort end
+      if selected_effort == nil and effort.anthropic_mode(req.model) ~= "manual" then selected_effort = "high" end
+      local on_event, is_completed = make_handler(req.on, selected_effort)
 
       inner = util.request_sse({
         url = pcfg.base_url .. "/v1/messages",

@@ -4,23 +4,95 @@ M.defaults = {
   ---Default model, as `provider/model-id`.
   default_model = "anthropic/claude-opus-4-8",
 
-  ---Models offered in the picker. `thinking = false` disables reasoning display
-  ---for models that don't support adaptive thinking. `context_window` is the
+  ---Models offered in the picker. `thinking = false` disables thinking on
+  ---generations that support doing so. `context_window` is the
   ---model's total token budget; it scales auto-compaction (see `context`). Values
   ---marked "confirmed" are from the provider docs; the rest are a conservative
   ---floor (erring low is safe — too high risks compacting at ~100% of the real
   ---window). Adjust any to match your account/tier.
   models = {
-    { ref = "anthropic/claude-opus-4-8", label = "opus 4.8", context_window = 1000000 }, -- confirmed 1M
-    { ref = "anthropic/claude-sonnet-5", label = "sonnet 5", context_window = 1000000 }, -- confirmed 1M
-    { ref = "anthropic/claude-fable-5", label = "fable 5", context_window = 200000 }, -- unconfirmed, floor
-    { ref = "anthropic/claude-haiku-4-5", label = "haiku 4.5", thinking = false, context_window = 200000 }, -- confirmed 200k
-    { ref = "openai/gpt-5.6-sol", label = "gpt-5.6 sol", context_window = 1050000 }, -- confirmed 1.05M
-    { ref = "openai/gpt-5.6-terra", label = "gpt-5.6 terra", context_window = 1050000 }, -- confirmed 1.05M
-    { ref = "openai/gpt-5.6-luna", label = "gpt-5.6 luna", context_window = 1050000 }, -- confirmed 1.05M
-    { ref = "openai/gpt-5.5", label = "gpt-5.5", context_window = 1000000 }, -- confirmed 1M (raw API)
-    { ref = "openai/gpt-5.1-codex", label = "codex 5.1", context_window = 400000 }, -- Codex tier, adjust
-    { ref = "openai/gpt-5.1-codex-mini", label = "codex mini", context_window = 400000 }, -- Codex tier, adjust
+    {
+      ref = "anthropic/claude-opus-4-8",
+      label = "opus 4.8",
+      context_window = 1000000,
+      max_output_tokens = 128000,
+      thinking_mode = "adaptive",
+      effort_levels = { "low", "medium", "high", "xhigh", "max" },
+    }, -- confirmed 1M; manual thinking budgets are rejected
+    {
+      ref = "anthropic/claude-sonnet-5",
+      label = "sonnet 5",
+      context_window = 1000000,
+      max_output_tokens = 128000,
+      thinking_mode = "adaptive_default",
+      effort_levels = { "low", "medium", "high", "xhigh", "max" },
+    }, -- confirmed 1M; adaptive thinking is on by default
+    {
+      ref = "anthropic/claude-fable-5",
+      label = "fable 5",
+      context_window = 1000000,
+      max_output_tokens = 128000,
+      thinking_mode = "adaptive_always",
+      effort_levels = { "low", "medium", "high", "xhigh", "max" },
+    }, -- confirmed 1M; thinking cannot be disabled
+    {
+      ref = "anthropic/claude-haiku-4-5",
+      label = "haiku 4.5",
+      thinking = false,
+      thinking_mode = "manual",
+      context_window = 200000,
+      max_output_tokens = 64000,
+    }, -- confirmed 200k; legacy fixed-budget thinking
+    {
+      ref = "openai/gpt-5.6-sol",
+      label = "gpt-5.6 sol",
+      context_window = 372000,
+      api_context_window = 1050000,
+      max_output_tokens = 128000,
+      reasoning_efforts = { "low", "medium", "high", "xhigh", "max", "ultra" },
+      api_reasoning_efforts = { "none", "low", "medium", "high", "xhigh", "max" },
+    }, -- Codex subscription window; raw API has 1.05M
+    {
+      ref = "openai/gpt-5.6-terra",
+      label = "gpt-5.6 terra",
+      context_window = 372000,
+      api_context_window = 1050000,
+      max_output_tokens = 128000,
+      reasoning_efforts = { "low", "medium", "high", "xhigh", "max", "ultra" },
+      api_reasoning_efforts = { "none", "low", "medium", "high", "xhigh", "max" },
+    }, -- Codex subscription window; raw API has 1.05M
+    {
+      ref = "openai/gpt-5.6-luna",
+      label = "gpt-5.6 luna",
+      context_window = 372000,
+      api_context_window = 1050000,
+      max_output_tokens = 128000,
+      reasoning_efforts = { "low", "medium", "high", "xhigh", "max" },
+      api_reasoning_efforts = { "none", "low", "medium", "high", "xhigh", "max" },
+    }, -- Codex subscription window; raw API has 1.05M
+    {
+      ref = "openai/gpt-5.5",
+      label = "gpt-5.5",
+      context_window = 272000,
+      api_context_window = 1050000,
+      max_output_tokens = 128000,
+      reasoning_efforts = { "low", "medium", "high", "xhigh" },
+      api_reasoning_efforts = { "none", "low", "medium", "high", "xhigh" },
+    }, -- Codex subscription window; raw API has 1.05M
+    {
+      ref = "openai/gpt-5.1-codex",
+      label = "codex 5.1",
+      context_window = 400000,
+      max_output_tokens = 64000,
+      reasoning_efforts = { "low", "medium", "high", "xhigh" },
+    },
+    {
+      ref = "openai/gpt-5.1-codex-mini",
+      label = "codex mini",
+      context_window = 400000,
+      max_output_tokens = 64000,
+      reasoning_efforts = { "low", "medium", "high", "xhigh" },
+    },
   },
 
   providers = {
@@ -28,7 +100,9 @@ M.defaults = {
       api_key_env = "ANTHROPIC_API_KEY",
       base_url = "https://api.anthropic.com",
       version = "2023-06-01",
-      max_tokens = 32000,
+      -- Thinking and visible text share this ceiling. Current adaptive models at
+      -- xhigh/max are documented to need at least 64k for agentic tool loops.
+      max_tokens = 64000,
       ---Send the interleaved-thinking beta (like the real CLI) so thinking
       ---persists across tool calls within a turn. Disable if your account
       ---rejects the beta.
@@ -37,8 +111,22 @@ M.defaults = {
     openai = {
       api_key_env = "OPENAI_API_KEY",
       base_url = "https://api.openai.com",
-      max_output_tokens = 32000,
-      reasoning_effort = "medium",
+      ---auto prefers a Codex/ChatGPT login; pin api_key or chatgpt when both
+      ---credentials exist and you need that transport's models/capabilities.
+      auth_mode = "auto", -- "auto" | "chatgpt" | "api_key"
+      -- Raw API requests are capped here. ChatGPT-login requests do not expose
+      -- this request knob, so context budgeting reserves the model's native
+      -- `max_output_tokens` instead (128k on GPT-5.6/5.5).
+      max_output_tokens = 64000,
+      -- Strong global default. The provider clamps an inherited ultra downward
+      -- to the deepest level supported by the selected model/transport (for
+      -- example Luna→max, GPT-5.5→xhigh, or raw-API Sol→max). An explicit
+      -- per-model override remains strict and errors when unsupported.
+      reasoning_effort = "ultra",
+      ---Stream a short reasoning summary into the UI. Set false to reduce
+      ---latency; scouts and summarizers disable it automatically because they
+      ---discard thinking output.
+      reasoning_summary = "auto", -- "auto" | "concise" | "detailed" | false
     },
   },
 
@@ -146,10 +234,15 @@ M.defaults = {
     ---Absolute ceiling (tokens) on that trigger — a COST cap. Even on a 1M-context
     ---model you rarely want to carry 0.75 × 1M ≈ 750k tokens every turn: it's
     ---expensive and overflows the cheap summarizer. Effective threshold =
-    ---min(compact_fraction × context_window, compact_at_tokens). Lower it for
+    ---the minimum of this cap, the window fraction, and the remaining request
+    ---envelope after output/system/tools/safety reservations. Lower it for
     ---cheaper turns; raise it to exploit a big window. (Token estimate is chars/4;
     ---falls back to this value alone when a model declares no context_window.)
     compact_at_tokens = 200000,
+    ---Extra room for provider framing and estimation error. The automatic
+    ---trigger also subtracts the actual system/tool-schema estimate and the
+    ---active model's requested output allowance from the context window.
+    request_safety_tokens = 8192,
     ---Keep the newest messages verbatim; older messages become a summary. Bounded
     ---by BOTH this count and a token budget (`keep_recent_fraction`), whichever is
     ---tighter, so a few huge tool outputs can't retain more than the threshold.
@@ -171,19 +264,21 @@ M.defaults = {
     ---Override per-invocation with `/compact llm` or `/compact heuristic`.
     compact_mode = "llm",
     ---Model that performs the LLM summarization call, as "provider/model-id".
-    ---Kept separate from the active chat model so compaction stays cheap and
-    ---fast even mid-session on an expensive model.
-    ---`nil` (default) = auto: a cheap model in the ACTIVE model's provider family
-    ---(`context.summarizer_models`), so a Codex/OpenAI-only user never triggers a
-    ---Claude request they have no credentials for (and vice-versa). Set a
-    ---"provider/model-id" string to pin one model regardless of the active provider.
+    ---May be kept separate from the active chat model when compaction latency or
+    ---cost matters. `nil` (default) checks the ACTIVE provider's
+    ---`context.summarizer_models` entry, then uses the active model itself. Thus a
+    ---Codex/OpenAI-only user never triggers a Claude request they lack credentials
+    ---for (and vice-versa). Set a ref to pin one model regardless of provider.
     summarizer_model = nil,
-    ---Per-provider cheap summarizer used when `summarizer_model` is nil. Falls back
-    ---to the active chat model itself if the provider isn't listed here.
+    ---Per-provider summarizer used when `summarizer_model` is nil. Falls back to
+    ---the active chat model itself if the provider isn't listed here.
     summarizer_models = {
       anthropic = "anthropic/claude-haiku-4-5",
-      openai = "openai/gpt-5.6-luna",
     },
+    ---OpenAI reasoning effort for the isolated summary request. Medium is a
+    ---deliberate compression-quality/latency default; set `"inherit"` when a
+    ---summary must match the live agent's effort exactly.
+    summarizer_effort = "medium",
   },
 
   subagents = {
@@ -200,17 +295,26 @@ M.defaults = {
     ---investigating a whole subsystem always returns a real report instead of an
     ---empty "hit the turn limit" error; budget for the investigation accordingly.
     max_turns = 12,
+    ---Cumulative number of scouts the parent may launch for one user turn,
+    ---across multiple model responses. Prevents repeated batches from bypassing
+    ---the per-response cap below.
+    max_per_turn = 12,
+    ---Visible output ceiling for scout requests on transports that accept one
+    ---(Anthropic and raw OpenAI API). ChatGPT login has no confirmed hard-cap
+    ---field, so it retains the native reserve and is bounded by the scout's turn,
+    ---delegation, result, and report limits instead.
+    max_output_tokens = 16000,
+    ---Scouts are scoped evidence-gatherers, so medium is a better quality/latency
+    ---point than blindly inheriting a parent's xhigh/max. Set "inherit" to keep
+    ---the parent level, or override per sub_agent call.
+    effort = "medium",
     ---Run a fan-out batch of `sub_agent` calls concurrently (overlapping their
     ---network latency) instead of one-at-a-time. Only pure read-only sub_agent
     ---batches are parallelised; mutating/permissioned tools always run in order.
     parallel = true,
-    ---Give sub-agents a read-only `bash` tool (inspection commands + git
-    ---read-only subcommands only; redirection and mutating flags are rejected).
-    ---Off by default: bash is not path-contained, so a sub-agent could read
-    ---anything your user can, with no permission prompt. Enable only in repos you
-    ---trust. `true` uses the built-in allow-list; pass `{ allow = { "cmd", ... } }`
-    ---to extend it.
-    bash = false,
+    max_parallel = 4, -- concurrent provider streams; excess scouts queue
+    max_per_batch = 8, -- extra same-response scouts get a synthetic error result
+    max_result_bytes = 64000, -- aggregate parent-context budget for a fan-out
   },
 
   ---Per-repo self-learning harness: the agent records durable facts about a repo
@@ -226,6 +330,8 @@ M.defaults = {
     ---(one index line until loaded), so raising this is rarely the right lever —
     ---curate depth into skills instead (`/context curate`).
     budget_tokens = 2000,
+    ---Maximum on-demand skill body injected into a turn (tokens; hard-capped).
+    skill_body_budget_tokens = 8000,
     ---Token cap on the always-loaded SKILLS INDEX (one line per skill). Skills past
     ---the cap stay fully available — loadable by name with `use_skill` and still
     ---keyword-hinted — but drop off the always-visible list, so a large skill
@@ -299,6 +405,30 @@ local function validate(o)
       if type(m) ~= "table" or type(m.ref) ~= "string" or not m.ref:match("^[^/]+/.+$") then
         errs[#errs + 1] = ("models[%d].ref must be a 'provider/model-id' string"):format(i)
       end
+      if type(m) == "table" then
+        for _, field in ipairs({ "reasoning_efforts", "api_reasoning_efforts", "effort_levels" }) do
+          if m[field] ~= nil and type(m[field]) ~= "table" then
+            errs[#errs + 1] = ("models[%d].%s must be a list"):format(i, field)
+          elseif type(m[field]) == "table" then
+            for j, value in ipairs(m[field]) do
+              if type(value) ~= "string" then
+                errs[#errs + 1] = ("models[%d].%s[%d] must be a string"):format(i, field, j)
+              end
+            end
+          end
+        end
+        for _, field in ipairs({ "context_window", "api_context_window", "max_output_tokens" }) do
+          if m[field] ~= nil and (type(m[field]) ~= "number" or m[field] <= 0) then
+            errs[#errs + 1] = ("models[%d].%s must be positive"):format(i, field)
+          end
+        end
+        if
+          m.thinking_mode ~= nil
+          and not vim.tbl_contains({ "adaptive", "adaptive_default", "adaptive_always", "manual" }, m.thinking_mode)
+        then
+          errs[#errs + 1] = ("models[%d].thinking_mode is not recognized"):format(i)
+        end
+      end
     end
   end
   if
@@ -308,7 +438,46 @@ local function validate(o)
   then
     errs[#errs + 1] = "ui.width must be a number in (0, 1] (fraction of columns)"
   end
-  if type(o.providers) ~= "table" then errs[#errs + 1] = "providers must be a table" end
+  if type(o.providers) ~= "table" then
+    errs[#errs + 1] = "providers must be a table"
+  else
+    for _, name in ipairs({ "anthropic", "openai" }) do
+      if o.providers[name] ~= nil and type(o.providers[name]) ~= "table" then
+        errs[#errs + 1] = "providers." .. name .. " must be a table"
+      end
+    end
+  end
+  if type(o.providers) == "table" and type(o.providers.openai) == "table" then
+    local p = o.providers.openai
+    if p.auth_mode ~= nil and not vim.tbl_contains({ "auto", "chatgpt", "api_key" }, p.auth_mode) then
+      errs[#errs + 1] = "providers.openai.auth_mode must be 'auto', 'chatgpt', or 'api_key'"
+    end
+    if
+      p.reasoning_summary ~= nil
+      and p.reasoning_summary ~= false
+      and not vim.tbl_contains({ "auto", "concise", "detailed" }, p.reasoning_summary)
+    then
+      errs[#errs + 1] = "providers.openai.reasoning_summary must be 'auto', 'concise', 'detailed', or false"
+    end
+    if
+      p.reasoning_effort ~= nil
+      and not vim.tbl_contains(
+        { "none", "minimal", "low", "medium", "high", "xhigh", "max", "ultra" },
+        p.reasoning_effort
+      )
+    then
+      errs[#errs + 1] = "providers.openai.reasoning_effort is not a recognized effort"
+    end
+    if p.max_output_tokens ~= nil and (type(p.max_output_tokens) ~= "number" or p.max_output_tokens <= 0) then
+      errs[#errs + 1] = "providers.openai.max_output_tokens must be positive"
+    end
+  end
+  if type(o.providers) == "table" and type(o.providers.anthropic) == "table" then
+    local p = o.providers.anthropic
+    if p.max_tokens ~= nil and (type(p.max_tokens) ~= "number" or p.max_tokens <= 0) then
+      errs[#errs + 1] = "providers.anthropic.max_tokens must be positive"
+    end
+  end
   for _, key in ipairs({ "tools", "context", "ui", "memory", "subagents", "sessions" }) do
     if o[key] ~= nil and type(o[key]) ~= "table" then errs[#errs + 1] = key .. " must be a table" end
   end
@@ -325,9 +494,65 @@ local function validate(o)
         errs[#errs + 1] = "context." .. field .. " must be a number in (0, 1]"
       end
     end
+    if
+      o.context.request_safety_tokens ~= nil
+      and (type(o.context.request_safety_tokens) ~= "number" or o.context.request_safety_tokens < 0)
+    then
+      errs[#errs + 1] = "context.request_safety_tokens must be a non-negative number"
+    end
+    if
+      o.context.summarizer_effort ~= nil
+      and not vim.tbl_contains(
+        { "inherit", "none", "minimal", "low", "medium", "high", "xhigh", "max", "ultra" },
+        o.context.summarizer_effort
+      )
+    then
+      errs[#errs + 1] = "context.summarizer_effort is not a recognized OpenAI effort (or 'inherit')"
+    end
+    if
+      o.context.summarizer_model ~= nil
+      and (type(o.context.summarizer_model) ~= "string" or not o.context.summarizer_model:match("^[^/]+/.+$"))
+    then
+      errs[#errs + 1] = "context.summarizer_model must be a 'provider/model-id' string or nil"
+    end
+    if o.context.summarizer_models ~= nil and type(o.context.summarizer_models) ~= "table" then
+      errs[#errs + 1] = "context.summarizer_models must be a provider-to-model table"
+    elseif type(o.context.summarizer_models) == "table" then
+      for provider, ref in pairs(o.context.summarizer_models) do
+        if type(provider) ~= "string" or type(ref) ~= "string" or not ref:match("^[^/]+/.+$") then
+          errs[#errs + 1] = "context.summarizer_models entries must be 'provider/model-id' strings"
+          break
+        end
+      end
+    end
   end
   if o.max_agent_turns ~= nil and (type(o.max_agent_turns) ~= "number" or o.max_agent_turns < 0) then
     errs[#errs + 1] = "max_agent_turns must be a non-negative number"
+  end
+  if type(o.subagents) == "table" then
+    local s = o.subagents
+    if s.effort ~= nil and type(s.effort) ~= "string" then errs[#errs + 1] = "subagents.effort must be a string" end
+    if s.model ~= nil and (type(s.model) ~= "string" or not s.model:match("^[^/]+/.+$")) then
+      errs[#errs + 1] = "subagents.model must be a 'provider/model-id' string or nil"
+    end
+    for _, field in ipairs({ "enabled", "parallel" }) do
+      if s[field] ~= nil and type(s[field]) ~= "boolean" then
+        errs[#errs + 1] = "subagents." .. field .. " must be boolean"
+      end
+    end
+    for _, field in ipairs({
+      "max_turns",
+      "max_per_turn",
+      "max_output_tokens",
+      "max_parallel",
+      "max_per_batch",
+      "max_result_bytes",
+    }) do
+      local value = s[field]
+      if value ~= nil and (type(value) ~= "number" or value < 1 or value ~= math.floor(value)) then
+        errs[#errs + 1] = "subagents." .. field .. " must be a positive integer"
+      end
+    end
   end
   if type(o.tools) == "table" and type(o.tools.diagnostics) == "table" then
     local sev = o.tools.diagnostics.severity
@@ -352,6 +577,17 @@ function M.setup(opts)
       M.options[key] = vim.deepcopy(M.defaults[key] --[[@as table]])
     end
   end
+  -- Recover malformed nested provider overrides too. A setup such as
+  -- `providers = { openai = false }` should produce a useful validation error,
+  -- not leave later request code indexing a boolean.
+  for _, name in ipairs({ "anthropic", "openai" }) do
+    if type(M.options.providers[name]) ~= "table" then
+      M.options.providers[name] = vim.deepcopy(M.defaults.providers[name])
+    end
+  end
+  if type(M.options.context.summarizer_models) ~= "table" then
+    M.options.context.summarizer_models = vim.deepcopy(M.defaults.context.summarizer_models)
+  end
   -- accept the long-form alias for the paranoid-averse
   if M.options.tools.dangerously_skip_permissions then M.options.tools.yolo = true end
   if #errs > 0 then
@@ -362,7 +598,7 @@ function M.setup(opts)
   M._setup_done = true
 end
 
----Resolve a `provider/model` ref into {provider=, id=, label=, thinking=}.
+---Resolve a `provider/model` ref into a live model with capability metadata.
 function M.resolve_model(ref)
   for _, m in ipairs(M.options.models) do
     if m.ref == ref then
@@ -372,15 +608,68 @@ function M.resolve_model(ref)
         id = id,
         label = m.label or id,
         thinking = m.thinking,
+        default_thinking = vim.deepcopy(m.thinking),
         thinking_budget = m.thinking_budget,
+        thinking_mode = m.thinking_mode,
+        effort = m.effort,
+        effort_levels = vim.deepcopy(m.effort_levels),
         reasoning_effort = m.reasoning_effort,
+        reasoning_efforts = vim.deepcopy(m.reasoning_efforts),
         context_window = m.context_window,
+        api_context_window = m.api_context_window,
+        max_output_tokens = m.max_output_tokens,
+        api_reasoning_efforts = vim.deepcopy(m.api_reasoning_efforts),
       }
     end
   end
   local provider, id = ref:match("^([^/]+)/(.+)$")
   if provider then return { provider = provider, id = id, label = id } end
   return nil
+end
+
+---Context window for the transport that OpenAI is expected to use. Subscription
+---and raw API catalogs can expose materially different windows for the same ID.
+function M.effective_context_window(model)
+  if model and model.provider == "openai" and model.api_context_window then
+    local ok, mode = pcall(function()
+      return require("advantage.auth").openai_mode_hint()
+    end)
+    if ok and mode == "api_key" then return model.api_context_window end
+  end
+  return model and model.context_window or nil
+end
+
+---Output allowance for the selected transport. Raw OpenAI API calls send the
+---configured request cap, tightened by the model maximum. The ChatGPT/Codex
+---backend has no equivalent request field, so budgeting must reserve the native
+---model maximum instead or a 128k completion can overflow a context calculation
+---that only held 64k aside.
+---@param model table|nil
+---@param provider_name? string
+---@param transport? "chatgpt"|"api_key"
+function M.effective_max_output_tokens(model, provider_name, transport)
+  provider_name = provider_name or (model and model.provider)
+  local pcfg = provider_name and M.options.providers[provider_name] or nil
+  local configured = pcfg and (provider_name == "anthropic" and pcfg.max_tokens or pcfg.max_output_tokens) or nil
+  local model_cap = model and model.max_output_tokens or nil
+  if provider_name == "openai" then
+    if transport == nil then
+      local ok, mode = pcall(function()
+        return require("advantage.auth").openai_mode_hint()
+      end)
+      transport = ok and mode or "chatgpt"
+    end
+    if transport == "chatgpt" then return model_cap or configured end
+  end
+  if type(configured) == "number" and type(model_cap) == "number" then return math.min(configured, model_cap) end
+  return configured or model_cap
+end
+
+---Context-envelope reserve for a forthcoming request. Kept as a named helper
+---because a transport's native completion allowance is not always the same as
+---the hard cap placed on raw API requests.
+function M.request_output_reserve_tokens(model, transport)
+  return M.effective_max_output_tokens(model, model and model.provider, transport)
 end
 
 function M.api_key(provider_name)

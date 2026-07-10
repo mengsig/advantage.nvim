@@ -148,46 +148,50 @@ function M.build(agent)
   local tools = require("advantage.tools")
   local compact = require("advantage.compact")
   local config = require("advantage.config")
+  local cwd = (agent and agent.ctx and agent.ctx.cwd) or (vim.uv or vim.loop).cwd()
 
-  local model = resolve_model(agent, config)
+  return memory.with_root(cwd, function()
+    local model = resolve_model(agent, config)
 
-  -- The memory block that will actually be sent: the agent's session-frozen
-  -- block, or a fresh render when there is no session. Passing it through the
-  -- real system_prompt builder means the bytes shown are byte-for-byte the bytes
-  -- sent — including the frozen-vs-disk state.
-  local frozen = agent and agent:_memory_prompt_block() or nil
-  local sys_parts = agentmod.system_prompt_parts(frozen)
-  local raw_system = agentmod.system_prompt(frozen)
-  assert(type(raw_system) == "string", "context_preview: system_prompt must return a string")
+    -- The memory block that will actually be sent: the agent's session-frozen
+    -- block, or a fresh render when there is no session. Passing it through the
+    -- real system_prompt builder means the bytes shown are byte-for-byte the bytes
+    -- sent — including the frozen-vs-disk state.
+    local frozen = agent and agent:_memory_prompt_block() or nil
+    local frozen_base = agent and agent._base_system_prompt or nil
+    local sys_parts = agentmod.system_prompt_parts(frozen, cwd, frozen_base)
+    local raw_system = agentmod.system_prompt(frozen, cwd, frozen_base)
+    assert(type(raw_system) == "string", "context_preview: system_prompt must return a string")
 
-  local lines = {}
-  local function add(l)
-    lines[#lines + 1] = l
-  end
+    local lines = {}
+    local function add(l)
+      lines[#lines + 1] = l
+    end
 
-  add("# Context preview")
-  add("")
-  add("The exact packet advantage sends the model each turn. The system prompt and")
-  add("tool schemas are the cached prefix; the transcript grows and only its newest")
-  add("turn is billed at full price.")
-  add("")
-  add(("Model: %s  ·  %s"):format(model.ref, model.label))
-  add("")
+    add("# Context preview")
+    add("")
+    add("The exact packet advantage sends the model each turn. The system prompt and")
+    add("tool schemas are the cached prefix; the transcript grows and only its newest")
+    add("turn is billed at full price.")
+    add("")
+    add(("Model: %s  ·  %s"):format(model.ref, model.label))
+    add("")
 
-  local system_total = render_system_section(add, agent, memory, frozen, sys_parts)
-  local tools_tok = render_tools_section(add, tools)
-  local trans_tok = render_transcript_section(add, agent, compact)
-  render_totals_section(add, system_total, tools_tok, trans_tok, model.provider)
+    local system_total = render_system_section(add, agent, memory, frozen, sys_parts)
+    local tools_tok = render_tools_section(add, tools)
+    local trans_tok = render_transcript_section(add, agent, compact)
+    render_totals_section(add, system_total, tools_tok, trans_tok, model.provider)
 
-  -- ── The exact bytes ─────────────────────────────────────────────────────────
-  add(string.rep("─", 48))
-  add("Exact system prompt bytes (scroll ↓):")
-  add("")
-  for _, l in ipairs(vim.split(raw_system, "\n", { plain = true })) do
-    add(l)
-  end
+    -- ── The exact bytes ─────────────────────────────────────────────────────────
+    add(string.rep("─", 48))
+    add("Exact system prompt bytes (scroll ↓):")
+    add("")
+    for _, l in ipairs(vim.split(raw_system, "\n", { plain = true })) do
+      add(l)
+    end
 
-  return lines, raw_system
+    return lines, raw_system
+  end)
 end
 
 return M

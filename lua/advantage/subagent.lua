@@ -10,165 +10,6 @@ local providers = require("advantage.providers")
 local tools = require("advantage.tools")
 local config = require("advantage.config")
 
--- Read-only bash for sub-agents -------------------------------------------
--- Sub-agents run autonomously with no permission prompt, so their optional
--- bash is restricted to a vetted allow-list of inspection commands. This is
--- best-effort (shell is not fully parseable): redirection and command
--- substitution are rejected outright, and each pipeline segment's leading
--- command must be allow-listed. It is NOT path-contained — like any bash it
--- can read outside the root — which is why it is opt-in and off by default.
-local READONLY_CMDS = {
-  ls = true,
-  cat = true,
-  head = true,
-  tail = true,
-  wc = true,
-  nl = true,
-  tac = true,
-  rg = true,
-  grep = true,
-  egrep = true,
-  fgrep = true,
-  find = true,
-  fd = true,
-  tree = true,
-  stat = true,
-  file = true,
-  du = true,
-  df = true,
-  pwd = true,
-  echo = true,
-  printf = true,
-  dirname = true,
-  basename = true,
-  realpath = true,
-  readlink = true,
-  sort = true,
-  uniq = true,
-  cut = true,
-  tr = true,
-  comm = true,
-  column = true,
-  diff = true,
-  date = true,
-  env = true,
-  printenv = true,
-  which = true,
-  type = true,
-  whoami = true,
-  hostname = true,
-  uname = true,
-  jq = true,
-  yq = true,
-  sed = true,
-  awk = true,
-  git = true,
-  xxd = true,
-  od = true,
-  cksum = true,
-  sha256sum = true,
-  md5sum = true,
-  ["true"] = true,
-  ["false"] = true,
-  test = true,
-}
-local GIT_READONLY = {
-  status = true,
-  log = true,
-  diff = true,
-  show = true,
-  branch = true,
-  tag = true,
-  ["rev-parse"] = true,
-  ["ls-files"] = true,
-  ["ls-tree"] = true,
-  blame = true,
-  describe = true,
-  remote = true,
-  shortlog = true,
-  ["cat-file"] = true,
-  grep = true,
-  whatchanged = true,
-  reflog = true,
-  ["rev-list"] = true,
-  ["name-rev"] = true,
-  ["symbolic-ref"] = true,
-  ["for-each-ref"] = true,
-  ["count-objects"] = true,
-  config = true,
-  show_ref = true,
-}
-
-local function bash_allowlist()
-  local cfg = (config.options.subagents or {}).bash
-  if type(cfg) == "table" and type(cfg.allow) == "table" then
-    local allow = vim.deepcopy(READONLY_CMDS)
-    for _, c in ipairs(cfg.allow) do
-      allow[c] = true
-    end
-    return allow
-  end
-  return READONLY_CMDS
-end
-
----Return an error string if `cmd` is not a safe read-only command, else nil.
-local function reject_bash(cmd, allow)
-  cmd = vim.trim(cmd or "")
-  if cmd == "" then return "empty command" end
-  if cmd:find("[>`]") or cmd:find("%$%(") then
-    return "read-only bash cannot use output redirection or command substitution"
-  end
-  for seg in (cmd .. "\n"):gmatch("([^|&;\n]+)") do
-    seg = vim.trim(seg):gsub("^%s*([%w_]+=%S*%s+)+", "") -- strip leading VAR=val
-    if seg ~= "" then
-      local first = (seg:match("^%S+") or ""):gsub(".*/", "") -- basename
-      if not allow[first] then return ("command '%s' is not in the read-only allow-list"):format(first) end
-      if first == "git" then
-        local subc = seg:match("^git%s+(%S+)")
-        if not (subc and GIT_READONLY[subc]) then
-          return ("git subcommand '%s' is not read-only"):format(tostring(subc))
-        end
-      elseif first == "find" and (seg:find("%-delete") or seg:find("%-exec")) then
-        return "find -delete / -exec is not allowed"
-      elseif first == "sed" then
-        for tok in seg:gmatch("%S+") do
-          if tok:match("^%-i") or tok:match("^%-%-in%-place") then return "sed -i (in-place edit) is not allowed" end
-        end
-      end
-    end
-  end
-end
-
-local sub_bash = {
-  name = "bash",
-  description = "Run a READ-ONLY bash command (inspection only: ls, cat, grep, rg, find, git status/log/diff, wc, etc.). Redirection and mutating commands are rejected.",
-  input_schema = {
-    type = "object",
-    properties = {
-      command = { type = "string", description = "The read-only command to run" },
-      timeout_ms = { type = "integer", description = "Timeout in ms (default 60000)" },
-    },
-    required = { "command" },
-  },
-  run = function(input, ctx, cb)
-    local why = reject_bash(input.command, bash_allowlist())
-    if why then return cb("Rejected: " .. why, true) end
-    local timeout = tonumber(input.timeout_ms) or 60000
-    vim.system(
-      { "bash", "-c", input.command },
-      { cwd = ctx.cwd, text = true, timeout = timeout },
-      vim.schedule_wrap(function(res)
-        local out = (res.stdout or "") .. (res.stderr or "")
-        if res.code == 124 or res.signal ~= 0 then out = out .. "\n(timed out)" end
-        if vim.trim(out) == "" then out = "(no output)" end
-        if #out > 30000 then out = require("advantage.util").utf8_safe_sub(out, 30000) .. "\n… (truncated)" end
-        cb(out, res.code ~= 0 and res.signal == 0 and false or (res.code ~= 0))
-      end)
-    )
-  end,
-}
-M._reject_bash = reject_bash
-
 local function readonly_tools()
   local out = {}
   for _, def in ipairs(tools.list) do
@@ -179,9 +20,6 @@ local function readonly_tools()
         input_schema = def.input_schema,
       }
     end
-  end
-  if (config.options.subagents or {}).bash then
-    out[#out + 1] = { name = sub_bash.name, description = sub_bash.description, input_schema = sub_bash.input_schema }
   end
   return out
 end
@@ -202,9 +40,9 @@ end
 ---token leak the sub-agent design is meant to avoid. The parent already digested
 ---memory and wrote a specific task prompt; that carries the context the scout needs.
 ---@param max_turns integer the sub-agent's total turn budget (constant for the run)
-local function system_prompt(max_turns)
+local function system_prompt(max_turns, cwd)
   local agent = require("advantage.agent")
-  local lines = { agent.base_system_prompt() }
+  local lines = { agent.base_system_prompt(cwd) }
   -- The scout gets the same semantic-navigation steer as the parent (it has the
   -- LSP tools too), when they're live — a scout answering "where is X defined /
   -- who calls it" should use goto_definition/find_references, not grep.
@@ -229,24 +67,8 @@ local function system_prompt(max_turns)
   return table.concat(lines, "\n")
 end
 
-local function run_tool_call(call, ctx, cb)
-  if call.name == "bash" and (config.options.subagents or {}).bash then
-    local done = false
-    local ok, err = pcall(sub_bash.run, call.input or {}, ctx, function(output, is_error)
-      if done then return end
-      done = true
-      cb({ type = "tool_result", tool_use_id = call.id, content = output or "", is_error = is_error or nil })
-    end)
-    if not ok then
-      cb({
-        type = "tool_result",
-        tool_use_id = call.id,
-        content = "Sub-agent bash crashed: " .. tostring(err),
-        is_error = true,
-      })
-    end
-    return
-  end
+local function run_tool_call(call, ctx, s, cb)
+  if s.cancelled then return end
   local def = tools.get(call.name)
   if not def or not def.safe or call.name == "sub_agent" then
     return cb({
@@ -258,10 +80,11 @@ local function run_tool_call(call, ctx, cb)
   end
   local verr = tools.validate_input(call.name, call.input)
   if verr then return cb({ type = "tool_result", tool_use_id = call.id, content = verr, is_error = true }) end
-  local done = false
-  local ok, err = pcall(def.run, call.input or {}, ctx, function(output, is_error, meta)
-    if done or (meta and meta.stream) then return end
+  local done, handle = false, nil
+  local ok, result = pcall(def.run, call.input or {}, ctx, function(output, is_error, meta)
+    if s.cancelled or done or (meta and meta.stream) then return end
     done = true
+    s.active_tools[call.id] = nil
     cb({
       type = "tool_result",
       tool_use_id = call.id,
@@ -269,28 +92,71 @@ local function run_tool_call(call, ctx, cb)
       is_error = is_error or nil,
     })
   end)
-  if not ok then
+  handle = result
+  if ok and not done and type(handle) == "table" and (handle.stop or handle.kill) then
+    s.active_tools[call.id] = handle
+  elseif not ok and not done and not s.cancelled then
+    done = true
+    s.active_tools[call.id] = nil
     cb({
       type = "tool_result",
       tool_use_id = call.id,
-      content = "Sub-agent tool crashed: " .. tostring(err),
+      content = "Sub-agent tool crashed: " .. tostring(result),
       is_error = true,
     })
   end
 end
 
-local function run_calls(calls, ctx, done)
-  local results, i = {}, 0
-  local function next_call()
-    i = i + 1
-    local call = calls[i]
-    if not call then return done(results) end
-    run_tool_call(call, ctx, function(result)
-      results[#results + 1] = result
-      next_call()
-    end)
+local function run_calls(calls, ctx, s, done)
+  if #calls == 0 then return done({}) end
+  local cfg = config.options.subagents or {}
+  local limit = math.min(#calls, math.max(1, tonumber(cfg.max_per_batch) or 8))
+  local max_parallel = math.max(1, tonumber(cfg.max_parallel) or 4)
+  local per_result_bytes = math.max(1000, math.floor((tonumber(cfg.max_result_bytes) or 64000) / #calls))
+  local results, pending, launching, finished = {}, #calls, true, false
+  local next_idx, running = 1, 0
+  local function maybe_finish()
+    if s.cancelled then return end
+    if finished or launching or pending > 0 then return end
+    finished = true
+    done(results)
   end
-  next_call()
+  local pump
+  pump = function()
+    if s.cancelled then return end
+    while running < max_parallel and next_idx <= limit do
+      local idx = next_idx
+      next_idx = idx + 1
+      running = running + 1
+      run_tool_call(calls[idx], ctx, s, function(result)
+        if s.cancelled then return end
+        if type(result.content) == "string" and #result.content > per_result_bytes then
+          result.content = require("advantage.util").utf8_safe_sub(result.content, per_result_bytes)
+            .. "\n… [scout batch result truncated]"
+        end
+        results[idx] = result
+        pending = pending - 1
+        running = running - 1
+        pump()
+        maybe_finish()
+      end)
+    end
+  end
+  -- Every tool exposed to a scout is read-only, so independent calls emitted in
+  -- one model response can safely overlap (LSP waits, filesystem reads, grep).
+  -- Preserve response order in `results`.
+  for idx = limit + 1, #calls do
+    results[idx] = {
+      type = "tool_result",
+      tool_use_id = calls[idx].id,
+      content = ("Scout tool batch limit exceeded (max %d); issue it in a later turn."):format(limit),
+      is_error = true,
+    }
+    pending = pending - 1
+  end
+  launching = false
+  pump()
+  maybe_finish()
 end
 
 -- The scout's report is spliced straight into the PARENT transcript, where it
@@ -303,10 +169,32 @@ local REPORT_CAP = 16000
 ---tool arg → configured subagents.model → the parent's model. Returns the model
 ---and provider, or (nil, nil, error_message) when the run can't proceed.
 local function resolve_subagent_model(input, ctx, cfg)
-  local model = input.model and config.resolve_model(input.model)
-  if not model and cfg.model then model = config.resolve_model(cfg.model) end
+  local model
+  if input.model then
+    model = config.resolve_model(input.model)
+    if not model then return nil, nil, "Invalid sub-agent model ref: " .. tostring(input.model) end
+  elseif cfg.model then
+    model = config.resolve_model(cfg.model)
+    if not model then return nil, nil, "Invalid config.subagents.model ref: " .. tostring(cfg.model) end
+  end
   model = model or ctx.model
   if not model then return nil, nil, "sub_agent has no model" end
+  -- Never mutate the parent's live quality setting while tuning a cheap scout.
+  model = vim.deepcopy(model)
+  local requested_effort = input.effort or cfg.effort
+  if requested_effort and requested_effort ~= "inherit" then
+    local controls = require("advantage.effort")
+    local _, err
+    if model.provider == "openai" then
+      _, err = controls.set_openai(model, requested_effort)
+    elseif model.provider == "anthropic" then
+      _, err = controls.set_anthropic(model, requested_effort)
+      model.thinking_display = "omitted"
+    end
+    if err then return nil, nil, "Invalid sub-agent effort: " .. err end
+  elseif model.provider == "anthropic" then
+    model.thinking_display = "omitted"
+  end
   local provider = providers.get(model.provider)
   if not provider then return nil, nil, "Unknown sub-agent provider: " .. tostring(model.provider) end
   return model, provider
@@ -315,7 +203,8 @@ end
 ---Deliver the scout's final report to the parent: capped and usage-annotated.
 local function finish_report(s, text, is_error)
   assert(type(s) == "table" and type(s.cb) == "function", "finish_report: session with cb required")
-  if s.cancelled then return end
+  if s.cancelled or s.finished then return end
+  s.finished = true
   local util = require("advantage.util")
   text = vim.trim(text or "")
   if text == "" and not is_error then text = "Sub-agent finished without a text report." end
@@ -359,6 +248,7 @@ local step
 ---(falling back to the newest interim findings if it somehow came back empty),
 ---and we never loop again.
 local function on_step_complete(s, blocks, stop_reason, final)
+  s.streaming = false
   s.job = nil
   if s.cancelled then return end
   if #blocks > 0 then s.messages[#s.messages + 1] = { role = "assistant", content = blocks } end
@@ -372,7 +262,8 @@ local function on_step_complete(s, blocks, stop_reason, final)
     end
   end
   if #calls == 0 then return finish_report(s, interim, false) end
-  run_calls(calls, s.ctx, function(results)
+  run_calls(calls, s.ctx, s, function(results)
+    if s.cancelled then return end
     s.messages[#s.messages + 1] = { role = "user", content = results }
     step(s)
   end)
@@ -386,38 +277,59 @@ function step(s)
   assert(type(s) == "table" and type(s.provider) == "table", "step: session with provider required")
   if s.cancelled then return end
   s.turn = s.turn + 1
-  local final = s.turn >= s.max_turns
+  local window = config.effective_context_window and config.effective_context_window(s.model) or s.model.context_window
+  local reserve = s.output_reserve or s.model.max_output_tokens or 64000
+  local prefix = require("advantage.compact").estimate_value_tokens({
+    system = system_prompt(s.max_turns, s.ctx.cwd),
+    tools = readonly_tools(),
+  })
+  local used = require("advantage.compact").estimate_tokens(s.messages)
+  local near_limit = type(window) == "number"
+    and used + prefix >= window - reserve - ((config.options.context or {}).request_safety_tokens or 8192)
+  local final = s.turn >= s.max_turns or near_limit
 
-  s.job = s.provider.stream({
+  s.streaming = true
+  local job = s.provider.stream({
     model = s.model,
-    system = system_prompt(s.max_turns),
+    system = system_prompt(s.max_turns, s.ctx.cwd),
     messages = final and final_report_messages(s) or s.messages,
     -- Keep the tools declared (so the transcript's prior tool_use/tool_result
     -- blocks still validate) but forbid their use on the final turn, forcing text.
     tools = readonly_tools(),
     tool_choice = final and "none" or nil,
+    -- Permit, but never require, same-turn read fan-out. Dependent look-ups can
+    -- still be issued one per turn after the previous result is observed.
+    parallel_tool_calls = not final,
+    -- Reasoning summaries cost latency/tokens but scouts never render them.
+    reasoning_summary = false,
+    prompt_cache_key = s.request_key,
+    session_id = s.request_key,
     on = {
       text = function() end,
       thinking = function() end,
       tool_start = function() end,
       auth = function() end,
-      usage = function(i, o, cached)
+      usage = function(i, o, cached, details)
         s.usage.input = s.usage.input + (i or 0)
         s.usage.output = s.usage.output + (o or 0)
-        require("advantage.usage").record(s.model, i or 0, o or 0, cached)
+        s.usage.reasoning = (s.usage.reasoning or 0) + ((details and details.reasoning) or 0)
+        s.usage.cache_write = (s.usage.cache_write or 0) + ((details and details.cache_write) or 0)
+        require("advantage.usage").record(s.model, i or 0, o or 0, cached, details)
       end,
       complete = function(blocks, stop_reason)
         on_step_complete(s, blocks, stop_reason, final)
       end,
       error = function(msg)
+        s.streaming = false
         s.job = nil
         finish_report(s, "Sub-agent error: " .. tostring(msg), true)
       end,
     },
   })
+  if not s.cancelled and not s.finished and s.streaming then s.job = job end
 end
 
----@param input {prompt:string, model?:string, max_turns?:integer}
+---@param input {prompt:string, model?:string, max_turns?:integer, effort?:string}
 ---@param ctx {cwd:string, model?:table, system?:string}
 ---@param cb fun(output:string, is_error:boolean)
 function M.run(input, ctx, cb)
@@ -430,11 +342,39 @@ function M.run(input, ctx, cb)
 
   local model, provider, err = resolve_subagent_model(input, ctx, cfg)
   if not model then return cb(err or "sub_agent has no model", true) end
+  -- Compute the transport-aware envelope before applying the scout's API-side
+  -- response cap. ChatGPT login does not accept that cap, so it must still
+  -- reserve the model's native maximum (128k for GPT-5.6) during preflight.
+  local output_reserve = config.request_output_reserve_tokens and config.request_output_reserve_tokens(model)
+    or model.max_output_tokens
+    or 64000
+  local output_cap = math.max(1000, tonumber(cfg.max_output_tokens) or 16000)
+  model.max_output_tokens = math.min(tonumber(model.max_output_tokens) or output_cap, output_cap)
 
   -- Floor at 2, not 1: the final turn is report-only (tools withheld), so a budget
   -- of 1 would leave the scout zero turns to actually investigate — it would report
   -- having read nothing. 2 guarantees at least one investigation turn plus the report.
   local max_turns = math.max(2, math.min(tonumber(input.max_turns or cfg.max_turns or 12) or 12, 30))
+  local digest = vim.fn.sha256(
+    ctx.cwd
+      .. ":"
+      .. tostring(model.provider)
+      .. ":"
+      .. tostring(model.id)
+      .. ":"
+      .. prompt
+      .. ":"
+      .. tostring((vim.uv or vim.loop).hrtime())
+  )
+  local request_key = digest:sub(1, 8)
+    .. "-"
+    .. digest:sub(9, 12)
+    .. "-4"
+    .. digest:sub(14, 16)
+    .. "-a"
+    .. digest:sub(18, 20)
+    .. "-"
+    .. digest:sub(21, 32)
   local s = {
     ctx = ctx,
     cb = cb,
@@ -444,9 +384,14 @@ function M.run(input, ctx, cb)
     max_turns = max_turns,
     turn = 0,
     cancelled = false,
+    finished = false,
+    streaming = false,
     job = nil, ---@type table?
-    usage = { input = 0, output = 0 }, -- accumulated across turns
+    active_tools = {}, -- tool_use_id -> cancellable read-only tool handle
+    usage = { input = 0, output = 0, reasoning = 0, cache_write = 0 }, -- accumulated across turns
     last_text = "", -- newest interim findings, so a turn-limit stop isn't wasted
+    request_key = request_key,
+    output_reserve = output_reserve,
   }
 
   step(s)
@@ -455,6 +400,12 @@ function M.run(input, ctx, cb)
     stop = function()
       s.cancelled = true
       if s.job and s.job.stop then s.job.stop() end
+      for _, handle in pairs(s.active_tools) do
+        local stopped = false
+        if type(handle) == "table" and handle.stop then stopped = pcall(handle.stop) end
+        if not stopped and type(handle) == "table" and handle.kill then pcall(handle.kill) end
+      end
+      s.active_tools = {}
     end,
   }
 end

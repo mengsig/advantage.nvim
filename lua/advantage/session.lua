@@ -1,19 +1,100 @@
 ---@brief Session persistence: one JSON file per conversation under stdpath("data").
 local M = {}
 
+local uv = vim.uv or vim.loop
+
+local function write_private_atomic(path, content)
+  local tmp, fd, err
+  for attempt = 1, 8 do
+    tmp = ("%s.adv.%d.%x.tmp"):format(path, vim.fn.getpid(), (uv.hrtime() + attempt) % 0x7fffffff)
+    fd, err = uv.fs_open(tmp, "wx", 384) -- 0600; never follow a planted temp symlink
+    if fd then break end
+  end
+  if not fd then return nil, err end
+  -- open(2)'s mode is umask-filtered. Force the intended private mode while the
+  -- inode is still reachable only through our exclusive randomized temp name.
+  local chmod_ok, chmod_err = uv.fs_chmod(tmp, 384)
+  if not chmod_ok then
+    uv.fs_close(fd)
+    os.remove(tmp)
+    return nil, chmod_err or "could not secure session temporary"
+  end
+  local offset = 0
+  while offset < #content do
+    local wrote
+    wrote, err = uv.fs_write(fd, content:sub(offset + 1), offset)
+    if not wrote or wrote <= 0 then break end
+    offset = offset + wrote
+  end
+  local synced, sync_err = uv.fs_fsync(fd)
+  uv.fs_close(fd)
+  if offset ~= #content or not synced then
+    os.remove(tmp)
+    return nil, err or sync_err or "write failed"
+  end
+  local renamed, rename_err = uv.fs_rename(tmp, path)
+  if not renamed then
+    os.remove(tmp)
+    return nil, rename_err or "rename failed"
+  end
+  return true
+end
+
 local function dir()
-  local d = vim.fn.stdpath("data") .. "/advantage/sessions"
+  local d = M._dir_override or (vim.fn.stdpath("data") .. "/advantage/sessions")
   vim.fn.mkdir(d, "p", "0700")
+  -- mkdir -p does not repair permissions on an existing directory. Session
+  -- transcripts can contain source and secrets, so tighten old installs too.
+  pcall(uv.fs_chmod, d, 448) -- 0700
   return d
 end
 
 ---Sessions are scoped per project so `resume` only offers relevant ones.
-local function project_key()
-  return vim.fn.sha256((vim.uv or vim.loop).cwd() or ""):sub(1, 12)
+local function project_root(cwd)
+  cwd = vim.fs.normalize(cwd or uv.cwd() or "")
+  local git = cwd ~= "" and vim.fs.find(".git", { path = cwd, upward = true })[1] or nil
+  local root = git and vim.fs.dirname(git) or cwd
+  return uv.fs_realpath(root) or root
+end
+
+local function project_key(cwd)
+  return vim.fn.sha256(project_root(cwd)):sub(1, 12)
+end
+M._project_key = project_key
+
+---Opaque filename component for a persisted conversation id. The raw id comes
+---from resumable JSON and must never become a path segment (`../../...`), while a
+---hash remains deterministic so every autosave replaces the same session file.
+local function filename_token(id)
+  return vim.fn.sha256(tostring(id or "")):sub(1, 32)
+end
+M._filename_token = filename_token
+
+local id_counter = 0
+---Generate a process-safe conversation id without depending on Lua's global RNG
+---seed. `Agent.new` can use this for new sessions; resumed ids remain stable.
+function M.new_id()
+  id_counter = id_counter + 1
+  local digest = vim.fn.sha256(
+    table.concat(
+      { tostring(vim.fn.getpid()), tostring(uv.hrtime()), tostring(id_counter), tostring(uv.cwd() or "") },
+      ":"
+    )
+  )
+  return ("%s-%s-%s-%s-%s"):format(
+    digest:sub(1, 8),
+    digest:sub(9, 12),
+    digest:sub(13, 16),
+    digest:sub(17, 20),
+    digest:sub(21, 32)
+  )
 end
 
 function M.save(agent)
-  local path = ("%s/%s-%s.json"):format(dir(), project_key(), agent.id)
+  local cwd = (agent.ctx and agent.ctx.cwd) or (vim.uv or vim.loop).cwd()
+  local sessions_dir = dir()
+  local key = project_key(cwd)
+  local path = ("%s/%s-%s.json"):format(sessions_dir, key, filename_token(agent.id))
   local payload = {
     v = 1,
     id = agent.id,
@@ -21,36 +102,49 @@ function M.save(agent)
     model = agent.model,
     messages = agent.messages,
     usage = agent.usage,
-    cwd = (vim.uv or vim.loop).cwd(),
+    cwd = cwd,
     updated_at = os.time(),
   }
   local ok, encoded = pcall(vim.json.encode, payload)
-  if not ok then return end
-  -- Autosave overwrites the same file every turn; write to a temp file and
-  -- atomically rename so a crash mid-write can't corrupt the only copy.
-  local tmp = path .. ".tmp"
-  local f = io.open(tmp, "w")
-  if not f then return end
-  f:write(encoded)
-  f:close()
-  pcall((vim.uv or vim.loop).fs_chmod, tmp, 384) -- 0600: transcripts can hold secrets
-  if not os.rename(tmp, path) then os.remove(tmp) end
+  if not ok then return nil, encoded end
+  -- Transcripts can hold source and secrets: the temporary is exclusive and
+  -- private from creation, and only a complete fsynced payload replaces the
+  -- prior autosave.
+  local saved, err = write_private_atomic(path, encoded)
+  if not saved then return nil, err end
+  -- One-time migration for pre-hardening filenames. Only construct/remove the
+  -- legacy path when the id itself was a single safe component.
+  local raw_id = tostring(agent.id or "")
+  if raw_id:match("^[%w._-]+$") and raw_id ~= "." and raw_id ~= ".." then
+    local legacy = ("%s/%s-%s.json"):format(sessions_dir, key, raw_id)
+    if legacy ~= path then os.remove(legacy) end
+  end
+  return true
 end
 
-function M.list()
-  local out = {}
-  local prefix = project_key()
-  for name, t in vim.fs.dir(dir()) do
+---@param cwd? string project/subdirectory whose sessions should be listed
+function M.list(cwd)
+  local out, by_id = {}, {}
+  local prefix = project_key(cwd)
+  local sessions_dir = dir()
+  for name, t in vim.fs.dir(sessions_dir) do
     -- Require the .json suffix so a crash-leftover "<id>.json.tmp" (atomic-write
     -- temp) is never decoded as a duplicate/partial session in the resume picker.
-    if t == "file" and vim.startswith(name, prefix) and name:sub(-5) == ".json" then
-      local f = io.open(dir() .. "/" .. name, "r")
+    if t == "file" and vim.startswith(name, prefix .. "-") and name:sub(-5) == ".json" then
+      local f = io.open(sessions_dir .. "/" .. name, "r")
       if f then
         local ok, data = pcall(vim.json.decode, f:read("*a"))
         f:close()
-        if ok and type(data) == "table" and data.messages then out[#out + 1] = data end
+        if ok and type(data) == "table" and data.messages then
+          local identity = tostring(data.id or name)
+          local existing = by_id[identity]
+          if not existing or (data.updated_at or 0) > (existing.updated_at or 0) then by_id[identity] = data end
+        end
       end
     end
+  end
+  for _, data in pairs(by_id) do
+    out[#out + 1] = data
   end
   table.sort(out, function(a, b)
     return (a.updated_at or 0) > (b.updated_at or 0)
@@ -73,9 +167,9 @@ local function checkpoints(messages)
   local out = {}
   for i, msg in ipairs(messages or {}) do
     if msg.role == "user" and type(msg.content) == "table" then
-      local text
+      local text = msg.original_text
       for _, block in ipairs(msg.content) do
-        if type(block) == "table" and block.type == "text" and block.text and block.text ~= "" then
+        if not text and type(block) == "table" and block.type == "text" and block.text and block.text ~= "" then
           text = block.text
           break
         end
@@ -130,8 +224,9 @@ function M.pick_checkpoint(data, cb)
 end
 
 ---@param cb fun(data: table|nil, prefill?: string)
-function M.pick(cb)
-  local sessions = M.list()
+---@param cwd? string frozen agent/project cwd used for session scoping
+function M.pick(cb, cwd)
+  local sessions = M.list(cwd)
   if #sessions == 0 then
     require("advantage.ui.chat").notify("no saved sessions for this project", vim.log.levels.INFO)
     return cb(nil)

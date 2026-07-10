@@ -20,6 +20,7 @@ local R = {}
 
 local function winbar_text()
   local left = ("%%#AdvBarIcon# %s %%#AdvBarTitle#%s"):format(ICON, esc_bar(S.model_label))
+  if S.effort_label then left = left .. (" %%#AdvBarFaint#· %s"):format(esc_bar(S.effort_label)) end
   if S.auth_badge then left = left .. (" %%#AdvBarFaint#· %s"):format(esc_bar(S.auth_badge)) end
   if config.options.tools.yolo then left = left .. " %#AdvBarDanger#⚡ yolo" end
   local right = ""

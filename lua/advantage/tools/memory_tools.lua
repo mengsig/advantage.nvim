@@ -49,6 +49,9 @@ end
 return function(tool, s)
   assert(type(tool) == "function", "memory tools: tool registrar required")
   assert(type(s) == "table", "memory tools: support module required")
+  local function scoped(memory, ctx, fn)
+    return memory.with_root(ctx.cwd, fn)
+  end
 
   tool({
     name = "remember",
@@ -74,9 +77,13 @@ return function(tool, s)
     run = function(input, ctx, cb)
       local memory = require("advantage.memory")
       if not memory.enabled() then return cb("Memory is disabled (config.memory.enabled = false).", true) end
-      local res = memory.remember(input.fact, input.section)
+      local res = scoped(memory, ctx, function()
+        return memory.remember(input.fact, input.section)
+      end)
       if res.status == "empty" then
         return cb("Nothing to remember (empty fact).", true)
+      elseif res.status == "error" then
+        return cb("Could not persist memory: " .. tostring(res.error or "write failed"), true)
       elseif res.status == "procedural" then
         return cb(
           "This reads like a multi-step procedure, not a fact. Procedures cost their full length in every request as memory bullets but only one index line as skills — record it with save_skill instead (or split out the single durable fact).",
@@ -122,10 +129,12 @@ return function(tool, s)
     end,
     run = function(input, ctx, cb)
       local memory = require("advantage.memory")
-      local body, desc = memory.use_skill(input.name)
+      local body, desc = scoped(memory, ctx, function()
+        return memory.use_skill(input.name)
+      end)
       if not body then
         local names = {}
-        for _, sk in ipairs(memory.skills_index()) do
+        for _, sk in ipairs(scoped(memory, ctx, memory.skills_index)) do
           names[#names + 1] = sk.name
         end
         return cb(
@@ -160,7 +169,9 @@ return function(tool, s)
     run = function(input, ctx, cb)
       local memory = require("advantage.memory")
       if not memory.enabled() then return cb("Memory is disabled (config.memory.enabled = false).", true) end
-      local ok, err = memory.save_skill(input.name, input.description, input.body)
+      local ok, err = scoped(memory, ctx, function()
+        return memory.save_skill(input.name, input.description, input.body)
+      end)
       if not ok then return cb("Could not save skill: " .. tostring(err), true) end
       cb(("Saved skill %q. It is now in the skills index; load its steps with use_skill."):format(input.name), false)
     end,

@@ -17,10 +17,19 @@
 ---  .advantage/<name>.md           user-authored config doc, injected verbatim (see M.config_docs)
 ---Project memory (AGENTS.md / CLAUDE.md) is also ingested for parity with the real CLIs.
 local config = require("advantage.config")
+local util = require("advantage.util")
 
 local M = {}
 
 local uv = vim.uv or vim.loop
+local utf8_safe_sub = util.utf8_safe_sub
+
+-- Repo-owned instruction files are untrusted input. Bound every read at source,
+-- before parsing/import expansion, so a giant sparse file or repeated import
+-- cannot block Neovim or allocate the whole file merely to truncate it later.
+local MAX_REPO_FILE_BYTES = 1024 * 1024
+local CONTEXT_FILE_MAX_BYTES = 1024 * 1024
+local MAX_CONTEXT_BULLETS = 512
 
 -- Canonical sections, in render order. `remember` routes a fact to one of these;
 -- an unknown section is coerced to "Notes" so the file never sprawls.
@@ -43,9 +52,9 @@ local PREAMBLE = {
 ---Walk up from cwd to the nearest `.git` so memory is stable no matter which
 ---sub-directory Neovim was opened in; fall back to cwd.
 local _root_cache = {}
-function M.root()
-  if M._root_override then return M._root_override end
-  local cwd = uv.cwd() or ""
+local _scoped_root = nil
+local function discover_root(cwd)
+  cwd = cwd or uv.cwd() or ""
   if _root_cache[cwd] ~= nil then return _root_cache[cwd] end
   local found = vim.fs.find(".git", { path = cwd, upward = true })[1]
   local root = found and vim.fs.dirname(found) or cwd
@@ -53,14 +62,36 @@ function M.root()
   return root
 end
 
+function M.root()
+  if M._root_override then return M._root_override end
+  return _scoped_root or discover_root()
+end
+
+---Run one synchronous memory operation against an agent's frozen workspace even
+---if the user executes :cd mid-session. The previous scope is restored on error.
+function M.with_root(cwd, fn)
+  local previous = _scoped_root
+  _scoped_root = discover_root(cwd)
+  local ok, a, b, c, d = pcall(fn)
+  _scoped_root = previous
+  if not ok then error(a, 0) end
+  return a, b, c, d
+end
+
+---Resolve a memory/config/skill path without ever following a repo-controlled
+---symlink outside the frozen project root.
+function M.contain(path)
+  return require("advantage.util").contain(path, M.root(), false)
+end
+
 local function mem_dir()
-  return M.root() .. "/.advantage"
+  return M.contain(".advantage")
 end
 local function context_file()
-  return mem_dir() .. "/context.md"
+  return M.contain(".advantage/context.md")
 end
 local function skills_dir()
-  return mem_dir() .. "/skills"
+  return M.contain(".advantage/skills")
 end
 
 local function opts()
@@ -75,28 +106,29 @@ end
 -- Small IO + text helpers
 --------------------------------------------------------------------------------
 
-local function read_file(path)
-  local f = io.open(path, "r")
-  if not f then return nil end
-  local data = f:read("*a")
+---@return string|nil data, boolean truncated
+local function read_file(path, max_bytes)
+  local safe = path and M.contain(path)
+  if not safe then return nil, false end
+  local f = io.open(safe, "r")
+  if not f then return nil, false end
+  local limit = math.max(1, math.min(MAX_REPO_FILE_BYTES, math.floor(tonumber(max_bytes) or MAX_REPO_FILE_BYTES)))
+  local data = f:read(limit + 1) or ""
   f:close()
-  return data
+  local truncated = #data > limit
+  if truncated then data = utf8_safe_sub(data, limit) end
+  return data, truncated
 end
 
 local function write_file(path, content)
-  vim.fn.mkdir(vim.fs.dirname(path), "p")
-  -- Atomic write: temp file + rename so a crash or a racing writer can't leave
-  -- a half-written context.md behind.
-  local tmp = path .. ".tmp"
-  local f = io.open(tmp, "w")
-  if not f then return false end
-  f:write(content)
-  f:close()
-  if not os.rename(tmp, path) then
-    os.remove(tmp)
-    return false
+  -- Share the hardened source-file writer: exclusive randomized temp file,
+  -- complete-write + fsync checks, atomic rename, and dirty-buffer protection.
+  local safe, err
+  if path then
+    safe, err = M.contain(path)
   end
-  return true
+  if not safe then return nil, err end
+  return require("advantage.tools.support").write_all(safe, content)
 end
 
 ---Rough token estimate, consistent with compact.lua (chars / 4).
@@ -104,18 +136,14 @@ local function tokens(s)
   return math.ceil(#(s or "") / 4)
 end
 
----Character-safe byte truncation (shared helper). This block is spliced into the
----system prompt, so a mid-character cut would make the request body invalid
----UTF-8; util.utf8_safe_sub backs off to a character boundary.
-local utf8_safe_sub = require("advantage.util").utf8_safe_sub
-
 ---Seed `<root>/.advantage/context.md` the first time this repo is used, so the
 ---memory file is visible, editable and committable from session one instead of
 ---appearing only after the model's first `remember` call. Idempotent — never
 ---touches an existing file. Called from agent creation.
 function M.bootstrap()
   if not M.enabled() then return false end
-  if uv.fs_stat(context_file()) then return false end
+  local path = context_file()
+  if not path or uv.fs_stat(path) then return false end
   local skeleton = table.concat({
     "# Repo memory",
     PREAMBLE[1],
@@ -126,7 +154,7 @@ function M.bootstrap()
     "_or facts land here via the `remember` tool organically as the agent works._",
     "",
   }, "\n")
-  return write_file(context_file(), skeleton) == true
+  return write_file(path, skeleton) == true
 end
 
 ---Normalize a fact to a bag of significant words for deterministic dedup.
@@ -173,14 +201,14 @@ end
 
 ---Parse context.md into an ordered {section -> {bullet, ...}} structure.
 local function parse_context()
-  local data = read_file(context_file())
+  local data, truncated = read_file(context_file(), CONTEXT_FILE_MAX_BYTES)
   local order, bullets = {}, {}
   for _, s in ipairs(SECTIONS) do
     order[#order + 1] = s
     bullets[s] = {}
   end
-  if not data then return bullets, order end
-  local current = nil
+  if not data then return bullets, order, false end
+  local current, bullet_count = nil, 0
   for _, line in ipairs(vim.split(data, "\n", { plain = true })) do
     local header = line:match("^##%s+(.+)%s*$")
     if header then
@@ -192,10 +220,17 @@ local function parse_context()
       current = header
     else
       local bullet = line:match("^%-%s+(.+)$")
-      if bullet and current then bullets[current][#bullets[current] + 1] = vim.trim(bullet) end
+      if bullet and current then
+        if bullet_count >= MAX_CONTEXT_BULLETS then
+          truncated = true
+          break
+        end
+        bullets[current][#bullets[current] + 1] = vim.trim(bullet)
+        bullet_count = bullet_count + 1
+      end
     end
   end
-  return bullets, order
+  return bullets, order, truncated
 end
 
 local function render_context(bullets, order)
@@ -297,7 +332,14 @@ function M.remember(fact, section)
   -- costs its full length every turn; as a skill it costs one index line
   if looks_procedural(fact) then return { status = "procedural", section = section } end
 
-  local bullets, order = parse_context()
+  local bullets, order, truncated = parse_context()
+  if truncated then
+    return {
+      status = "error",
+      section = section,
+      error = "context.md exceeds the 1 MiB safety limit; curate it manually before recording more",
+    }
+  end
   local threshold = opts().dedupe_threshold or 0.8
   local fa, fn = word_set(fact)
 
@@ -308,7 +350,8 @@ function M.remember(fact, section)
         -- keep the more informative phrasing; don't grow the file for a near-dup
         if #fact > #existing then
           items[idx] = fact
-          save_context(bullets, order)
+          local ok, err = save_context(bullets, order)
+          if not ok then return { status = "error", section = section, error = err or "write failed" } end
           local advice = M.curation_advice()
           return {
             status = "updated",
@@ -326,7 +369,8 @@ function M.remember(fact, section)
 
   bullets[section][#bullets[section] + 1] = fact
   local evicted = enforce_budget(bullets, order)
-  save_context(bullets, order)
+  local ok, err = save_context(bullets, order)
+  if not ok then return { status = "error", section = section, error = err or "write failed" } end
   M._session.remember_count = (M._session.remember_count or 0) + 1
   local advice = M.curation_advice()
   return {
@@ -439,7 +483,8 @@ end
 function M.forget(pattern)
   pattern = tostring(pattern or ""):lower()
   if pattern == "" then return 0 end
-  local bullets, order = parse_context()
+  local bullets, order, truncated = parse_context()
+  if truncated then return 0, "context.md exceeds the 1 MiB safety limit; curate it manually before rewriting" end
   local removed = 0
   for _, items in pairs(bullets) do
     for i = #items, 1, -1 do
@@ -449,7 +494,10 @@ function M.forget(pattern)
       end
     end
   end
-  if removed > 0 then save_context(bullets, order) end
+  if removed > 0 then
+    local ok, err = save_context(bullets, order)
+    if not ok then return 0, err or "write failed" end
+  end
   return removed
 end
 
@@ -569,8 +617,9 @@ function M.stats()
   local list = skills.scan_skills()
   local bodies_tokens = 0
   for _, s in ipairs(list) do
-    local _, _, body = skills.parse_skill(read_file(s.path) or "")
-    bodies_tokens = bodies_tokens + tokens(body or "")
+    -- The dashboard needs a savings estimate, not every full runbook body. File
+    -- size is a conservative proxy and avoids rereading all skills on each open.
+    bodies_tokens = bodies_tokens + math.ceil((tonumber(s.bytes) or 0) / 4)
   end
   return {
     block_tokens = tokens(M.render()),
@@ -585,29 +634,91 @@ end
 -- Project memory ingestion (parity: real CLIs read AGENTS.md / CLAUDE.md)
 --------------------------------------------------------------------------------
 
+local function configured_byte_cap(field, default_tokens)
+  local value = tonumber(opts()[field]) or default_tokens
+  if value ~= value or value == math.huge or value == -math.huge then value = default_tokens end
+  return math.max(400, math.min(MAX_REPO_FILE_BYTES, math.floor(math.max(1, value) * 4)))
+end
+
+---Expand one level of @imports while bounding the finished string during
+---construction. Repeated imports are represented once and cached reads ensure a
+---repo cannot multiply I/O/allocation with thousands of identical references.
+local function expand_project_imports(text, root, cap)
+  local out, used, pos, truncated = {}, 0, 1, false
+  local cache, included = {}, {}
+  local function append(part)
+    if part == "" then return true end
+    local room = cap - used
+    if room <= 0 then
+      truncated = true
+      return false
+    end
+    local complete = true
+    if #part > room then
+      part = utf8_safe_sub(part, room)
+      truncated = true
+      complete = false
+    end
+    out[#out + 1] = part
+    used = used + #part
+    return complete and used < cap
+  end
+
+  while pos <= #text and used < cap do
+    local first, last, rel = text:find("@([%w._/-]+)", pos)
+    if not first then
+      append(text:sub(pos))
+      pos = #text + 1
+      break
+    end
+    if not append(text:sub(pos, first - 1)) then break end
+    local abs = util.contain(rel, root, false)
+    local replacement = "@" .. rel
+    if abs then
+      if included[abs] then
+        replacement = ("[duplicate @%s omitted]"):format(rel)
+      else
+        included[abs] = true
+        if cache[abs] == nil then
+          local imported, import_truncated = read_file(abs, cap)
+          cache[abs] = { text = imported, truncated = import_truncated }
+        end
+        if cache[abs].text then replacement = cache[abs].text end
+        if cache[abs].truncated then truncated = true end
+      end
+    end
+    if not append(replacement) then break end
+    pos = last + 1
+  end
+  if pos <= #text then truncated = true end
+  return table.concat(out), truncated
+end
+
 ---Read the project's committed memory file, resolving one level of `@file`
 ---imports (Claude Code style, e.g. CLAUDE.md that just holds `@AGENTS.md`).
 local function project_memory()
-  local root = M.root()
-  local pick
+  local root, text, source_truncated = M.root(), nil, false
+  local cap = configured_byte_cap("project_budget_tokens", 2000)
+  local source_cap = math.min(MAX_REPO_FILE_BYTES, math.max(64 * 1024, cap * 4))
   for _, name in ipairs({ "AGENTS.md", "CLAUDE.md" }) do
-    if read_file(root .. "/" .. name) then
-      pick = name
+    local path = M.contain(name)
+    local candidate, truncated
+    if path then
+      candidate, truncated = read_file(path, source_cap)
+    end
+    if candidate ~= nil then
+      text, source_truncated = candidate, truncated
       break
     end
   end
-  if not pick then return nil end
-  local text = read_file(root .. "/" .. pick) or ""
-  text = text:gsub("@([%w._/-]+)", function(rel)
-    -- Only resolve imports that stay inside the repo: reject absolute paths,
-    -- `..` escapes, and in-repo symlinks pointing outside so a committed
-    -- AGENTS.md/CLAUDE.md can't exfiltrate files. Same containment as file tools.
-    local abs = require("advantage.util").contain(rel, root, false)
-    return (abs and read_file(abs)) or ("@" .. rel)
-  end)
+  if text == nil then return nil end
+  local expanded_truncated
+  text, expanded_truncated = expand_project_imports(text, root, cap)
   text = text:gsub("<!%-%-.-%-%->", "") -- strip HTML-comment noise (e.g. tool markers)
-  local cap = (opts().project_budget_tokens or 2000) * 4
-  if #text > cap then text = utf8_safe_sub(text, cap) .. "\n… [project memory truncated]" end
+  if source_truncated or expanded_truncated then
+    local marker = "\n… [project memory truncated]"
+    text = utf8_safe_sub(text, math.max(0, cap - #marker)) .. marker
+  end
   return vim.trim(text)
 end
 
@@ -619,6 +730,7 @@ end
 ---@return {name: string, text: string}[]
 function M.config_docs()
   local dir = mem_dir()
+  if not dir then return {} end
   local fs = uv.fs_scandir(dir)
   if not fs then return {} end
   local names = {}
@@ -629,14 +741,21 @@ function M.config_docs()
     if (typ == "file" or typ == nil) and name:match("%.md$") and name ~= "context.md" then names[#names + 1] = name end
   end
   table.sort(names)
-  local cap = (opts().config_budget_tokens or 2000) * 4
+  local cap = configured_byte_cap("config_budget_tokens", 2000)
   local docs = {}
   for _, name in ipairs(names) do
-    local text = read_file(dir .. "/" .. name)
+    local path = M.contain(".advantage/" .. name)
+    local text, truncated
+    if path then
+      text, truncated = read_file(path, cap)
+    end
     if text then
       text = vim.trim(text:gsub("<!%-%-.-%-%->", ""))
       if #text > 0 then
-        if #text > cap then text = utf8_safe_sub(text, cap) .. "\n… [config doc truncated]" end
+        if truncated then
+          local marker = "\n… [config doc truncated]"
+          text = utf8_safe_sub(text, math.max(0, cap - #marker)) .. marker
+        end
         docs[#docs + 1] = { name = name, text = text }
       end
     end
@@ -654,7 +773,8 @@ end
 ---`lua/advantage/tools/init.lua`) — looks for any file in the tree whose path
 ---ends with that suffix. Bounded so a huge tree can't wedge the command.
 local function path_resolves(root, path)
-  if uv.fs_stat(root .. "/" .. path) or uv.fs_stat(path) then return true end
+  local direct = M.contain(path)
+  if direct and uv.fs_stat(direct) then return true end
   local base = path:match("([^/]+)$")
   if not base then return false end
   local hits = vim.fs.find(base, { path = root, type = "file", limit = 64 })
@@ -705,13 +825,21 @@ end
 ---Build the repo-facts part from context.md, or a cold-start placeholder telling
 ---the model the (empty) memory exists so the learning flywheel starts on turn one.
 local function repo_facts_part()
-  local bullets, order = parse_context()
+  local bullets, order, source_truncated = parse_context()
   assert(type(bullets) == "table", "repo_facts_part: parse_context must return a bullets table")
   local has_facts = false
   for _, items in pairs(bullets) do
     if #items > 0 then has_facts = true end
   end
-  if has_facts then return { label = "repo memory (context.md)", text = vim.trim(render_context(bullets, order)) } end
+  if has_facts then
+    local text = vim.trim(render_context(bullets, order))
+    local cap = math.min(MAX_REPO_FILE_BYTES, budget_chars() + 1024)
+    if source_truncated or #text > cap then
+      local marker = "\n… [context.md truncated to the configured memory budget]"
+      text = utf8_safe_sub(text, math.max(0, cap - #marker)) .. marker
+    end
+    return { label = "repo memory (context.md)", text = text }
+  end
   return {
     label = "repo memory (context.md, empty)",
     text = "# Repo memory\nEmpty so far — this repo hasn't been learned yet. As you discover durable, non-obvious facts (build/test commands, architecture invariants, conventions, gotchas, stated preferences), record them with the `remember` tool so future sessions start ahead.",

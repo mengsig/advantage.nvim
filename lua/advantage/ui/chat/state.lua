@@ -27,6 +27,15 @@ local S = {
   think_start = nil,
   mode = nil, -- nil | "thinking" | "text"
   last_kind = nil, -- "header" | "text" | "tool" | "user" | nil
+  -- Provider deltas often arrive a few bytes at a time.  The controller folds
+  -- each short burst into one render so buffer writes, extmarks, and redraws
+  -- scale with frames rather than tokens.
+  stream_parts = {},
+  stream_bytes = 0,
+  stream_mode = nil,
+  stream_buf = nil,
+  stream_timer = nil,
+  tool_streams = {}, -- id -> buffered streamed tool output
   spinner = 1,
   timer = nil,
   status = "idle", -- idle | streaming | tool | waiting | compacting
@@ -35,6 +44,7 @@ local S = {
   usage = { input = 0, output = 0 },
   auth_badge = nil,
   model_label = "",
+  effort_label = nil,
   welcome_mark = nil,
   on_submit = nil,
   attachments = {}, -- pending prompt images: {name=, path=, media_type=, data=}

@@ -8,6 +8,11 @@ local config = require("advantage.config")
 local initialized = false
 local agent_mod, ui, current
 
+local function sync_model_ui(model)
+  ui.set_model_label(model.label)
+  ui.set_effort_label(require("advantage.effort").describe(model))
+end
+
 local function ensure_init()
   if initialized then return end
   initialized = true
@@ -25,7 +30,7 @@ local function ensure_agent()
   if not current then
     local model = assert(config.resolve_model(config.options.default_model), "unknown default_model")
     current = agent_mod.new({ model = model })
-    ui.set_model_label(model.label)
+    sync_model_ui(model)
   end
   return current
 end
@@ -80,6 +85,12 @@ function M.open()
   ui.open()
 end
 
+---Frozen workspace of the active conversation (used by project-scoped UI
+---helpers so `:cd` cannot silently retarget an in-flight session).
+function M.cwd()
+  return current and current.ctx and current.ctx.cwd or (vim.uv or vim.loop).cwd()
+end
+
 ---Send a prompt (opens the panel if hidden). While a turn is running, the
 ---default `mode = "instant"` injects it before the next tool call; `mode = "queued"`
 ---waits until the whole agent flow is idle.
@@ -102,7 +113,7 @@ function M.new_session()
     or assert(config.resolve_model(config.options.default_model), "unknown default_model")
   current = agent_mod.new({ model = model })
   ui.clear()
-  ui.set_model_label(model.label)
+  sync_model_ui(model)
   ui.open()
 end
 
@@ -117,23 +128,38 @@ function M.pick_model()
   }, function(choice)
     if not choice then return end
     local model = assert(config.resolve_model(choice.ref), "unknown model")
+    local detached = 0
+    local model_changed = false
     if current then
       if current:busy() then
         ui.notify("finish or cancel the running turn first", vim.log.levels.WARN)
         return
       end
+      if current.model.provider ~= model.provider or current.model.id ~= model.id then
+        model_changed = true
+        current.messages, detached = require("advantage.compact").detach_provider_state(current.messages)
+      end
       current.model = model
+      current.ctx.model = model
+      if model_changed then
+        -- Threshold hysteresis and static-prefix estimates are model/transport
+        -- specific. Reusing them after a switch can suppress a mandatory compact
+        -- for a smaller context window.
+        current._auto_compact_floor = nil
+        current._request_prefix_tokens = nil
+      end
     else
       ensure_agent()
       current.model = model
     end
-    ui.set_model_label(model.label)
-    ui.notify("model → " .. model.label)
+    sync_model_ui(model)
+    ui.notify("model → " .. model.label .. (detached > 0 and " · private reasoning replay reset" or ""))
   end)
 end
 
 function M.resume()
   ensure_init()
+  local cwd = current and current.ctx and current.ctx.cwd or (vim.uv or vim.loop).cwd()
   require("advantage.session").pick(function(data, prefill)
     if not data then return end
     if current and current:busy() then current:cancel() end
@@ -146,7 +172,11 @@ function M.resume()
     if data.model and model and model.id == data.model.id then
       if model.thinking == nil then model.thinking = data.model.thinking end
       if model.thinking_budget == nil then model.thinking_budget = data.model.thinking_budget end
+      if model.thinking_mode == nil then model.thinking_mode = data.model.thinking_mode end
+      if model.effort == nil then model.effort = data.model.effort end
+      if model.effort_levels == nil then model.effort_levels = data.model.effort_levels end
       if model.reasoning_effort == nil then model.reasoning_effort = data.model.reasoning_effort end
+      if model.reasoning_efforts == nil then model.reasoning_efforts = data.model.reasoning_efforts end
     end
     current = agent_mod.new({
       id = data.id,
@@ -154,13 +184,15 @@ function M.resume()
       model = model,
       messages = data.messages,
       usage = data.usage,
+      cwd = data.cwd or cwd,
     })
     ui.open(false)
     ui.render_transcript(data.messages, model.label)
+    ui.set_effort_label(require("advantage.effort").describe(model))
     ui.set_usage(current.usage)
     ui.open()
     if prefill and prefill ~= "" then ui.set_prompt(prefill) end
-  end)
+  end, cwd)
 end
 
 local function buf_var(buf, name)
@@ -243,6 +275,15 @@ local function netrw_line_files(line1, line2)
   return files, skipped
 end
 
+local function agent_relative(path)
+  local root = current and current.ctx and current.ctx.cwd or (vim.uv or vim.loop).cwd() or ""
+  local abs = vim.fn.fnamemodify(path, ":p"):gsub("/+$", "")
+  root = vim.fn.fnamemodify(root, ":p"):gsub("/+$", "")
+  if abs == root then return "." end
+  if vim.startswith(abs, root .. "/") then return abs:sub(#root + 2) end
+  return abs
+end
+
 ---Relative file name of a buffer, or nil (+warning) for non-file buffers.
 local function buf_rel_name(buf)
   local name = vim.api.nvim_buf_get_name(buf)
@@ -253,7 +294,7 @@ local function buf_rel_name(buf)
   if vim.bo[buf].modified then
     ui.notify("buffer has unsaved changes — line references use the file on disk", vim.log.levels.WARN)
   end
-  return vim.fn.fnamemodify(name, ":.")
+  return agent_relative(name)
 end
 
 ---Visual mode: reference the selection as `@file:L10-20`. The lines are read
@@ -313,13 +354,13 @@ function M.add_file()
     ui.notify("current buffer has no file on disk", vim.log.levels.WARN)
     return
   end
-  M.attach(vim.fn.fnamemodify(name, ":."))
+  M.attach(agent_relative(name))
 end
 
 ---Pick a project file and add it to the chat prompt.
 function M.pick_files()
   ensure_agent()
-  local files = require("advantage.attach").project_files(2000)
+  local files = require("advantage.attach").project_files(2000, current.ctx.cwd)
   if #files == 0 then
     ui.notify("no project files found", vim.log.levels.WARN)
     return
@@ -335,7 +376,13 @@ function M.attach(path)
   local attach = require("advantage.attach")
   local ext = path:match("%.(%w+)$")
   if ext and attach.IMAGE_TYPES[ext:lower()] then
-    local img, err = attach.load_image(path)
+    local allow_outside = (config.options.tools or {}).allow_outside_root
+    local resolved = require("advantage.util").contain(path, current.ctx.cwd, allow_outside)
+    if not resolved then
+      ui.notify("attachment path escapes the session workspace: " .. tostring(path), vim.log.levels.WARN)
+      return
+    end
+    local img, err = attach.load_image(resolved)
     if not img then
       ui.notify(err, vim.log.levels.WARN)
       return
@@ -366,72 +413,10 @@ function M.toggle_yolo()
   end
 end
 
-local OPENAI_EFFORT_ITEMS = {
-  { label = "default · config", value = nil, aliases = { "default", "auto", "adaptive" } },
-  { label = "off · omit reasoning", value = false, aliases = { "off", "none", "disabled" } },
-  { label = "minimal", value = "minimal", aliases = { "minimal" } },
-  { label = "low", value = "low", aliases = { "low" } },
-  { label = "medium", value = "medium", aliases = { "medium" } },
-  { label = "high", value = "high", aliases = { "high" } },
-}
-
-local OPENAI_EFFORTS = {}
-for _, item in ipairs(OPENAI_EFFORT_ITEMS) do
-  for _, alias in ipairs(item.aliases) do
-    OPENAI_EFFORTS[alias] = item
-  end
-end
-
-local ANTHROPIC_EFFORT_ITEMS = {
-  { label = "adaptive/default", value = "adaptive", aliases = { "adaptive", "default", "auto" } },
-  { label = "off", value = false, aliases = { "off", "none", "disabled" } },
-  { label = "low · 1k budget", value = { type = "enabled", budget_tokens = 1024 }, aliases = { "low", "1k" } },
-  {
-    label = "medium · 4k budget",
-    value = { type = "enabled", budget_tokens = 4096 },
-    aliases = { "medium", "4k", "think" },
-  },
-  { label = "high · 8k budget", value = { type = "enabled", budget_tokens = 8192 }, aliases = { "high", "8k" } },
-  {
-    label = "higher · 10k budget",
-    value = { type = "enabled", budget_tokens = 10000 },
-    aliases = { "higher", "10k", "think-hard", "think_hard" },
-  },
-  {
-    label = "highest · 16k budget",
-    value = { type = "enabled", budget_tokens = 16384 },
-    aliases = { "highest", "16k", "think-harder", "think_harder" },
-  },
-  {
-    label = "max · 32k budget",
-    value = { type = "enabled", budget_tokens = 31999 },
-    aliases = { "max", "32k", "ultra", "ultrathink" },
-  },
-}
-
-local ANTHROPIC_EFFORTS = {}
-for _, item in ipairs(ANTHROPIC_EFFORT_ITEMS) do
-  for _, alias in ipairs(item.aliases) do
-    ANTHROPIC_EFFORTS[alias] = item
-  end
-end
-
-local function apply_anthropic_effort(agent, choice)
-  if choice.value == "adaptive" then
-    agent.model.thinking = nil
-    agent.model.thinking_budget = nil
-  elseif choice.value == false then
-    agent.model.thinking = false
-    agent.model.thinking_budget = nil
-  else
-    agent.model.thinking = vim.deepcopy(choice.value)
-    agent.model.thinking_budget = nil
-  end
-  ui.notify("thinking → " .. choice.label)
-end
+local effort = require("advantage.effort")
 
 ---Set reasoning/thinking effort directly.
----OpenAI: default|off|minimal|low|medium|high. Anthropic: adaptive|off|low|medium|high|higher|highest|max (aliases: 1k|4k|8k|10k|16k|32k, think/think-hard/think-harder/ultrathink).
+---Values are validated against the selected model's declared capabilities.
 function M.set_effort(mode)
   local agent = ensure_agent()
   if agent:busy() then
@@ -446,26 +431,24 @@ function M.set_effort(mode)
   end
 
   if agent.model.provider == "openai" then
-    local choice = OPENAI_EFFORTS[mode]
-    if not choice then
-      ui.notify("OpenAI effort must be: default, off, minimal, low, medium, or high", vim.log.levels.WARN)
+    local label, err = effort.set_openai(agent.model, mode)
+    if not label then
+      ui.notify(err, vim.log.levels.WARN)
       return false
     end
-    agent.model.reasoning_effort = choice.value
-    ui.notify("effort → " .. choice.label)
+    ui.notify("effort → " .. label)
+    ui.set_effort_label(effort.describe(agent.model))
     return true
   end
 
   if agent.model.provider == "anthropic" then
-    local choice = ANTHROPIC_EFFORTS[mode]
-    if not choice then
-      ui.notify(
-        "Claude thinking must be: adaptive, off, low/1k, medium/4k, high/8k, higher/10k, highest/16k, or max/32k",
-        vim.log.levels.WARN
-      )
+    local label, err = effort.set_anthropic(agent.model, mode)
+    if not label then
+      ui.notify(err, vim.log.levels.WARN)
       return false
     end
-    apply_anthropic_effort(agent, choice)
+    ui.notify("thinking/effort → " .. label)
+    ui.set_effort_label(effort.describe(agent.model))
     return true
   end
 
@@ -485,13 +468,11 @@ function M.pick_effort()
   end
 
   if agent.model.provider == "openai" then
-    local items = OPENAI_EFFORT_ITEMS
+    local items = effort.openai_items(agent.model)
     require("advantage.ui.picker").select(items, {
       prompt = "advantage · reasoning effort",
       format_item = function(x)
-        local selected = x.value == nil and agent.model.reasoning_effort == nil
-          or agent.model.reasoning_effort == x.value
-        return ("%s %s"):format(selected and "●" or " ", x.label)
+        return ("%s %s"):format(effort.openai_selected(agent.model, x) and "●" or " ", x.label)
       end,
     }, function(choice)
       if not choice then return end
@@ -501,24 +482,15 @@ function M.pick_effort()
   end
 
   if agent.model.provider == "anthropic" then
-    local current = agent.model.thinking
-    local items = ANTHROPIC_EFFORT_ITEMS
+    local items = effort.anthropic_items(agent.model)
     require("advantage.ui.picker").select(items, {
       prompt = "advantage · thinking",
       format_item = function(x)
-        local selected = false
-        if x.value == false then
-          selected = current == false
-        elseif x.value == "adaptive" then
-          selected = current == nil or current == "adaptive" or current == true
-        elseif type(current) == "table" then
-          selected = current.budget_tokens == x.value.budget_tokens
-        end
-        return ("%s %s"):format(selected and "●" or " ", x.label)
+        return ("%s %s"):format(effort.anthropic_selected(agent.model, x) and "●" or " ", x.label)
       end,
     }, function(choice)
       if not choice then return end
-      apply_anthropic_effort(agent, choice)
+      M.set_effort(choice.aliases[1])
     end)
     return
   end
@@ -603,9 +575,13 @@ end
 local function context_forget(memory, args)
   local pattern = table.concat(vim.list_slice(args, 2), " ")
   if pattern == "" then return ui.notify("usage: /context forget <text to match>", vim.log.levels.WARN) end
-  local n = memory.forget(pattern)
+  local n, err = memory.forget(pattern)
+  if err then return ui.notify("could not update repo memory: " .. tostring(err), vim.log.levels.ERROR) end
   -- drop the frozen memory block so the forgotten fact leaves the live prefix
-  if n > 0 and current then current._memory_block = nil end
+  if n > 0 and current then
+    current._memory_block = nil
+    current._request_prefix_tokens = nil
+  end
   ui.notify(
     n > 0 and ("forgot %d fact%s matching %q"):format(n, n == 1 and "" or "s", pattern)
       or ("no facts matched %q"):format(pattern)
@@ -633,22 +609,25 @@ end
 function M.context(arg)
   ensure_init()
   local memory = require("advantage.memory")
-  local args = vim.split(vim.trim(tostring(arg or "")), "%s+", { trimempty = true })
-  local action = args[1] or "show"
+  local cwd = (current and current.ctx and current.ctx.cwd) or (vim.uv or vim.loop).cwd()
+  return memory.with_root(cwd, function()
+    local args = vim.split(vim.trim(tostring(arg or "")), "%s+", { trimempty = true })
+    local action = args[1] or "show"
 
-  if action == "init" then
-    context_init(memory)
-  elseif action == "curate" then
-    context_curate(memory)
-  elseif action == "verify" then
-    context_verify(memory)
-  elseif action == "preview" then
-    context_preview()
-  elseif action == "forget" then
-    context_forget(memory, args)
-  else
-    context_show(memory)
-  end
+    if action == "init" then
+      context_init(memory)
+    elseif action == "curate" then
+      context_curate(memory)
+    elseif action == "verify" then
+      context_verify(memory)
+    elseif action == "preview" then
+      context_preview()
+    elseif action == "forget" then
+      context_forget(memory, args)
+    else
+      context_show(memory)
+    end
+  end)
 end
 
 ---Show the keybind and command cheatsheet.

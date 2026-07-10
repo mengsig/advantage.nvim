@@ -43,6 +43,37 @@ function M.get(name)
   return by_name[name]
 end
 
+local function schema_error(value, schema, path)
+  if value == nil or type(schema) ~= "table" then return nil end
+  local expected = schema.type
+  local actual = type(value)
+  local valid = expected == nil
+    or (expected == "object" and actual == "table")
+    or (expected == "array" and actual == "table")
+    or (expected == "string" and actual == "string")
+    or (expected == "boolean" and actual == "boolean")
+    or (expected == "number" and actual == "number")
+    or (expected == "integer" and actual == "number" and value == math.floor(value))
+  if not valid then return ("%s must be %s (got %s)"):format(path, expected, actual) end
+  if schema.enum and not vim.tbl_contains(schema.enum, value) then
+    return ("%s must be one of: %s"):format(path, table.concat(schema.enum, ", "))
+  end
+  if expected == "object" then
+    for _, field in ipairs(schema.required or {}) do
+      if value[field] == nil then return ("%s.%s is required"):format(path, field) end
+    end
+    for field, child in pairs(schema.properties or {}) do
+      local err = schema_error(value[field], child, path .. "." .. field)
+      if err then return err end
+    end
+  elseif expected == "array" then
+    for i, item in ipairs(value) do
+      local err = schema_error(item, schema.items, ("%s[%d]"):format(path, i))
+      if err then return err end
+    end
+  end
+end
+
 ---Validate a decoded tool input against its schema's `required` list. Models
 ---intermittently drop a required argument (classically `path` on edit_file when
 ---the big `new_string` field dominates the call), and a truncated tool-call
@@ -53,16 +84,20 @@ end
 ---@return string|nil err  nil if valid, else a message naming the missing args
 function M.validate_input(name, input)
   local def = by_name[name]
-  local req = def and def.input_schema and def.input_schema.required
-  if not req then return nil end
-  input = type(input) == "table" and input or {}
+  local schema = def and def.input_schema
+  if not schema then return nil end
+  if type(input) ~= "table" then return ("%s: input must be object (got %s)"):format(name, type(input)) end
+  local req = schema.required or {}
   local missing = {}
   for _, field in ipairs(req) do
     -- Present-but-empty is the tool's own concern (e.g. edit_file new_string=""
     -- deletes text); "required" only means the key must be supplied.
     if input[field] == nil then missing[#missing + 1] = field end
   end
-  if #missing == 0 then return nil end
+  if #missing == 0 then
+    local err = schema_error(input, schema, "input")
+    return err and (name .. ": " .. err) or nil
+  end
   local provided = {}
   for k in pairs(input) do
     provided[#provided + 1] = k
@@ -79,6 +114,7 @@ end
 
 ---Resolve a tool path argument against the project root (for snapshots etc).
 M.resolve = support.resolve
+M.read_all = support.read_all
 
 ---The configured web_search key (inline api_key wins over api_key_env). Kept as
 ---a module field for callers/tests that inspect it.
@@ -109,6 +145,10 @@ function M.enabled(def)
     if type(t) == "table" and t.enabled == false then return false end
     local ok, lsp = pcall(require, "advantage.lsp")
     return ok and lsp.available()
+  end
+  if def.feature == "subagents" then
+    local t = require("advantage.config").options.subagents
+    return not (type(t) == "table" and t.enabled == false)
   end
   return true
 end

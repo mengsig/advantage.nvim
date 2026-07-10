@@ -71,8 +71,8 @@ do
     tool_start = function(id, name)
       got.tools[#got.tools + 1] = { id, name }
     end,
-    usage = function(i, o)
-      got.usage = { i, o }
+    usage = function(i, o, cached, details)
+      got.usage = { i, o, cached, details }
     end,
     complete = function(blocks, stop, usage)
       final = { blocks = blocks, stop = stop, usage = usage }
@@ -82,7 +82,10 @@ do
     end,
   })
   local feed = {
-    { type = "message_start", message = { usage = { input_tokens = 12, cache_read_input_tokens = 3 } } },
+    {
+      type = "message_start",
+      message = { usage = { input_tokens = 12, cache_read_input_tokens = 3, cache_creation_input_tokens = 2 } },
+    },
     { type = "content_block_start", index = 0, content_block = { type = "thinking" } },
     { type = "content_block_delta", index = 0, delta = { type = "thinking_delta", thinking = "hm" } },
     { type = "content_block_delta", index = 0, delta = { type = "signature_delta", signature = "sig" } },
@@ -107,7 +110,10 @@ do
   )
   check(final.blocks[2].type == "text" and final.blocks[2].text == "let me check", "text block accumulated")
   check(final.blocks[3].type == "tool_use" and final.blocks[3].input.command == "ls", "tool_use input json assembled")
-  check(got.usage[1] == 15 and got.usage[2] == 55, "usage reported")
+  check(
+    got.usage[1] == 17 and got.usage[2] == 55 and got.usage[3] == 3 and got.usage[4].cache_write == 2,
+    "usage reports Anthropic cache reads and cache creation separately"
+  )
 
   -- prompt caching: rolling breakpoints on the two most recent messages so the
   -- static prefix + prior conversation are read from cache instead of re-billed.
@@ -120,6 +126,16 @@ do
   check(msgs[3].content[#msgs[3].content].cache_control ~= nil, "cache breakpoint on last message")
   check(msgs[2].content[#msgs[2].content].cache_control ~= nil, "cache breakpoint on second-to-last message")
   check(msgs[1].content[1].cache_control == nil, "older messages carry no breakpoint")
+
+  local signed = {
+    { role = "user", content = { { type = "text", text = "ordinary" } } },
+    { role = "assistant", content = { { type = "thinking", thinking = "secret", signature = "signed" } } },
+  }
+  anthropic._apply_message_cache(signed)
+  check(
+    signed[2].content[1].cache_control == nil and signed[1].content[1].cache_control ~= nil,
+    "anthropic cache breakpoints never mutate signed thinking blocks"
+  )
 end
 
 -- 3. openai handler -----------------------------------------------------------
@@ -168,7 +184,12 @@ do
     { type = "response.output_text.delta", delta = "on it" },
     {
       type = "response.output_item.done",
-      item = { type = "message", content = { { type = "output_text", text = "on it" } } },
+      item = {
+        type = "message",
+        id = "msg_1",
+        status = "completed",
+        content = { { type = "output_text", text = "on it" } },
+      },
     },
     { type = "response.completed", response = { usage = { input_tokens = 9, output_tokens = 21 } } },
   }
@@ -179,6 +200,11 @@ do
   check(final.blocks[1].type == "openai_reasoning", "reasoning item captured for replay")
   check(final.blocks[2].type == "tool_use" and final.blocks[2].input.path == "a.lua", "function_call → tool_use")
   check(final.blocks[3].type == "text" and final.blocks[3].text == "on it", "message → text block")
+  local replayed_message = openai._to_input_items({ { role = "assistant", content = { final.blocks[3] } } })[1]
+  check(
+    replayed_message and replayed_message.type == "message" and replayed_message.id == "msg_1",
+    "completed OpenAI message items replay byte-for-byte with their server id"
+  )
   check(got.usage[1] == 9 and got.usage[2] == 21, "usage reported")
 
   local items = openai._to_input_items({
@@ -208,7 +234,7 @@ do
     {
       role = "assistant",
       content = {
-        { type = "openai_reasoning", item = { type = "reasoning", encrypted_content = "stale" } },
+        { type = "openai_reasoning", item = { type = "reasoning", id = "rs_fresh", encrypted_content = "fresh" } },
         {
           type = "tool_use",
           id = "call_after",
@@ -225,8 +251,8 @@ do
     if item.type == "reasoning" then reasoning = reasoning + 1 end
     if item.type == "function_call" and item.id then id_leaks = id_leaks + 1 end
   end
-  check(reasoning == 0, "openai drops encrypted reasoning after compaction")
-  check(id_leaks == 0, "openai detaches stored function_call ids after compaction")
+  check(reasoning == 1, "openai preserves fresh reasoning generated after a compaction summary")
+  check(id_leaks == 1, "openai preserves fresh function-call ids generated after compaction")
 
   -- compaction itself must strip the item id from retained tool calls so the
   -- Responses API doesn't demand the reasoning item we removed.
@@ -260,6 +286,88 @@ do
     end
   end
   check(kept_id == nil, "compact detaches openai item ids from retained tool calls")
+
+  -- A token-limit stop is a usable partial response, not a transport failure.
+  -- Keep its completed output items and the authoritative usage breakdown.
+  local incomplete, incomplete_usage
+  local incomplete_handler = openai._make_handler({
+    text = function() end,
+    thinking = function() end,
+    tool_start = function() end,
+    usage = function(inp, out, cached, details)
+      incomplete_usage = { input = inp, output = out, cached = cached, details = details }
+    end,
+    complete = function(blocks, stop, usage)
+      incomplete = { blocks = blocks, stop = stop, usage = usage }
+    end,
+    error = function(msg)
+      incomplete = { error = msg }
+    end,
+  }, "high")
+  incomplete_handler("response.output_item.done", {
+    type = "response.output_item.done",
+    item = { type = "message", id = "msg_partial", content = { { type = "output_text", text = "partial" } } },
+  })
+  incomplete_handler("response.incomplete", {
+    type = "response.incomplete",
+    response = {
+      incomplete_details = { reason = "max_output_tokens" },
+      usage = {
+        input_tokens = 31,
+        output_tokens = 17,
+        input_tokens_details = { cached_tokens = 11, cache_write_tokens = 4 },
+        output_tokens_details = { reasoning_tokens = 9 },
+      },
+    },
+  })
+  check(
+    incomplete and not incomplete.error and incomplete.stop == "max_tokens" and incomplete.blocks[1].text == "partial",
+    "openai preserves completed output when response.incomplete hits the token cap"
+  )
+  check(
+    incomplete_usage
+      and incomplete_usage.cached == 11
+      and incomplete_usage.details.reasoning == 9
+      and incomplete_usage.details.cache_write == 4
+      and incomplete_usage.details.effort == "high",
+    "openai preserves cache, reasoning, and effective-effort usage details on incomplete responses"
+  )
+
+  -- Some streams end before output_item.done. Preserve the text deltas, but do
+  -- not execute a function_call that the server marks incomplete.
+  local cut
+  local cut_handler = openai._make_handler({
+    text = function() end,
+    thinking = function() end,
+    tool_start = function() end,
+    usage = function() end,
+    complete = function(blocks, stop)
+      cut = { blocks = blocks, stop = stop }
+    end,
+    error = function(msg)
+      cut = { error = msg }
+    end,
+  }, "high")
+  cut_handler("response.output_text.delta", { type = "response.output_text.delta", delta = "cut but useful" })
+  cut_handler("response.incomplete", {
+    type = "response.incomplete",
+    response = {
+      incomplete_details = { reason = "max_output_tokens" },
+      output = {
+        { type = "function_call", status = "incomplete", call_id = "half", name = "bash", arguments = '{"command":' },
+      },
+      usage = {},
+    },
+  })
+  check(
+    cut
+      and not cut.error
+      and cut.stop == "max_tokens"
+      and #cut.blocks == 1
+      and cut.blocks[1].type == "text"
+      and cut.blocks[1].text == "cut but useful",
+    "openai keeps undelimited partial text and never runs a truncated function call"
+  )
 end
 
 -- 4. tools ---------------------------------------------------------------------
@@ -374,6 +482,19 @@ do
     "validate_input allows empty-string required field"
   )
   check(tools.validate_input("read_file", { path = "p" }) == nil, "validate_input passes read_file with path")
+  local type_err = tools.validate_input("edit_file", { path = 42, old_string = "a", new_string = "b" })
+  check(
+    type_err and type_err:find("input.path must be string", 1, true),
+    "validate_input rejects malformed argument types before tool summaries or runners can crash"
+  )
+  local nested_type_err = tools.validate_input("multi_edit", {
+    path = "p",
+    edits = { { old_string = "a", new_string = 7 } },
+  })
+  check(
+    nested_type_err and nested_type_err:find("input.edits[1].new_string must be string", 1, true),
+    "validate_input recursively checks nested array item types"
+  )
 
   r = assert(run("bash", { command = "echo out; echo err >&2; exit 3" }))
   check(r:find("out") and r:find("err") and r:find("exit code 3"), "bash merges output + exit code")
@@ -812,6 +933,95 @@ do
   -- a clean encode proves the summary was truncated on a character boundary.
   check(summary_text ~= nil, "summary message present after the pinned turn")
   check(pcall(vim.fn.json_encode, summary_text), "compact truncates the summary on a UTF-8 character boundary")
+
+  -- Message count alone is not a safe proxy for context pressure: a handful of
+  -- giant reads/reasoning blocks can overflow the model while still sitting well
+  -- below keep_recent_messages.
+  local few_huge = {}
+  for i = 1, 4 do
+    few_huge[i] = {
+      role = i % 2 == 1 and "user" or "assistant",
+      content = { { type = "text", text = ("huge-%d "):format(i) .. string.rep("x", 12000) } },
+    }
+  end
+  local few_out, few_info = compact.compact(few_huge, {
+    compact_at_tokens = 100,
+    keep_recent_messages = 16,
+    keep_recent_tokens = 1000,
+    summary_max_chars = 1000,
+  })
+  check(
+    few_info and few_info.compacted_messages > 0 and few_info.after_tokens < few_info.before_tokens,
+    "token pressure compacts a few huge messages even below the message-count gate"
+  )
+  check(few_out[1].pinned == true, "few-message token-pressure compaction still pins the original task")
+
+  local measured = compact.estimate_tokens({
+    {
+      role = "assistant",
+      content = { { type = "thinking", thinking = "short", signature = "sig" } },
+      usage = { output = 5000 },
+    },
+  })
+  check(measured >= 5000, "token estimates never undercount provider-measured hidden reasoning output")
+
+  local image_message = {
+    role = "user",
+    pinned = true,
+    original_text = "inspect this screenshot",
+    content = {
+      { type = "image", source = { type = "base64", media_type = "image/png", data = string.rep("A", 1024 * 1024) } },
+      { type = "text", text = "inspect this screenshot" },
+    },
+  }
+  check(
+    compact.estimate_tokens({ image_message }) < 10000,
+    "vision estimates use a bounded image allowance instead of counting base64 as text tokens"
+  )
+  local image_history = { image_message }
+  for i = 2, 10 do
+    image_history[#image_history + 1] = {
+      role = i % 2 == 0 and "assistant" or "user",
+      content = { { type = "text", text = ("image follow-up %d "):format(i) .. string.rep("x", 200) } },
+    }
+  end
+  local image_out = select(1, compact.force(image_history, { keep_recent_messages = 2, summary_max_chars = 1200 }))
+  check(
+    image_out[1].content[1] and image_out[1].content[1].type == "image",
+    "compaction preserves a task-defining uploaded image in the pinned original turn"
+  )
+
+  local detached = select(
+    1,
+    compact.detach_provider_state({
+      {
+        role = "assistant",
+        content = {
+          { type = "openai_reasoning", item = { type = "reasoning", encrypted_content = string.rep("z", 1000) } },
+          { type = "text", text = "visible answer" },
+        },
+        usage = { output = 50000 },
+      },
+    })
+  )
+  check(
+    detached[1].usage == nil and compact.estimate_tokens(detached) < 1000,
+    "detaching private reasoning clears its stale measured-output token floor"
+  )
+
+  local aged = {}
+  for i = 1, 20 do
+    aged[i] = {
+      role = i % 2 == 1 and "user" or "assistant",
+      content = { { type = "text", text = ("AGED-%02d "):format(i) .. string.rep("q", 700) } },
+    }
+  end
+  local aged_out = select(1, compact.force(aged, { keep_recent_messages = 2, summary_max_chars = 1200 }))
+  local aged_summary = aged_out[2].content[1].text
+  check(
+    aged_summary:find("AGED%-18") ~= nil and aged_summary:find("AGED%-02") == nil,
+    "bounded heuristic summaries prioritize the newest aged-out work"
+  )
 end
 
 -- 4a2. LLM-summarized compaction ---------------------------------------------
@@ -880,10 +1090,7 @@ do
       end
     end
     check(next_messages and next_messages[1].pinned == true, "original task pinned verbatim through LLM compaction")
-    check(
-      llm_summary_text ~= nil,
-      "LLM summary still carries the shared SUMMARY_PREFIX (openai reasoning-drop detection depends on it)"
-    )
+    check(llm_summary_text ~= nil, "LLM summary still carries the shared SUMMARY_PREFIX")
     check(
       llm_summary_text and llm_summary_text:find("build a widget", 1, true) ~= nil,
       "model-written summary text is preserved"
@@ -893,8 +1100,34 @@ do
       "info reports llm mode and the resolved summarizer model"
     )
     check(info and info.usage and info.usage.input == 500, "info carries summarizer token usage")
-    check(seen_req and seen_req.model.thinking == false, "summarizer request disables thinking")
+    check(
+      seen_req and seen_req.model.thinking == false and seen_req.model.reasoning_effort == "medium",
+      "summarizer disables legacy thinking and uses the balanced medium compaction effort"
+    )
     local first_seen_req = seen_req
+
+    -- `inherit` must carry a live /effort override when the active model is also
+    -- the configured summarizer, not silently fall back to provider config.
+    summarize_calls = 0
+    local inherit_done = false
+    local inherit_opts = vim.tbl_extend("force", vim.deepcopy(config.options.context), {
+      summarizer_effort = "inherit",
+    })
+    compact.summarize_with_llm(make_messages(10), inherit_opts, function()
+      inherit_done = true
+    end, {
+      provider = "fakesummarizer",
+      id = "mini",
+      label = "mini",
+      reasoning_effort = "xhigh",
+    })
+    vim.wait(2000, function()
+      return inherit_done
+    end, 5)
+    check(
+      seen_req and seen_req.model.reasoning_effort == "xhigh",
+      "summarizer_effort=inherit preserves the active model's live effort override"
+    )
 
     local long_messages = {}
     for i = 1, 10 do
@@ -935,6 +1168,92 @@ do
     check(
       first_seen_req and first_seen_req.messages[1].content[1].text:find("turn 1 content", 1, true) == nil,
       "the pinned task is not re-sent to the summarizer"
+    )
+
+    local semantic_reqs = {}
+    providers.register("fakesemantic", {
+      stream = function(req)
+        semantic_reqs[#semantic_reqs + 1] = req
+        vim.schedule(function()
+          req.on.complete({ { type = "text", text = "Primary Request: retained semantic state." } }, "end_turn")
+        end)
+        return { stop = function() end }
+      end,
+    })
+    local semantic_opts = vim.tbl_extend("force", vim.deepcopy(config.options.context), {
+      summarizer_model = "fakesemantic/mini",
+    })
+    local semantic_messages = make_messages(10)
+    semantic_messages[2].content = {
+      { type = "thinking", thinking = "READABLE-THINK", signature = "OPAQUE-SIGNATURE" },
+      {
+        type = "openai_reasoning",
+        item = {
+          type = "reasoning",
+          encrypted_content = "OPAQUE-CIPHER",
+          summary = { { type = "summary_text", text = "READABLE-REASONING-SUMMARY" } },
+        },
+      },
+    }
+    local semantic_done = false
+    compact.summarize_with_llm(semantic_messages, semantic_opts, function()
+      semantic_done = true
+    end)
+    vim.wait(2000, function()
+      return semantic_done
+    end, 5)
+    local semantic_text = semantic_reqs[1] and semantic_reqs[1].messages[1].content[1].text or ""
+    check(
+      semantic_text:find("READABLE%-THINK")
+        and semantic_text:find("READABLE%-REASONING%-SUMMARY")
+        and not semantic_text:find("OPAQUE%-SIGNATURE")
+        and not semantic_text:find("OPAQUE%-CIPHER"),
+      "LLM compaction serializes readable reasoning but never opaque signatures/ciphertext"
+    )
+
+    local tail_messages = {}
+    for i = 1, 80 do
+      tail_messages[i] = {
+        role = i % 2 == 1 and "user" or "assistant",
+        content = { { type = "text", text = ("LLM-AGED-%02d "):format(i) .. string.rep("w", 7000) } },
+      }
+    end
+    local tail_done = false
+    compact.summarize_with_llm(tail_messages, semantic_opts, function()
+      tail_done = true
+    end)
+    vim.wait(2000, function()
+      return tail_done
+    end, 5)
+    local tail_text = semantic_reqs[2] and semantic_reqs[2].messages[1].content[1].text or ""
+    check(
+      tail_text:find("LLM%-AGED%-76") and not tail_text:find("LLM%-AGED%-02"),
+      "bounded LLM transcript serialization preserves the newest aged-out work"
+    )
+  end
+
+  do
+    providers.register("fakesummarizertruncated", {
+      stream = function(req)
+        vim.schedule(function()
+          req.on.complete({ { type = "text", text = "Primary Request only; tail was cut" } }, "max_tokens")
+        end)
+        return { stop = function() end }
+      end,
+    })
+    local truncated_opts = vim.tbl_extend("force", vim.deepcopy(config.options.context), {
+      summarizer_model = "fakesummarizertruncated/mini",
+    })
+    local truncated_done, truncated_info = false, nil
+    compact.summarize_with_llm(make_messages(10), truncated_opts, function(_, info)
+      truncated_info, truncated_done = info, true
+    end)
+    vim.wait(2000, function()
+      return truncated_done
+    end, 5)
+    check(
+      truncated_info and truncated_info.mode == "heuristic" and truncated_info.reason == "llm_summary_truncated",
+      "token-truncated LLM summaries are rejected in favor of a complete heuristic summary"
     )
   end
 
@@ -1101,6 +1420,14 @@ do
       rt({ compact_at_tokens = 120000, compact_fraction = 0.75 }, { context_window = 200000 }) == 120000,
       "an explicit smaller cap wins over the window fraction"
     )
+    check(
+      rt(
+        { compact_at_tokens = 200000, compact_fraction = 0.75, request_safety_tokens = 8000 },
+        { context_window = 200000 },
+        70000
+      ) == 122000,
+      "threshold reserves output plus the static request prefix before the provider context limit"
+    )
 
     local krt = compact.resolve_keep_recent_tokens
     check(krt({ keep_recent_fraction = 0.4 }, 200000) == 80000, "recent budget = keep_recent_fraction × threshold")
@@ -1128,12 +1455,14 @@ do
     )
   end
 
-  -- regression: cancelling a session must not permanently disable auto-compact.
-  -- self.job:stop() never invokes the summarizer's completion callback, which
-  -- is otherwise the only place _compacting gets cleared.
+  -- Regression: cancelling must invalidate late callbacks and must not leave the
+  -- agent unable to run a fresh manual compaction. A stopped provider is allowed
+  -- to race one already-scheduled callback, so explicitly deliver one here.
   do
+    local hanging_req, cancelled_callback = nil, false
     providers.register("fakesummarizerhang", {
       stream = function(req)
+        hanging_req = req
         return { stop = function() end }
       end,
     })
@@ -1141,10 +1470,28 @@ do
 
     local ag5 = agent_mod.new({ model = { provider = "fakesummarizerhang", id = "mini", label = "mini" } })
     ag5.messages = make_messages(10)
-    ag5:compact({ mode = "llm" }, function() end)
+    ag5:compact({ mode = "llm" }, function()
+      cancelled_callback = true
+    end)
     check(ag5._compacting == true, "compaction is in flight before cancellation")
     ag5:cancel()
     check(ag5._compacting == false, "cancel() resets _compacting so a stuck LLM compaction doesn't wedge auto-compact")
+
+    local fresh_info
+    ag5:compact({ mode = "heuristic" }, function(info)
+      fresh_info = info
+    end)
+    check(
+      fresh_info ~= nil and ag5.status == "idle" and ag5.cancelled == false,
+      "a fresh manual compaction succeeds immediately after cancellation"
+    )
+    local after_fresh = vim.json.encode(ag5.messages)
+    hanging_req.on.complete({ { type = "text", text = "STALE SUMMARY MUST NOT LAND" } }, "end_turn")
+    vim.wait(20)
+    check(
+      not cancelled_callback and vim.json.encode(ag5.messages) == after_fresh,
+      "a late callback from the cancelled epoch cannot overwrite fresh compacted history"
+    )
   end
 
   -- regression: _turn() must wait for an async auto-compact to finish before
@@ -1188,6 +1535,55 @@ do
     config.options.context.auto_compact_mode = nil
     config.options.context.compact_at_tokens = nil
   end
+
+  -- A synchronously rejected summarizer can invoke the fallback and start the
+  -- main request before summarize_with_llm returns. Its wrapper must not replace
+  -- the main request's cancellable handle afterward.
+  do
+    local main_handle = { kind = "main", stop = function() end }
+    providers.register("fakesyncmain", {
+      stream = function()
+        return main_handle
+      end,
+    })
+    providers.register("fakesyncfail", {
+      stream = function(req)
+        req.on.error("synchronous summary rejection")
+        return { kind = "stale-summary", stop = function() end }
+      end,
+    })
+    config.options.context.summarizer_model = "fakesyncfail/mini"
+    config.options.context.auto_compact_mode = "llm"
+    config.options.context.compact_at_tokens = 1
+    local ag7 = agent_mod.new({ model = { provider = "fakesyncmain", id = "mini", label = "mini" } })
+    ag7.messages = make_messages(10)
+    ag7:_turn()
+    check(ag7.job == main_handle, "synchronous summarizer failure cannot overwrite the live main-request handle")
+    ag7:cancel()
+    config.options.context.auto_compact_mode = nil
+    config.options.context.compact_at_tokens = nil
+  end
+
+  -- Manual compaction must be durable even when the user quits immediately
+  -- afterward, before another turn reaches Agent:_finish().
+  do
+    local session = require("advantage.session")
+    local old_dir, old_autosave = session._dir_override, config.options.sessions.autosave
+    session._dir_override = vim.fn.tempname()
+    config.options.sessions.autosave = true
+    local persisted = agent_mod.new({ model = { provider = "fakesummarizer", id = "mini", label = "mini" } })
+    persisted.messages = make_messages(10)
+    local compact_done = false
+    persisted:compact({ mode = "heuristic" }, function(info)
+      compact_done = info ~= nil
+    end)
+    local saved_sessions = session.list(persisted.ctx.cwd)
+    check(
+      compact_done and #saved_sessions > 0 and #saved_sessions[1].messages == #persisted.messages,
+      "manual compaction autosaves the compacted transcript before an immediate quit"
+    )
+    session._dir_override, config.options.sessions.autosave = old_dir, old_autosave
+  end
 end
 
 -- 4b. sub-agent tool -------------------------------------------------------------
@@ -1196,6 +1592,26 @@ section("sub-agent")
 do
   local providers = require("advantage.providers")
   local tools = require("advantage.tools")
+  local config = require("advantage.config")
+  local enabled = config.options.subagents.enabled
+  config.options.subagents.enabled = false
+  local exposed = false
+  for _, schema in ipairs(tools.schemas()) do
+    if schema.name == "sub_agent" then exposed = true end
+  end
+  config.options.subagents.enabled = enabled
+  check(not exposed, "sub_agent is removed from the model schema when disabled")
+  local bad_model_result, bad_model_error
+  require("advantage.subagent").run({ prompt = "inspect", model = "not-a-ref" }, {
+    cwd = vim.uv.cwd(),
+    model = { provider = "fakesub", id = "model", label = "fake sub" },
+  }, function(out, is_error)
+    bad_model_result, bad_model_error = out, is_error
+  end)
+  check(
+    bad_model_error == true and tostring(bad_model_result):find("Invalid sub-agent model ref", 1, true),
+    "an invalid explicit scout model never silently falls back to the parent"
+  )
   local tmp = vim.fn.tempname()
   vim.fn.mkdir(tmp, "p")
   vim.fn.writefile({ "subagent evidence" }, tmp .. "/note.txt")
@@ -1395,41 +1811,137 @@ do
   local o_auto =
     openai._build_body(config.options.providers.openai, { model = { id = "m" }, messages = {}, tools = tool })
   check(o_auto.tool_choice == "auto", "openai defaults to 'auto' when tools exist and no tool_choice given")
+  local o_parallel = openai._build_body(config.options.providers.openai, {
+    model = { id = "m" },
+    messages = {},
+    tools = tool,
+    parallel_tool_calls = true,
+  })
+  check(o_parallel.parallel_tool_calls == true, "openai permits same-turn parallel tool calls when requested")
+  local o_serial = openai._build_body(config.options.providers.openai, {
+    model = { id = "m" },
+    messages = {},
+    tools = tool,
+    parallel_tool_calls = false,
+  })
+  check(o_serial.parallel_tool_calls == false, "openai can explicitly disable same-turn parallel tool calls")
 end
 
--- 4b. sub-agent read-only bash validator ---------------------------------------
+-- 4b-tc2. provider/model-aware thinking and effort matrix ----------------------
 
-section("sub-agent read-only bash")
+section("provider effort matrix")
 do
-  local reject = require("advantage.subagent")._reject_bash
-  local allow = {
-    ls = true,
-    cat = true,
-    grep = true,
-    rg = true,
-    find = true,
-    wc = true,
-    git = true,
-    sed = true,
-    awk = true,
-    head = true,
-    tail = true,
-    echo = true,
-    sort = true,
-  }
-  local function ok(cmd)
-    return reject(cmd, allow) == nil
+  local anthropic = require("advantage.providers.anthropic")
+  local openai = require("advantage.providers.openai")
+  local config = require("advantage.config")
+  local effort = require("advantage.effort")
+  local pcfg = config.options.providers.anthropic
+  local system = { { type = "text", text = "sys" } }
+  local messages = { { role = "user", content = { { type = "text", text = "hi" } } } }
+
+  local function anthropic_body(model)
+    return anthropic._build_body(pcfg, { model = model, messages = messages, tools = {} }, system)
   end
-  check(ok("grep -rn foo ."), "read-only bash allows grep")
-  check(ok("rg pat | head -20"), "read-only bash allows piped inspection")
-  check(ok("git log --oneline -5"), "read-only bash allows git log")
-  check(not ok("echo hi > out.txt"), "read-only bash rejects output redirection")
-  check(not ok("cat $(which sh)"), "read-only bash rejects command substitution")
-  check(not ok("git commit -m x"), "read-only bash rejects mutating git")
-  check(not ok("rm -rf ."), "read-only bash rejects non-allow-listed command")
-  check(not ok("find . -delete"), "read-only bash rejects find -delete")
-  check(not ok("sed -i s/a/b/ f"), "read-only bash rejects sed -i")
-  check(not ok("cat a | tee b"), "read-only bash rejects tee")
+
+  local opus = assert(config.resolve_model("anthropic/claude-opus-4-8"))
+  local label, err = effort.set_anthropic(opus, "xhigh")
+  local opus_body = anthropic_body(opus)
+  check(
+    label ~= nil
+      and err == nil
+      and opus_body.thinking
+      and opus_body.thinking.type == "adaptive"
+      and opus_body.thinking.budget_tokens == nil
+      and opus_body.output_config.effort == "xhigh",
+    "Opus 4.8 maps xhigh to adaptive thinking plus output_config.effort (never a fixed budget)"
+  )
+
+  local sonnet = assert(config.resolve_model("anthropic/claude-sonnet-5"))
+  label, err = effort.set_anthropic(sonnet, "off")
+  local sonnet_body = anthropic_body(sonnet)
+  check(
+    label ~= nil and err == nil and sonnet_body.thinking and sonnet_body.thinking.type == "disabled",
+    "Sonnet 5 sends explicit thinking.disabled because omission would keep default adaptive thinking on"
+  )
+
+  local fable = assert(config.resolve_model("anthropic/claude-fable-5"))
+  label, err = effort.set_anthropic(fable, "off")
+  check(label == nil and type(err) == "string", "Fable 5 does not offer an unsupported thinking-off mode")
+  assert(effort.set_anthropic(fable, "high"))
+  local fable_body = anthropic_body(fable)
+  check(
+    fable_body.thinking == nil and fable_body.output_config and fable_body.output_config.effort == "high",
+    "Fable 5 controls always-on native thinking through output_config.effort without a rejected thinking object"
+  )
+
+  local haiku = assert(config.resolve_model("anthropic/claude-haiku-4-5"))
+  assert(effort.set_anthropic(haiku, "medium"))
+  local haiku_body = anthropic_body(haiku)
+  check(
+    haiku_body.thinking
+      and haiku_body.thinking.type == "enabled"
+      and haiku_body.thinking.budget_tokens == 4096
+      and haiku_body.output_config == nil,
+    "Haiku 4.5 retains the legacy fixed-budget thinking path"
+  )
+
+  local sol = assert(config.resolve_model("openai/gpt-5.6-sol"))
+  local luna = assert(config.resolve_model("openai/gpt-5.6-luna"))
+  local chatgpt_sol = effort.openai_levels(sol, "chatgpt")
+  local api_sol = effort.openai_levels(sol, "api_key")
+  check(
+    vim.tbl_contains(chatgpt_sol, "ultra") and not vim.tbl_contains(chatgpt_sol, "none"),
+    "ChatGPT-login Sol exposes subscription-native ultra but not raw-API none"
+  )
+  check(
+    vim.tbl_contains(api_sol, "none") and not vim.tbl_contains(api_sol, "ultra"),
+    "raw-API Sol exposes explicit none but not subscription-only ultra"
+  )
+  check(
+    not vim.tbl_contains(effort.openai_levels(luna, "chatgpt"), "ultra"),
+    "Luna does not inherit Sol/Terra's unsupported ultra level"
+  )
+  local gpt55 = assert(config.resolve_model("openai/gpt-5.5"))
+  local sol_login, sol_login_err = effort.resolve_openai(sol, "chatgpt", "ultra")
+  local luna_login, luna_login_err = effort.resolve_openai(luna, "chatgpt", "ultra")
+  local gpt55_login, gpt55_login_err = effort.resolve_openai(gpt55, "chatgpt", "ultra")
+  local sol_api, sol_api_err = effort.resolve_openai(sol, "api_key", "ultra")
+  check(
+    sol_login == "ultra"
+      and sol_login_err == nil
+      and luna_login == "max"
+      and luna_login_err == nil
+      and gpt55_login == "xhigh"
+      and gpt55_login_err == nil
+      and sol_api == "max"
+      and sol_api_err == nil,
+    "inherited provider ultra clamps to each model/transport maximum without weakening Sol login"
+  )
+  local explicit_api_sol = vim.deepcopy(sol)
+  explicit_api_sol.reasoning_effort = "ultra"
+  local explicit_value, explicit_err = effort.resolve_openai(explicit_api_sol, "api_key", "ultra")
+  check(
+    explicit_value == nil and type(explicit_err) == "string" and explicit_err:find("explicit model override", 1, true),
+    "an explicit unsupported per-model effort remains an error instead of being clamped"
+  )
+
+  local none_body = openai._build_body(config.options.providers.openai, {
+    model = { id = "gpt-5.6-sol", reasoning_effort = "none" },
+    messages = messages,
+    tools = {},
+  })
+  check(
+    none_body.reasoning.effort == "none" and none_body.reasoning.summary == nil and none_body.include == nil,
+    "OpenAI reasoning-off is sent explicitly as none and suppresses summary/encrypted-reasoning requests"
+  )
+
+  local unknown = { id = "claude-future-unannotated" }
+  local unknown_items = effort.anthropic_items(unknown)
+  local unknown_body = anthropic_body(unknown)
+  check(
+    #unknown_items == 1 and unknown_items[1].value == "default" and unknown_body.thinking == nil,
+    "unknown Claude IDs omit generation-specific thinking knobs until capabilities are declared"
+  )
 end
 
 -- 4c. auth handles null-bearing credential files -------------------------------
@@ -1534,8 +2046,11 @@ do
     "request targets the configured OpenAI/Codex summarizer model"
   )
   check(
-    captured_body and captured_body.reasoning and captured_body.reasoning.effort == "minimal",
-    "codex summarizer forces minimal reasoning effort (thinking=false alone does nothing for openai)"
+    captured_body
+      and captured_body.reasoning
+      and captured_body.reasoning.effort == "medium"
+      and captured_body.reasoning.summary == nil,
+    "raw-API summarizer uses balanced medium reasoning and suppresses discarded reasoning summaries"
   )
   local codex_summary
   for _, m in ipairs(next_messages or {}) do
@@ -1554,8 +2069,8 @@ do
   local auto =
     compact._resolve_summarizer(config.defaults.context, { provider = "openai", id = "gpt-5.1-codex", label = "codex" })
   check(
-    auto and auto.provider == "openai" and auto.id == "gpt-5.6-luna",
-    "auto summarizer uses GPT-5.6 Luna for an OpenAI/Codex model"
+    auto and auto.provider == "openai" and auto.id == "gpt-5.1-codex",
+    "OpenAI auto-compaction uses the active model"
   )
   local auto_anthropic = compact._resolve_summarizer(
     config.defaults.context,
@@ -1565,6 +2080,74 @@ do
     auto_anthropic and auto_anthropic.provider == "anthropic" and auto_anthropic.id == "claude-haiku-4-5",
     "auto summarizer uses Haiku for an Anthropic model"
   )
+
+  -- ChatGPT login catalogs can expose the active flagship while rejecting a
+  -- configured sibling. A 404 for Luna must retry once with the active login
+  -- model at its inherited quality level instead of dropping straight to the heuristic.
+  do
+    local auth = require("advantage.auth")
+    local original_auth = auth.openai
+    local original_request = util.request_sse
+    local bodies = {}
+    ---@diagnostic disable-next-line: duplicate-set-field
+    auth.openai = function(cb)
+      cb({ mode = "chatgpt", token = "login-token", account_id = "acct", badge = "codex" })
+    end
+    ---@diagnostic disable-next-line: duplicate-set-field
+    util.request_sse = function(opts)
+      local body = vim.json.decode(opts.body)
+      bodies[#bodies + 1] = body
+      vim.schedule(function()
+        if body.model == "gpt-5.6-luna" then
+          opts.on_error("HTTP 404: Model not found gpt-5.6-luna", 404)
+        else
+          opts.on_event("response.output_item.done", {
+            type = "response.output_item.done",
+            item = {
+              type = "message",
+              id = "fallback-summary",
+              content = { { type = "output_text", text = "Primary Request and Intent: preserve login fallback." } },
+            },
+          })
+          opts.on_event("response.completed", {
+            type = "response.completed",
+            response = { usage = { input_tokens = 300, output_tokens = 40 } },
+          })
+        end
+      end)
+      return { stop = function() end }
+    end
+
+    local fallback_done, fallback_info, fallback_err = false, nil, nil
+    local active = assert(config.resolve_model("openai/gpt-5.6-sol"))
+    compact.summarize_with_llm(make_messages(10), config.options.context, function(_, i, e)
+      fallback_info, fallback_err, fallback_done = i, e, true
+    end, active)
+    vim.wait(2000, function()
+      return fallback_done
+    end, 5)
+    auth.openai = original_auth
+    util.request_sse = original_request
+
+    check(
+      fallback_done
+        and fallback_err == nil
+        and #bodies == 2
+        and bodies[1].model == "gpt-5.6-luna"
+        and bodies[2].model == "gpt-5.6-sol",
+      "Luna 404 on ChatGPT login retries exactly once with the active Sol model"
+    )
+    check(
+      bodies[1]
+        and bodies[2]
+        and bodies[1].reasoning.effort == "medium"
+        and bodies[2].reasoning.effort == "medium"
+        and fallback_info
+        and fallback_info.model.id == "gpt-5.6-sol"
+        and fallback_info.fallback_from == "gpt-5.6 luna",
+      "login-model fallback preserves balanced compaction effort and reports both selected and unavailable models"
+    )
+  end
 end
 
 -- 5. agent e2e with a fake provider + UI ----------------------------------------
@@ -2120,6 +2703,42 @@ do
   check(all_indexed == 3, "all skills remain in the full index / hintable regardless of the display cap")
   config.options.memory.skills_index_budget_tokens = 1200
 
+  -- Repo-controlled runbooks are indexed from bounded frontmatter and their
+  -- bodies are capped before entering the model-visible tool result.
+  config.options.memory.skill_body_budget_tokens = 256 -- 1 KiB body cap
+  local oversized_dir = tmp .. "/.advantage/skills/oversized"
+  vim.fn.mkdir(oversized_dir, "p")
+  vim.fn.writefile({
+    "---",
+    "name: oversized",
+    "description: deliberately large external skill",
+    "---",
+    "",
+    string.rep("body-data ", 800),
+  }, oversized_dir .. "/SKILL.md")
+  local oversized = select(1, memory.use_skill("oversized"))
+  check(
+    oversized and #oversized <= 1024 and oversized:find("skill body truncated", 1, true) ~= nil,
+    "use_skill caps an oversized repo-controlled body before transcript injection"
+  )
+  local saved_large, large_err = memory.save_skill("too-large", "too large", string.rep("x", 1100))
+  check(
+    not saved_large and tostring(large_err):find("safety limit", 1, true),
+    "save_skill rejects a body beyond its load budget"
+  )
+  vim.fn.delete(oversized_dir, "rf")
+  config.options.memory.skill_body_budget_tokens = nil
+
+  -- Import expansion reads a repeated file once and does not duplicate its full
+  -- contents into the always-loaded prompt block.
+  vim.fn.writefile({ "shared project guidance" }, tmp .. "/shared.md")
+  vim.fn.writefile({ "@shared.md", "@shared.md" }, tmp .. "/AGENTS.md")
+  local imported = memory.render()
+  check(imported:find("shared project guidance", 1, true) ~= nil, "project memory expands a contained @import")
+  check(imported:find("duplicate @shared.md omitted", 1, true) ~= nil, "project memory deduplicates repeated @imports")
+  vim.fn.delete(tmp .. "/AGENTS.md")
+  vim.fn.delete(tmp .. "/shared.md")
+
   -- gated off injects nothing
   config.options.memory.enabled = false
   check(memory.render() == "", "disabled memory injects nothing")
@@ -2155,10 +2774,11 @@ do
     end,
   })
 
-  local pturn, final_results = 0, nil
+  local pturn, final_results, requested_parallel = 0, nil, nil
   providers.register("fakepar", {
     stream = function(req)
       pturn = pturn + 1
+      if pturn == 1 then requested_parallel = req.parallel_tool_calls end
       vim.defer_fn(function()
         if pturn == 1 then
           req.on.complete({
@@ -2190,6 +2810,7 @@ do
   end, 10)
 
   check(sub_started == 3, "all three sub-agents ran")
+  check(requested_parallel == true, "main-agent provider request permits parallel tool calls")
   check(max_concurrent >= 2, "sub-agents overlapped instead of running one-at-a-time")
   check(final_results and #final_results == 3, "three tool_results merged into one user turn")
   local ids = {}
@@ -2724,6 +3345,18 @@ do
   vim.fn.delete(repo .. "/.advantage/style.md")
   vim.fn.delete(repo .. "/.advantage/rules.md")
 
+  config.options.memory.config_budget_tokens = 16
+  vim.fn.writefile({ string.rep("untrusted-config ", 200) }, repo .. "/.advantage/large.md")
+  local capped_docs = memory.config_docs()
+  check(
+    #capped_docs == 1
+      and #capped_docs[1].text <= 400
+      and capped_docs[1].text:find("config doc truncated", 1, true) ~= nil,
+    "config docs are bounded while reading, before prompt injection"
+  )
+  vim.fn.delete(repo .. "/.advantage/large.md")
+  config.options.memory.config_budget_tokens = nil
+
   vim.fn.chdir(prev_cwd)
   memory._root_override = MEMTMP
 end
@@ -2905,14 +3538,45 @@ do
   check(
     gpt56["openai/gpt-5.6-sol"]
       and gpt56["openai/gpt-5.6-sol"].label == "gpt-5.6 sol"
-      and gpt56["openai/gpt-5.6-sol"].context_window == 1050000
+      and gpt56["openai/gpt-5.6-sol"].context_window == 372000
+      and gpt56["openai/gpt-5.6-sol"].api_context_window == 1050000
+      and gpt56["openai/gpt-5.6-sol"].max_output_tokens == 128000
       and gpt56["openai/gpt-5.6-terra"]
       and gpt56["openai/gpt-5.6-terra"].label == "gpt-5.6 terra"
-      and gpt56["openai/gpt-5.6-terra"].context_window == 1050000
+      and gpt56["openai/gpt-5.6-terra"].context_window == 372000
+      and gpt56["openai/gpt-5.6-terra"].api_context_window == 1050000
       and gpt56["openai/gpt-5.6-luna"]
       and gpt56["openai/gpt-5.6-luna"].label == "gpt-5.6 luna"
-      and gpt56["openai/gpt-5.6-luna"].context_window == 1050000,
-    "default model picker includes the complete GPT-5.6 family with documented context windows"
+      and gpt56["openai/gpt-5.6-luna"].context_window == 372000
+      and gpt56["openai/gpt-5.6-luna"].api_context_window == 1050000,
+    "GPT-5.6 metadata separates the 372k ChatGPT-login window from the 1.05M raw-API window"
+  )
+  local transport_model = {
+    provider = "openai",
+    context_window = 372000,
+    api_context_window = 1050000,
+  }
+  local saved_auth_mode = config.options.providers.openai.auth_mode
+  -- Earlier e2e coverage intentionally replaces the live model list with a fake
+  -- one; construct the built-in metadata explicitly so this remains order-proof.
+  local output_model = vim.tbl_extend("force", vim.deepcopy(gpt56["openai/gpt-5.6-sol"]), {
+    provider = "openai",
+    id = "gpt-5.6-sol",
+  })
+  config.options.providers.openai.auth_mode = "chatgpt"
+  local login_window = config.effective_context_window(transport_model)
+  local login_output_reserve = config.request_output_reserve_tokens(output_model)
+  config.options.providers.openai.auth_mode = "api_key"
+  local api_window = config.effective_context_window(transport_model)
+  local api_output_reserve = config.request_output_reserve_tokens(output_model)
+  config.options.providers.openai.auth_mode = saved_auth_mode
+  check(
+    login_window == 372000 and api_window == 1050000,
+    "effective context budgeting follows the selected OpenAI transport"
+  )
+  check(
+    login_output_reserve == 128000 and api_output_reserve == 64000,
+    "output reservation uses the native ChatGPT maximum but the configured raw-API cap"
   )
 
   config.setup({ models = { { ref = "openai/gpt-5.5", label = "only one" } } })
@@ -2944,6 +3608,24 @@ do
   check(
     vim.tbl_contains(errs, "context.auto_compact_mode must be 'llm' or 'heuristic'"),
     "validation reports malformed auto_compact_mode"
+  )
+  errs = config._validate(vim.tbl_extend("force", vim.deepcopy(config.defaults), {
+    subagents = vim.tbl_extend("force", vim.deepcopy(config.defaults.subagents), { max_parallel = "many" }),
+  }))
+  check(
+    vim.tbl_contains(errs, "subagents.max_parallel must be a positive integer"),
+    "validation rejects malformed sub-agent concurrency limits"
+  )
+  local malformed = vim.deepcopy(config.defaults)
+  malformed.providers.openai = false
+  malformed.subagents.max_per_turn = 0
+  malformed.subagents.max_output_tokens = "huge"
+  errs = config._validate(malformed)
+  check(
+    vim.tbl_contains(errs, "providers.openai must be a table")
+      and vim.tbl_contains(errs, "subagents.max_per_turn must be a positive integer")
+      and vim.tbl_contains(errs, "subagents.max_output_tokens must be a positive integer"),
+    "validation rejects malformed nested provider and cumulative/output scout controls"
   )
 
   config.options = saved
@@ -2998,7 +3680,7 @@ do
     local session = require("advantage.session")
     local dir = vim.fn.stdpath("data") .. "/advantage/sessions"
     vim.fn.mkdir(dir, "p", "0700")
-    local key = vim.fn.sha256((vim.uv or vim.loop).cwd() or ""):sub(1, 12)
+    local key = session._project_key((vim.uv or vim.loop).cwd())
     local tmp = dir .. "/" .. key .. "-hardening-bogus.json.tmp"
     local f = assert(io.open(tmp, "w"))
     f:write('{"title":"HARDENING_BOGUS","messages":[{"role":"user","content":[]}]}')
@@ -3010,6 +3692,51 @@ do
       if s.title == "HARDENING_BOGUS" then has_bogus = true end
     end
     check(not has_bogus, "session.list ignores .json.tmp crash-leftovers")
+  end
+
+  -- Persisted ids are untrusted JSON, not filename components. Hash them and
+  -- repair the private directory mode even when an older install created it loose.
+  do
+    local session = require("advantage.session")
+    local tmp = vim.fn.tempname()
+    vim.fn.mkdir(tmp, "p");
+    (vim.uv or vim.loop).fs_chmod(tmp, 493) -- 0755
+    session._dir_override = tmp
+    local raw_id = "../../tampered/session"
+    local saved = session.save({
+      id = raw_id,
+      title = "unsafe id",
+      model = { provider = "fake", id = "m" },
+      messages = {},
+      usage = {},
+      ctx = { cwd = (vim.uv or vim.loop).cwd() },
+    })
+    local names = {}
+    for name in vim.fs.dir(tmp) do
+      if name:sub(-5) == ".json" then names[#names + 1] = name end
+    end
+    local mode = bit.band(((vim.uv or vim.loop).fs_stat(tmp) or {}).mode or 0, 511)
+    check(saved == true and #names == 1, "session save accepts a persisted id through an opaque filename token")
+    check(
+      not names[1]:find("tampered", 1, true) and not names[1]:find("/", 1, true),
+      "session filename never embeds the raw id"
+    )
+    check(session._filename_token(raw_id):match("^[0-9a-f]+$") ~= nil, "session filename token is deterministic hex")
+    local fresh_a, fresh_b = session.new_id(), session.new_id()
+    check(
+      fresh_a ~= fresh_b and fresh_a:match("^[0-9a-f-]+$") ~= nil,
+      "fresh session ids are unique without relying on the global RNG seed"
+    )
+    check(mode == 448, "session storage repairs an existing directory to mode 0700")
+    local repo = tmp .. "/repo"
+    vim.fn.mkdir(repo .. "/.git", "p")
+    vim.fn.mkdir(repo .. "/src/deep", "p")
+    check(
+      session._project_key(repo) == session._project_key(repo .. "/src/deep"),
+      "session scope is stable across subdirectories of the same git project"
+    )
+    session._dir_override = nil
+    vim.fn.delete(tmp, "rf")
   end
 
   -- read_file refuses a binary file instead of streaming raw bytes into the body.
@@ -3041,6 +3768,86 @@ do
     check((vim.uv or vim.loop).fs_stat(tmp .. "/out.txt.adv.tmp") == nil, "atomic write leaves no .adv.tmp leftover")
   end
 
+  -- Agent writes must never silently replace an unsaved editor buffer. The
+  -- dirty buffer is the user's authoritative version until they save/discard it.
+  do
+    local tools = require("advantage.tools")
+    local tmp = vim.fn.tempname()
+    vim.fn.mkdir(tmp, "p")
+    local path = tmp .. "/dirty.txt"
+    vim.fn.writefile({ "disk version" }, path)
+    local buf = vim.fn.bufadd(path)
+    vim.fn.bufload(buf)
+    vim.api.nvim_buf_set_lines(buf, 0, -1, false, { "unsaved editor version" })
+    vim.bo[buf].modified = true
+    local result, is_err
+    tools.get("write_file").run({ path = "dirty.txt", content = "agent overwrite\n" }, { cwd = tmp }, function(out, err)
+      result, is_err = out, err
+    end)
+    check(
+      is_err == true and result and result:find("unsaved Neovim changes", 1, true),
+      "write_file refuses to overwrite a dirty Neovim buffer"
+    )
+    check(vim.fn.readfile(path)[1] == "disk version", "dirty-buffer refusal leaves the on-disk file unchanged")
+    vim.api.nvim_buf_delete(buf, { force = true })
+  end
+
+  -- Dirty-buffer identity follows symlinks: opening the real path and editing
+  -- through an alias must not bypass the unsaved-buffer refusal.
+  do
+    local uv = vim.uv or vim.loop
+    local tools = require("advantage.tools")
+    local support = require("advantage.tools.support")
+    local tmp = vim.fn.tempname()
+    vim.fn.mkdir(tmp, "p")
+    local real, alias = tmp .. "/real.txt", tmp .. "/alias.txt"
+    vim.fn.writefile({ "disk version" }, real)
+    local linked = uv.fs_symlink("real.txt", alias)
+    if linked then
+      local buf = vim.fn.bufadd(real)
+      vim.fn.bufload(buf)
+      vim.api.nvim_buf_set_lines(buf, 0, -1, false, { "unsaved through real path" })
+      vim.bo[buf].modified = true
+      local result, is_err
+      tools
+        .get("write_file")
+        .run({ path = "alias.txt", content = "agent overwrite\n" }, { cwd = tmp }, function(out, err)
+          result, is_err = out, err
+        end)
+      check(
+        support.read_all(alias):find("unsaved through real path", 1, true) ~= nil,
+        "dirty reads resolve a symlink alias to its loaded buffer"
+      )
+      check(
+        is_err == true and result:find("unsaved Neovim changes", 1, true),
+        "dirty write refusal catches a symlink alias"
+      )
+      check((uv.fs_lstat(alias) or {}).type == "link", "refused dirty alias write preserves the symlink")
+      vim.api.nvim_buf_delete(buf, { force = true })
+    else
+      check(true, "dirty-buffer symlink alias is protected (skipped: no symlink support)")
+      check(true, "dirty alias write is refused (skipped: no symlink support)")
+      check(true, "refused alias write preserves the symlink (skipped: no symlink support)")
+    end
+    vim.fn.delete(tmp, "rf")
+  end
+
+  -- Atomic replacement must restore an existing file's exact mode after open(2)
+  -- applies the process umask to the temporary inode.
+  do
+    local uv = vim.uv or vim.loop
+    local support = require("advantage.tools.support")
+    local tmp = vim.fn.tempname()
+    vim.fn.mkdir(tmp, "p")
+    local path = tmp .. "/mode.txt"
+    vim.fn.writefile({ "before" }, path)
+    uv.fs_chmod(path, 438) -- 0666; a normal 0022 umask would reduce a new temp to 0644
+    local ok = support.write_all(path, "after\n")
+    local mode = bit.band((uv.fs_stat(path) or {}).mode or 0, 511)
+    check(ok == true and mode == 438, "atomic write preserves existing mode despite umask")
+    vim.fn.delete(tmp, "rf")
+  end
+
   -- anthropic sanitize drops a tool_result whose tool_use was compacted away.
   do
     local anthropic = require("advantage.providers.anthropic")
@@ -3063,8 +3870,9 @@ do
     check(found_real, "sanitize keeps a tool_result paired with a present tool_use")
   end
 
-  -- a large thinking budget must leave answer headroom under max_tokens (or the
-  -- reply is empty), and must never push max_tokens past the model's output ceiling.
+  -- A legacy/manual Haiku thinking budget must leave answer headroom under
+  -- max_tokens (or the reply is empty), and must never push max_tokens past the
+  -- model's output ceiling. Modern Opus uses adaptive effort and rejects budgets.
   do
     local anthropic = require("advantage.providers.anthropic")
     local util = require("advantage.util")
@@ -3100,20 +3908,31 @@ do
       return captured
     end
     local cap = config.defaults.providers.anthropic.max_tokens
-    local model = { id = "claude-opus-4-8", thinking = { type = "enabled", budget_tokens = 31999 } }
+    local model = {
+      id = "claude-haiku-4-5",
+      thinking_mode = "manual",
+      thinking = { type = "enabled", budget_tokens = 63999 },
+    }
     local big = capture_body(model)
     check(big and big.max_tokens == cap, "anthropic max_tokens stays at the configured ceiling")
     check(
       big and big.thinking.budget_tokens + 8192 <= cap,
       "a large thinking budget is trimmed to leave answer headroom under max_tokens"
     )
-    check(model.thinking.budget_tokens == 31999, "the shared model config is not mutated by the trim")
-    local small = capture_body({ id = "claude-opus-4-8", thinking = { type = "enabled", budget_tokens = 4096 } })
+    check(model.thinking.budget_tokens == 63999, "the shared model config is not mutated by the trim")
+    local small = capture_body({
+      id = "claude-haiku-4-5",
+      thinking_mode = "manual",
+      thinking = { type = "enabled", budget_tokens = 4096 },
+    })
     check(small and small.thinking.budget_tokens == 4096, "a budget that already fits is left untouched")
-    local adaptive = capture_body({ id = "claude-opus-4-8" })
+    local adaptive = capture_body({ id = "claude-opus-4-8", thinking_mode = "adaptive" })
     check(
-      adaptive and adaptive.max_tokens == config.defaults.providers.anthropic.max_tokens,
-      "adaptive thinking keeps the configured max_tokens"
+      adaptive
+        and adaptive.max_tokens == config.defaults.providers.anthropic.max_tokens
+        and adaptive.thinking.type == "adaptive"
+        and adaptive.thinking.budget_tokens == nil,
+      "modern Opus adaptive thinking keeps max_tokens and never emits a fixed budget"
     )
     util.request_sse = orig
     vim.env.CLAUDE_CONFIG_DIR, vim.env.ANTHROPIC_API_KEY = saved_dir, saved_key

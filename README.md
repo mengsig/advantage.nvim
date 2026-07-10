@@ -91,6 +91,25 @@ Refreshed tokens are written back to the CLI's own credential file so `claude`
 and `codex` keep working. The winbar shows which credential is in use
 (`max`, `pro`, `chatgpt`, or `api`).
 
+OpenAI's login and API-key paths are different transports with different model
+catalogues, context windows, and effort levels. `providers.openai.auth_mode`
+defaults to `"auto"` (prefer a usable Codex/ChatGPT login, otherwise use an API
+key). Set it to `"chatgpt"` or `"api_key"` to require that transport instead of
+falling back to the other one. The effort picker and context budgeting use the
+same transport choice; the server remains authoritative about which model IDs
+your particular account can access.
+
+Output budgeting is transport-aware too. GPT-5.6/5.5 ChatGPT-login requests do
+not expose a per-request output cap, so advantage reserves the model's native
+128k maximum when deciding when to compact. Raw API requests send and reserve
+`providers.openai.max_output_tokens` (64k by default).
+
+`providers.openai.reasoning_summary = "auto"` streams the provider-selected
+reasoning summary into the thinking UI. Use `"concise"` or `"detailed"` to
+request a specific depth, or `false` to omit summaries and reduce overhead.
+Read-only scouts and compaction summarizers disable summaries automatically
+because their thinking output is not shown.
+
 > macOS note: Claude Code stores credentials in the Keychain there, not in
 > `.credentials.json` — use the API-key fallback or run `claude setup-token`.
 
@@ -145,12 +164,30 @@ right (editable), `q` closes. With no agent changes it falls back to `git diff`.
 skips *all* permission cards. A red `⚡ yolo` badge stays in the winbar while
 it's on. Use at your own risk.
 
-**Effort / thinking.** `/effort` (or `/effort high`, `:Advantage effort [mode]`, `<leader>ce`) tunes the
-active model before the next turn. OpenAI/Codex models get `default`/`off` plus
-`minimal`/`low`/`medium`/`high` `reasoning.effort`; Anthropic models get
-`adaptive`/`off` plus fixed thinking budgets: `low`=`1k`, `medium`=`4k`,
-`high`=`8k`, `higher`=`10k`, `highest`=`16k`, and `max`=`32k` (aliases include
-`think`, `think-hard`, `think-harder`, and `ultrathink`).
+**Effort / thinking.** `/effort` (or `/effort high`,
+`:Advantage effort [mode]`, `<leader>ce`) tunes the active model before the next
+turn. The choices are model- and transport-aware:
+
+- Current OpenAI/Codex models use `reasoning.effort`. Subscription GPT-5.6 Sol
+  and Terra expose `low` through `ultra`, Luna through `max`, and GPT-5.5 through
+  `xhigh`; API-key profiles expose their declared API levels. `default` removes
+  the per-model override and inherits `providers.openai.reasoning_effort`
+  (`ultra` by default). An inherited value is clamped downward to the deepest
+  level that model/transport supports—Sol stays `ultra` on login, Luna becomes
+  `max`, GPT-5.5 becomes `xhigh`, and raw-API Sol becomes `max`. An explicit
+  unsupported per-model choice remains an error. `off` is an alias for the
+  explicit API value `none` and is only
+  offered when that model/transport supports it — merely omitting `reasoning`
+  would restore the provider default, not turn reasoning off.
+- Modern Claude models use native adaptive thinking plus
+  `output_config.effort` (`low`/`medium`/`high`/`xhigh`/`max`). Opus 4.8 is
+  explicitly enabled adaptively, Sonnet 5's default-on mode is explicitly
+  disabled when you choose `off`, and Fable 5 cannot be disabled, so `off` is
+  not offered for it.
+- Haiku 4.5 and older manual-thinking Claude models retain fixed budgets:
+  `low`=`1k`, `medium`=`4k`, `high`=`8k`, `higher`=`10k`, `highest`=`16k`, and
+  `max`=`32k` (aliases include `think`, `think-hard`, `think-harder`, and
+  `ultrathink`).
 
 **Usage dashboard.** `/usage` (or `:Advantage usage`, `<leader>cu`) shows
 session/today/7-day token totals, cache savings (cached input bills at ~10%, and
@@ -163,8 +200,11 @@ measured, not asserted.
 
 **Context compaction.** Old transcript history is automatically compacted when
 its estimated size (roughly chars/4) crosses a threshold that **scales to the
-active model's window**: `min(context.compact_fraction × model.context_window,
-context.compact_at_tokens)`. The fraction protects a small-window model (it
+active model's effective window**: `min(context.compact_fraction × window,
+context.compact_at_tokens, window − output allowance − system/tool schemas −
+context.request_safety_tokens)`. For OpenAI, `window` is selected from
+`context_window` (ChatGPT/Codex login) or `api_context_window` (raw API key).
+The fraction protects a small-window model (it
 compacts before it overflows) while `compact_at_tokens` is an absolute **cost
 ceiling** so a 1M-context model never carries ~750k raw tokens every turn. The
 newest messages stay verbatim — bounded by both `keep_recent_messages` and a
@@ -179,16 +219,22 @@ runs in one of two modes:
   round-trip added to it. Set `context.auto_compact_mode = "llm"` to opt into the
   same LLM summarizer for automatic compaction.
 - **Manual compaction** (`/compact` or `:Advantage compact`) defaults to
-  spending one call on a fast/cheap summarizer model so a real model writes a
+  spending one call on a summarizer model so it writes a
   dense, structured summary — primary intent, files touched, decisions, pending
   work — from the *untruncated* older transcript. By default the summarizer is a
-  cheap model **in your active model's provider family** (Haiku for Claude,
-  GPT-5.6 Luna for OpenAI/Codex), so a Codex-only user never triggers a Claude
-  request they have no credentials for; pin one with `context.summarizer_model`.
+  model **in your active model's provider family** (Haiku for Claude; the active
+  model for OpenAI/Codex), so a Codex-only user never triggers a Claude request
+  they have no credentials for; pin one with `context.summarizer_model`.
+  Subscription and API model catalogues can differ: if a pinned summarizer
+  returns HTTP 404 / model-not-found, advantage retries once with the **active
+  model on the same provider** using `context.summarizer_effort` (`medium` by
+  default, a deliberate compression-quality/latency balance). Set it to
+  `inherit` when compaction must match the live effort, or pin a lower level to make it cheaper. The
+  compaction notice names the fallback.
   The **original task prompt is preserved verbatim** through every compaction
-  (both modes), so long sessions never drift off what you asked for. If the
-  summarizer call fails, it falls back to the offline heuristic automatically and
-  shows a warning. Run
+  (both modes), so long sessions never drift off what you asked for. If the LLM
+  attempt and any active-model retry fail, it falls back to the offline heuristic
+  automatically and shows a warning. Run
   `/compact heuristic` (or `:Advantage compact heuristic`) to skip the model
   call and use the free heuristic instead for a single invocation, or set
   `context.compact_mode = "heuristic"` to make that the default everywhere.
@@ -319,15 +365,22 @@ with `tools = { diagnostics = { enabled = false } }` (or just the auto-attach wi
 
 **Sub-agents.** The model has a `sub_agent` tool for read-only fan-out: a worker
 gets its own short loop and can use read/search/list tools, then returns a
-concise report to the parent agent. It cannot edit files. When the model fires
-several `sub_agent` calls in one turn they run **concurrently**, overlapping
-their network latency instead of one at a time (`subagents.parallel`). Set
-`subagents.bash = true` to also give sub-agents a **read-only** bash — inspection
-commands and git read-only subcommands only; output redirection, command
-substitution and mutating flags are rejected. It is off by default because bash
-isn't path-contained (a sub-agent could read anything your user can, with no
-permission prompt), so enable it only in repos you trust. Sub-agents run on a
-**lean context**: they get the base instructions (and the read-only tool set,
+concise report to the parent agent. It cannot edit files. A model may call one
+worker and wait (sequential delegation) or emit several `sub_agent` calls in one
+turn; with `subagents.parallel = true`, a same-turn fan-out runs
+**concurrently** and overlaps network latency. Parallelism is supported, not
+required, and setting `parallel = false` makes batches run sequentially. Fan-out
+is bounded by `max_parallel` concurrent streams, `max_per_batch` workers in one
+response, and `max_per_turn` workers cumulatively across the whole parent turn;
+reports share a `max_result_bytes` parent-context budget, each scout request is
+held to `max_output_tokens` on Anthropic/raw-API transports, and excess work is
+reported explicitly instead of growing without limit. ChatGPT-login scouts keep
+the model's native output reserve because that transport has no confirmed hard
+cap field; their turn, delegation, result, and report limits still bound them.
+Scouts default to
+`subagents.effort = "medium"` rather than inheriting an expensive parent setting;
+each `sub_agent` call can override `effort` or request `"inherit"`. Sub-agents
+run on a **lean context**: they get the base instructions (and the read-only tool set,
 including the LSP navigation tools) but **not** the repo-memory block or skills
 index — a scout can't `remember`/`use_skill` anyway, and re-shipping the full
 learned context to every worker (and to each worker of a parallel fan-out,
@@ -451,17 +504,53 @@ approval; if any edit in the batch fails to match, nothing is written.
 require("advantage").setup({
   default_model = "anthropic/claude-opus-4-8",
   models = {                       -- context_window scales compaction per model;
-                                   -- adjust to your account/tier (confirmed vs floor)
-    { ref = "anthropic/claude-opus-4-8", label = "opus 4.8", context_window = 1000000 },
-    { ref = "anthropic/claude-sonnet-5", label = "sonnet 5", context_window = 1000000 },
-    { ref = "anthropic/claude-fable-5", label = "fable 5", context_window = 200000 },
-    { ref = "anthropic/claude-haiku-4-5", label = "haiku 4.5", thinking = false, context_window = 200000 },
-    { ref = "openai/gpt-5.6-sol", label = "gpt-5.6 sol", context_window = 1050000 },
-    { ref = "openai/gpt-5.6-terra", label = "gpt-5.6 terra", context_window = 1050000 },
-    { ref = "openai/gpt-5.6-luna", label = "gpt-5.6 luna", context_window = 1050000 },
-    { ref = "openai/gpt-5.5", label = "gpt-5.5", context_window = 1000000 },
-    { ref = "openai/gpt-5.1-codex", label = "codex 5.1", context_window = 400000 },
-    { ref = "openai/gpt-5.1-codex-mini", label = "codex mini", context_window = 400000 },
+                                   -- OpenAI context_window = ChatGPT/Codex login;
+                                   -- api_context_window = raw API-key transport
+    { ref = "anthropic/claude-opus-4-8", label = "opus 4.8", context_window = 1000000,
+      max_output_tokens = 128000,
+      thinking_mode = "adaptive", effort_levels = { "low", "medium", "high", "xhigh", "max" } },
+    { ref = "anthropic/claude-sonnet-5", label = "sonnet 5", context_window = 1000000,
+      max_output_tokens = 128000,
+      thinking_mode = "adaptive_default", effort_levels = { "low", "medium", "high", "xhigh", "max" } },
+    { ref = "anthropic/claude-fable-5", label = "fable 5", context_window = 1000000,
+      max_output_tokens = 128000,
+      thinking_mode = "adaptive_always", effort_levels = { "low", "medium", "high", "xhigh", "max" } },
+    { ref = "anthropic/claude-haiku-4-5", label = "haiku 4.5", thinking = false,
+      thinking_mode = "manual", context_window = 200000, max_output_tokens = 64000 },
+    { ref = "openai/gpt-5.6-sol", label = "gpt-5.6 sol", context_window = 372000,
+      api_context_window = 1050000, max_output_tokens = 128000,
+      reasoning_efforts = { "low", "medium", "high", "xhigh", "max", "ultra" },
+      api_reasoning_efforts = { "none", "low", "medium", "high", "xhigh", "max" } },
+    { ref = "openai/gpt-5.6-terra", label = "gpt-5.6 terra", context_window = 372000,
+      api_context_window = 1050000, max_output_tokens = 128000,
+      reasoning_efforts = { "low", "medium", "high", "xhigh", "max", "ultra" },
+      api_reasoning_efforts = { "none", "low", "medium", "high", "xhigh", "max" } },
+    { ref = "openai/gpt-5.6-luna", label = "gpt-5.6 luna", context_window = 372000,
+      api_context_window = 1050000, max_output_tokens = 128000,
+      reasoning_efforts = { "low", "medium", "high", "xhigh", "max" },
+      api_reasoning_efforts = { "none", "low", "medium", "high", "xhigh", "max" } },
+    { ref = "openai/gpt-5.5", label = "gpt-5.5", context_window = 272000,
+      api_context_window = 1050000, max_output_tokens = 128000,
+      reasoning_efforts = { "low", "medium", "high", "xhigh" },
+      api_reasoning_efforts = { "none", "low", "medium", "high", "xhigh" } },
+    { ref = "openai/gpt-5.1-codex", label = "codex 5.1", context_window = 400000,
+      max_output_tokens = 64000,
+      reasoning_efforts = { "low", "medium", "high", "xhigh" } },
+    { ref = "openai/gpt-5.1-codex-mini", label = "codex mini", context_window = 400000,
+      max_output_tokens = 64000,
+      reasoning_efforts = { "low", "medium", "high", "xhigh" } },
+  },
+  providers = {
+    anthropic = {
+      max_tokens = 64000,         -- shared visible-answer + thinking ceiling
+      interleaved_thinking = true,
+    },
+    openai = {
+      auth_mode = "auto",         -- "auto" | "chatgpt" | "api_key"
+      max_output_tokens = 64000,  -- raw API request cap; login reserves model max
+      reasoning_effort = "ultra", -- inherited + clamped per model/transport
+      reasoning_summary = "auto", -- "auto" | "concise" | "detailed" | false
+    },
   },
   system_prompt = nil,           -- string to replace, function(default) to extend
   max_agent_turns = 100,         -- safety cap on tool-loop round-trips per user turn
@@ -511,18 +600,20 @@ require("advantage").setup({
     auto_compact = true,
     compact_fraction = 0.75,     -- compact at this % of the model's context_window
     compact_at_tokens = 200000,  -- absolute cost ceiling on that trigger (chars/4)
+    request_safety_tokens = 8192, -- beyond output + system/tool reservations
     keep_recent_messages = 16,   -- newest kept verbatim, also bounded by:
     keep_recent_fraction = 0.4,  -- recent window kept, as a % of the threshold
     summary_max_chars = 12000,   -- heuristic-mode summary cap
     auto_compact_mode = "heuristic", -- auto-compact: "heuristic" | "llm"
     compact_mode = "llm",        -- manual /compact: "llm" | "heuristic"
-    summarizer_model = nil,      -- nil = auto: a cheap model in the ACTIVE provider's
-                                 -- family (so a Codex-only user never needs Claude creds
-                                 -- to /compact). Set "provider/model-id" to pin one.
-    summarizer_models = {        -- the per-provider cheap summarizer picked when nil
+    summarizer_model = nil,      -- nil = auto: a model in the ACTIVE provider's family
+                                 -- (so a Codex-only user never needs Claude creds
+                                 -- to /compact). A 404 retries the active same-provider
+                                 -- model before heuristic. Set a ref to pin one.
+    summarizer_models = {        -- omitted providers use the active model
       anthropic = "anthropic/claude-haiku-4-5",
-      openai = "openai/gpt-5.6-luna",
     },
+    summarizer_effort = "medium", -- OpenAI: balanced compaction; "inherit" matches live effort
   },
   subagents = {
     enabled = true,              -- exposes the read-only `sub_agent` tool
@@ -530,14 +621,19 @@ require("advantage").setup({
                                  -- (e.g. "anthropic/claude-haiku-4-5") for cheaper fan-out
     max_turns = 12,              -- per-sub-agent turn budget (last turn is report-only,
                                  -- so a scout always returns findings, not an empty error)
-    parallel = true,             -- run a fan-out batch of sub_agents concurrently
-    bash = false,                -- give sub-agents a read-only bash (see below); or
-                                 -- { allow = { "cmd", ... } } to extend the allow-list
+    max_per_turn = 12,           -- cumulative scouts across the whole parent turn
+    max_output_tokens = 16000,   -- per-scout Anthropic/raw-API output ceiling
+    effort = "medium",           -- per-call `effort` can override; "inherit" uses parent
+    parallel = true,             -- support concurrent fan-out; false preserves sequential runs
+    max_parallel = 4,            -- concurrent provider streams; excess scouts queue
+    max_per_batch = 8,           -- bounded same-response fan-out
+    max_result_bytes = 64000,    -- shared parent-context budget for batch results
   },
   memory = {                     -- per-repo self-learning harness (remember/use_skill)
     enabled = true,
     budget_tokens = 2000,        -- cap on the always-loaded facts block (crisp signposts;
                                  -- push DEPTH into on-demand skills, not this tier)
+    skill_body_budget_tokens = 8000, -- cap for on-demand use_skill bodies
     skills_index_budget_tokens = 1200, -- cap on the always-loaded skills index; skills past
                                  -- it stay loadable by name (deterministic truncation)
     project_budget_tokens = 2000,-- cap on ingested AGENTS.md / CLAUDE.md
@@ -570,14 +666,20 @@ require("advantage").setup({
 
 - Sessions are stored under `stdpath("data")/advantage/sessions`, scoped per
   project directory.
-- Anthropic requests use adaptive thinking with summarized reasoning — the
-  model's thought process streams into the transcript, dimmed. The
-  interleaved-thinking beta is sent (like the real CLI) so reasoning persists
-  across tool calls within a turn; disable with
+- Claude thinking requests follow each generation's actual contract: modern
+  models use adaptive thinking and `output_config.effort`, while Haiku 4.5 uses
+  manual budgets. Summarized reasoning streams into the transcript, dimmed. The
+  interleaved-thinking beta is sent so reasoning persists across tool calls
+  within a turn; disable with
   `providers = { anthropic = { interleaved_thinking = false } }` if your account
   rejects it.
-- Codex subscription access goes through the same backend the codex CLI uses
-  and should be considered experimental; the API-key path is stable.
+- OpenAI Responses calls use a stable per-chat `prompt_cache_key`; the ChatGPT
+  transport also keeps one stable `session_id` across the tool loop. Together
+  with the frozen system prefix, this preserves provider cache/session routing
+  instead of defeating it with a new identifier every request.
+- Codex subscription access goes through the same backend the codex CLI uses;
+  model availability can differ from the raw API catalogue. The API-key path is
+  selected with `providers.openai.auth_mode = "api_key"` when needed.
 - Request bodies and credentials are passed to curl via files/stdin, never
   argv, so nothing sensitive shows up in the process list.
 

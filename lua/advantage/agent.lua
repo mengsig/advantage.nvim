@@ -19,8 +19,8 @@ local function git_branch(cwd)
   return ref:match("ref: refs/heads/(.+)$") or ref:sub(1, 8)
 end
 
-local function default_system_prompt()
-  local cwd = uv.cwd()
+local function default_system_prompt(cwd)
+  cwd = cwd or uv.cwd()
   local branch = git_branch(cwd)
   local lines = {
     "You are advantage, an expert coding agent running inside Neovim, working directly in the user's project. You have access to super powerful LSP based tools, you must use these to reduce token cost and for you to have better context and understanding -- if it's the right decision: diagnostics, document_symbols, goto_definition, find_references, hover, workspace_symbol. Secondly, you have a memory system that you must take advantage of.",
@@ -89,9 +89,9 @@ local MEMORY_GUIDE = table.concat({
 ---the parent's full repo memory to every fan-out worker (5× on a parallel batch,
 ---cold-cached) is exactly the cost leak sub-agents exist to avoid. Honors a user
 ---`system_prompt` override (string/function) just like the main prompt does.
-function M.base_system_prompt()
+function M.base_system_prompt(cwd)
   local cfg = config.options.system_prompt
-  local base = default_system_prompt()
+  local base = default_system_prompt(cwd)
   if type(cfg) == "string" then
     base = cfg
   elseif type(cfg) == "function" then
@@ -105,8 +105,8 @@ end
 ---`M.system_prompt` joins the `text` fields with "\n\n"; `/context preview` uses
 ---the labels to attribute per-section token cost and expands the memory part.
 ---@param memory_block? string frozen block to use verbatim (see M.system_prompt)
-function M.system_prompt_parts(memory_block)
-  local base = M.base_system_prompt()
+function M.system_prompt_parts(memory_block, cwd, frozen_base)
+  local base = frozen_base or M.base_system_prompt(cwd)
   local parts = { { label = "base instructions", text = base } }
   -- Steer toward semantic navigation (only when those tools are actually live).
   local lsp = M.lsp_guide()
@@ -131,29 +131,43 @@ end
 ---  write doesn't invalidate the whole prompt cache (a memory write persists to
 ---  disk and stays in the recent transcript, so the model still has it). Omit
 ---  (nil) to render fresh — sub-agents and tests do.
-function M.system_prompt(memory_block)
+function M.system_prompt(memory_block, cwd, frozen_base)
   local texts = {}
-  for _, p in ipairs(M.system_prompt_parts(memory_block)) do
+  for _, p in ipairs(M.system_prompt_parts(memory_block, cwd, frozen_base)) do
     texts[#texts + 1] = p.text
   end
   return table.concat(texts, "\n\n")
 end
 
----@param opts {model: table, messages?: table, id?: string, title?: string, usage?: table}
+---@param opts {model: table, messages?: table, id?: string, title?: string, usage?: table, cwd?: string}
 function M.new(opts)
   local self = setmetatable({}, Agent)
-  self.id = opts.id or tostring(os.time()) .. "-" .. math.random(1000, 9999)
+  self.id = opts.id or require("advantage.session").new_id()
   self.model = opts.model
   self.messages = opts.messages or {}
   self.title = opts.title
   self.usage = opts.usage or { input = 0, output = 0, cached = 0 }
+  self.usage.reasoning = self.usage.reasoning or 0
+  self.usage.cache_write = self.usage.cache_write or 0
   self.status = "idle" -- idle | streaming | tools
   self.job = nil
   self.cancelled = false
+  self.epoch = 0 -- invalidates every callback belonging to an abandoned operation
+  local digest = vim.fn.sha256((uv.cwd() or "") .. ":" .. self.id)
+  self.request_key = digest:sub(1, 8)
+    .. "-"
+    .. digest:sub(9, 12)
+    .. "-4"
+    .. digest:sub(14, 16)
+    .. "-a"
+    .. digest:sub(18, 20)
+    .. "-"
+    .. digest:sub(21, 32)
   self.turn_started = nil
-  self.turn_usage = { input = 0, output = 0, cached = 0 }
+  self.turn_usage = { input = 0, output = 0, cached = 0, reasoning = 0, cache_write = 0 }
   self.turn_open = false
-  self.ctx = { cwd = uv.cwd(), model = self.model }
+  self.ctx = { cwd = opts.cwd or uv.cwd(), model = self.model }
+  self._base_system_prompt = M.base_system_prompt(self.ctx.cwd)
   self.allowed = {} -- per-session "always allow" tool names
   self.queue = {} -- Ctrl-S messages submitted while a turn was running
   self.interrupts = {} -- Enter messages to inject before the next tool call
@@ -161,6 +175,7 @@ function M.new(opts)
   self.active_tools = {} -- tool_use_id -> cancellable handle returned by a running tool
   self.snapshots = {} -- abs path -> content before the agent's first touch (false = new file)
   self.turn_changed = {} -- abs paths changed during the current turn
+  self.subagents_started = 0 -- cumulative delegation budget for one user turn
   -- fresh conversation: reset the LSP usage-nudge streak so a new chat starts clean
   pcall(function()
     require("advantage.lsp").reset_session()
@@ -170,7 +185,7 @@ function M.new(opts)
   pcall(function()
     local memory = require("advantage.memory")
     memory.reset_session()
-    if memory.bootstrap() then
+    if memory.with_root(self.ctx.cwd, memory.bootstrap) then
       vim.schedule(function()
         pcall(
           require("advantage.ui.chat").notify,
@@ -200,7 +215,7 @@ end
 function Agent:_memory_prompt_block()
   if self._memory_block == nil then
     local ok, memory = pcall(require, "advantage.memory")
-    self._memory_block = (ok and memory.render()) or ""
+    self._memory_block = (ok and memory.with_root(self.ctx.cwd, memory.render)) or ""
   end
   return self._memory_block
 end
@@ -214,11 +229,24 @@ function Agent:compact(opts, callback)
     self:ui().notify("finish or cancel the running turn before compacting context", vim.log.levels.WARN)
     return callback(nil)
   end
+  self.cancelled = false
+  self.epoch = self.epoch + 1
+  local epoch = self.epoch
   self.status = "compacting"
   self:ui().compaction_start(require("advantage.compact").estimate_tokens(self.messages))
   self:_maybe_compact(true, opts, function(info)
+    if self.epoch ~= epoch then return end
     self.status = "idle"
     self:ui().compaction_done()
+    -- Compaction is a durable transcript boundary, not merely a UI operation.
+    -- Without this write, quitting immediately after `/compact` resurrects the
+    -- pre-compaction transcript because no later turn reaches _finish().
+    if info and config.options.sessions.autosave then
+      local ok, err = require("advantage.session").save(self)
+      if not ok then
+        self:ui().notify("could not autosave compacted session: " .. tostring(err), vim.log.levels.WARN)
+      end
+    end
     callback(info)
   end)
 end
@@ -233,7 +261,9 @@ local function user_content(text, opts, cwd)
   -- per session; the transcript shows the user's original text.
   local mok, memory = pcall(require, "advantage.memory")
   if mok then
-    local hints = memory.skill_hints(text)
+    local hints = memory.with_root(cwd, function()
+      return memory.skill_hints(text)
+    end)
     if #hints > 0 then
       local lines = { "", "<repo-skill-hint>" }
       for _, s in ipairs(hints) do
@@ -259,7 +289,11 @@ end
 
 function Agent:_push_user_message(text, opts, show)
   local content = user_content(text, opts, self.ctx.cwd)
-  local msg = { role = "user", content = content }
+  local names = {}
+  for _, img in ipairs((opts and opts.images) or {}) do
+    names[#names + 1] = img.name or "image"
+  end
+  local msg = { role = "user", content = content, original_text = text, attachment_names = #names > 0 and names or nil }
   -- The first user turn of a session is the original task: pin it so compaction
   -- keeps it verbatim (never paraphrased/truncated) no matter how long the
   -- session runs. Compaction reads this flag; providers ignore it.
@@ -298,11 +332,13 @@ function Agent:send(text, opts)
 
   self:_push_user_message(text, opts)
   self.cancelled = false
+  self.epoch = self.epoch + 1
   self.turn_started = uv.hrtime()
-  self.turn_usage = { input = 0, output = 0, cached = 0 }
+  self.turn_usage = { input = 0, output = 0, cached = 0, reasoning = 0, cache_write = 0 }
   self.turn_open = false
   self.turn_changed = {}
   self.loop = 0 -- provider round-trips this user turn (runaway guard)
+  self.subagents_started = 0
   self:_turn()
 end
 
@@ -331,6 +367,7 @@ function Agent:_drain_interrupts(results, remaining_calls)
   end
   self.interrupts = {}
   self.loop = 0 -- fresh user input restarts the runaway budget
+  self.subagents_started = 0
   return true
 end
 
@@ -341,21 +378,24 @@ function Agent:_drain_interrupts_as_user_messages()
   end
   self.interrupts = {}
   self.loop = 0 -- fresh user input restarts the runaway budget
+  self.subagents_started = 0
   return true
 end
 
 local MUTATING = { write_file = true, edit_file = true, multi_edit = true }
+
+local function tool_detail(tool, input)
+  if not (tool and tool.summary) then return nil end
+  local ok, detail = pcall(tool.summary, input)
+  return ok and detail or "invalid tool input"
+end
 
 ---Remember a file's pre-edit content so `/review` can diff against it.
 function Agent:_snapshot(call)
   if not MUTATING[call.name] then return end
   local path = tools.resolve and tools.resolve(call.input and call.input.path, self.ctx)
   if not path then return end
-  if self.snapshots[path] == nil then
-    local f = io.open(path, "r")
-    self.snapshots[path] = f and f:read("*a") or false
-    if f then f:close() end
-  end
+  if self.snapshots[path] == nil then self.snapshots[path] = (tools.read_all and tools.read_all(path)) or false end
   return path
 end
 
@@ -406,16 +446,18 @@ function Agent:_adopt_compaction(next_messages, info)
   -- fact that just aged out of the transcript re-enters the (now legitimately
   -- re-cached) system prefix.
   self._memory_block = nil
+  self._request_prefix_tokens = nil
 end
 
 ---Completion callback for the async LLM summarizer. Splices the summary in on
 ---success, records its token usage, and falls back to the heuristic on failure.
-function Agent:_on_llm_compaction(next_messages, info, err, finish_heuristic, callback)
+function Agent:_on_llm_compaction(next_messages, info, err, finish_heuristic, callback, epoch)
   assert(
     type(finish_heuristic) == "function" and type(callback) == "function",
     "_on_llm_compaction: callbacks required"
   )
   local util = require("advantage.util")
+  if epoch and self.epoch ~= epoch then return end
   self.job = nil
   self._compacting = false
   -- If the user cancelled mid-summarize, cancel() already cleaned up; never
@@ -435,11 +477,18 @@ function Agent:_on_llm_compaction(next_messages, info, err, finish_heuristic, ca
     self.usage.input = self.usage.input + u.input
     self.usage.output = self.usage.output + u.output
     self.usage.cached = (self.usage.cached or 0) + (u.cached or 0)
+    self.usage.reasoning = (self.usage.reasoning or 0) + (u.reasoning or 0)
+    self.usage.cache_write = (self.usage.cache_write or 0) + (u.cache_write or 0)
     self:ui().set_usage(self.usage)
-    require("advantage.usage").record(info.model, u.input, u.output, u.cached)
+    require("advantage.usage").record(info.model, u.input, u.output, u.cached, u)
   end
   local label = (info.model and info.model.label) or "llm"
-  if info.reason == "llm_summary_increased_context" then label = label .. " → heuristic fallback" end
+  if info.fallback_from then label = label .. " (fallback from " .. info.fallback_from .. ")" end
+  if info.reason == "llm_summary_increased_context" then
+    label = label .. " → heuristic fallback"
+  elseif info.reason == "llm_summary_truncated" then
+    label = label .. " → truncated; heuristic fallback"
+  end
   self:ui().notice(
     ("compacted %d old messages with %s (~%s → ~%s tokens)"):format(
       info.compacted_messages,
@@ -485,6 +534,7 @@ function Agent:_maybe_compact(force, opts, callback)
   callback = callback or function() end
   assert(type(callback) == "function", "_maybe_compact: callback must be a function")
   local cfg = config.options.context or {}
+  local epoch = self.epoch
   if not force and cfg.auto_compact == false then return callback(nil) end
   local compact = require("advantage.compact")
 
@@ -494,7 +544,23 @@ function Agent:_maybe_compact(force, opts, callback)
   -- the same token count as a 200k one; both fall back to constants when the
   -- model declares no window. compact.lua itself stays model-agnostic — it just
   -- consumes the numbers handed to it below in `eff`.
-  local threshold = compact.resolve_threshold(cfg, self.model)
+  local compact_model = self.model
+  local effective_window = config.effective_context_window and config.effective_context_window(self.model)
+  if effective_window and effective_window ~= self.model.context_window then
+    compact_model = vim.tbl_extend("force", {}, self.model, { context_window = effective_window })
+  end
+  -- The context limit covers more than transcript history. Reserve the exact
+  -- static prefix estimate plus the configured output allowance before choosing
+  -- a threshold; otherwise a 200k model with a 64k reply budget can 400 while a
+  -- transcript-only 75% guard still believes the request fits.
+  if self._request_prefix_tokens == nil then
+    local system = M.system_prompt(self:_memory_prompt_block(), self.ctx.cwd, self._base_system_prompt)
+    self._request_prefix_tokens = compact.estimate_value_tokens({ system = system, tools = tools.schemas() })
+  end
+  local output_reserve = config.request_output_reserve_tokens and config.request_output_reserve_tokens(self.model)
+    or config.effective_max_output_tokens(self.model)
+    or 0
+  local threshold = compact.resolve_threshold(cfg, compact_model, self._request_prefix_tokens + output_reserve)
 
   if not force and self:_auto_compact_blocked(compact, threshold) then return callback(nil) end
 
@@ -518,9 +584,13 @@ function Agent:_maybe_compact(force, opts, callback)
   local mode = force and (opts.mode or cfg.compact_mode or "heuristic") or (cfg.auto_compact_mode or "heuristic")
   if mode ~= "llm" then return finish_heuristic() end
 
-  self.job = compact.summarize_with_llm(self.messages, eff, function(next_messages, info, err)
-    self:_on_llm_compaction(next_messages, info, err, finish_heuristic, callback)
+  local job = compact.summarize_with_llm(self.messages, eff, function(next_messages, info, err)
+    self:_on_llm_compaction(next_messages, info, err, finish_heuristic, callback, epoch)
   end, self.model)
+  -- A provider may reject synchronously. Its callback can already have cleared
+  -- `_compacting` and started the main request before summarize_with_llm returns;
+  -- do not overwrite that live request with the stale summarizer handle.
+  if self.epoch == epoch and self._compacting then self.job = job end
 end
 
 function Agent:_turn()
@@ -540,8 +610,10 @@ function Agent:_turn_impl()
   -- concurrent send() during the wait is treated as an interrupt/queue instead
   -- of slipping through as a second top-level turn while status is still "idle".
   self.status = "streaming"
+  local epoch = self.epoch
 
   local function continue_turn()
+    if self.epoch ~= epoch then return end
     local ok, err = pcall(function()
       self:_continue_turn()
     end)
@@ -567,24 +639,37 @@ function Agent:_turn_impl()
 end
 
 ---Fold a streamed usage report into both the session and per-turn counters.
-function Agent:_accumulate_usage(inp, out, cached)
+function Agent:_accumulate_usage(inp, out, cached, details)
   assert(type(inp) == "number" and type(out) == "number", "_accumulate_usage: numeric token counts required")
   assert(type(self.usage) == "table" and type(self.turn_usage) == "table", "_accumulate_usage: usage tables missing")
   cached = cached or 0
+  details = details or {}
   self.usage.input = self.usage.input + inp
   self.usage.output = self.usage.output + out
   self.usage.cached = (self.usage.cached or 0) + cached
+  self.usage.reasoning = (self.usage.reasoning or 0) + (details.reasoning or 0)
+  self.usage.cache_write = (self.usage.cache_write or 0) + (details.cache_write or 0)
   self.turn_usage.input = self.turn_usage.input + inp
   self.turn_usage.output = self.turn_usage.output + out
   self.turn_usage.cached = (self.turn_usage.cached or 0) + cached
+  self.turn_usage.reasoning = (self.turn_usage.reasoning or 0) + (details.reasoning or 0)
+  self.turn_usage.cache_write = (self.turn_usage.cache_write or 0) + (details.cache_write or 0)
+  self.response_usage = {
+    input = inp,
+    output = out,
+    cached = cached,
+    reasoning = details.reasoning or 0,
+    cache_write = details.cache_write or 0,
+    effort = details.effort,
+  }
   self:ui().set_usage(self.usage)
-  require("advantage.usage").record(self.model, inp, out, cached)
+  require("advantage.usage").record(self.model, inp, out, cached, details)
 end
 
 ---Reset the per-turn timing/usage bookkeeping without starting a turn.
 function Agent:_reset_turn_state()
   self.turn_started = uv.hrtime()
-  self.turn_usage = { input = 0, output = 0, cached = 0 }
+  self.turn_usage = { input = 0, output = 0, cached = 0, reasoning = 0, cache_write = 0 }
   self.turn_open = false
 end
 
@@ -601,7 +686,9 @@ function Agent:_on_stream_complete(blocks, stop_reason)
   assert(type(blocks) == "table", "_on_stream_complete: blocks must be a table")
   self.job = nil
   if self.cancelled then return end
-  if #blocks > 0 then table.insert(self.messages, { role = "assistant", content = blocks }) end
+  if #blocks > 0 then
+    table.insert(self.messages, { role = "assistant", content = blocks, usage = vim.deepcopy(self.response_usage) })
+  end
   self:ui().message_meta(self.turn_usage, self.turn_started and (uv.hrtime() - self.turn_started) or nil)
 
   if stop_reason == "tool_use" then
@@ -647,7 +734,8 @@ function Agent:_continue_turn()
   end
 
   self.status = "streaming"
-  self.ctx.system = M.system_prompt(self:_memory_prompt_block())
+  self.response_usage = nil
+  self.ctx.system = M.system_prompt(self:_memory_prompt_block(), self.ctx.cwd, self._base_system_prompt)
   local ui = self:ui()
   if not self.turn_open then
     ui.begin_assistant(self.model.label)
@@ -655,41 +743,54 @@ function Agent:_continue_turn()
   end
   ui.set_status("streaming")
 
+  local epoch = self.epoch
   self.job = provider.stream({
     model = self.model,
     system = self.ctx.system,
     messages = self.messages,
     tools = tools.schemas(),
-    on = self:_stream_handlers(ui),
+    -- Allow (but do not require) the model to emit multiple function calls in
+    -- one response. It can still call one sub_agent per turn when an investigation
+    -- depends on an earlier result. Only same-response sub_agent fan-outs overlap.
+    parallel_tool_calls = config.options.subagents
+      and config.options.subagents.enabled ~= false
+      and config.options.subagents.parallel ~= false,
+    prompt_cache_key = self.request_key,
+    session_id = self.request_key,
+    on = self:_stream_handlers(ui, epoch),
   })
 end
 
 ---Build the provider stream callback table, routing each event to a method so
 ---the streaming state machine lives in named handlers, not one giant literal.
-function Agent:_stream_handlers(ui)
+function Agent:_stream_handlers(ui, epoch)
   assert(type(ui) == "table", "_stream_handlers: ui module required")
+  epoch = epoch or self.epoch
+  local function current()
+    return not self.cancelled and self.epoch == epoch
+  end
   return {
     text = function(chunk)
-      ui.stream_text(chunk)
+      if current() then ui.stream_text(chunk) end
     end,
     thinking = function(chunk)
-      ui.stream_thinking(chunk)
+      if current() then ui.stream_thinking(chunk) end
     end,
     tool_start = function(id, name)
-      ui.tool_begin(id, name)
+      if current() then ui.tool_begin(id, name) end
     end,
     auth = function(badge)
-      ui.set_auth(badge)
+      if current() then ui.set_auth(badge) end
     end,
-    usage = function(inp, out, cached)
-      self:_accumulate_usage(inp, out, cached)
+    usage = function(inp, out, cached, details)
+      if current() then self:_accumulate_usage(inp, out, cached, details) end
     end,
     complete = function(blocks, stop_reason)
-      self:_on_stream_complete(blocks, stop_reason)
+      if current() then self:_on_stream_complete(blocks, stop_reason) end
     end,
     error = function(msg)
+      if not current() then return end
       self.job = nil
-      if self.cancelled then return end
       ui.notice("error: " .. msg)
       self:_finish(true)
     end,
@@ -707,7 +808,7 @@ end
 function Agent:_parallel_maybe_finish(st)
   if st.finished or st.launching or st.pending > 0 then return end
   st.finished = true
-  if self.cancelled then return end
+  if self.cancelled or self.epoch ~= st.epoch then return end
   local dense = {}
   for _, r in ipairs(st.seed or {}) do
     dense[#dense + 1] = r
@@ -723,21 +824,38 @@ function Agent:_parallel_maybe_finish(st)
   self:_turn()
 end
 
+function Agent:_parallel_pump(st)
+  if self.cancelled or self.epoch ~= st.epoch then return end
+  while st.running < st.max_parallel and st.next_idx <= st.launch_limit do
+    local idx = st.next_idx
+    st.next_idx = idx + 1
+    st.running = st.running + 1
+    self:_parallel_launch(st, idx, st.calls[idx])
+  end
+  self:_parallel_maybe_finish(st)
+end
+
 ---Launch one worker in a parallel batch, recording its result when it settles.
 function Agent:_parallel_launch(st, idx, call)
   assert(type(st) == "table" and type(idx) == "number", "_parallel_launch: state and index required")
   local ui = st.ui
   local tool = tools.get(call.name)
-  local detail = tool and tool.summary and tool.summary(call.input) or nil
+  local detail = tool_detail(tool, call.input)
   ui.tool_update(call.id, { name = call.name, detail = detail, status = "running" })
   ui.set_status("tool", call.name)
 
   local function settle(output, is_error)
-    if self.cancelled then return end
+    if self.cancelled or self.epoch ~= st.epoch then return end
+    output = tostring(output or "")
+    if #output > st.per_result_bytes then
+      output = require("advantage.util").utf8_safe_sub(output, st.per_result_bytes)
+        .. "\n… [fan-out result truncated]"
+    end
     st.results[idx] = { type = "tool_result", tool_use_id = call.id, content = output, is_error = is_error or nil }
     ui.tool_update(call.id, { status = is_error and "error" or "ok" })
     st.pending = st.pending - 1
-    self:_parallel_maybe_finish(st)
+    st.running = st.running - 1
+    self:_parallel_pump(st)
   end
 
   local verr = tool and tools.validate_input(call.name, call.input)
@@ -753,7 +871,7 @@ function Agent:_parallel_launch(st, idx, call)
     call.input,
     self.ctx,
     vim.schedule_wrap(function(output, is_error, meta)
-      if self.cancelled then return end
+      if self.cancelled or self.epoch ~= st.epoch then return end
       if meta and meta.stream then
         if ui.tool_output then ui.tool_output(call.id, output or "") end
         return
@@ -775,6 +893,11 @@ end
 
 function Agent:_run_tools_parallel(calls, seed)
   assert(type(calls) == "table" and #calls > 0, "_run_tools_parallel: non-empty calls required")
+  local scfg = config.options.subagents or {}
+  local total_cap = math.max(1, tonumber(scfg.max_per_turn) or 12)
+  local available = math.max(0, total_cap - (self.subagents_started or 0))
+  local launch_limit = math.min(#calls, math.max(1, tonumber(scfg.max_per_batch) or 8), available)
+  self.subagents_started = (self.subagents_started or 0) + launch_limit
   local st = {
     calls = calls,
     seed = seed,
@@ -783,12 +906,28 @@ function Agent:_run_tools_parallel(calls, seed)
     pending = #calls,
     finished = false,
     launching = true,
+    epoch = self.epoch,
+    running = 0,
+    next_idx = 1,
+    launch_limit = launch_limit,
+    max_parallel = math.max(1, tonumber(scfg.max_parallel) or 4),
+    per_result_bytes = math.max(1000, math.floor((tonumber(scfg.max_result_bytes) or 64000) / #calls)),
   }
-  for idx, call in ipairs(calls) do
-    self:_parallel_launch(st, idx, call)
+  for idx = launch_limit + 1, #calls do
+    local call = calls[idx]
+    st.results[idx] = {
+      type = "tool_result",
+      tool_use_id = call.id,
+      content = available <= 0 and ("Sub-agent turn budget exhausted (max %d); continue after new user input."):format(
+        total_cap
+      ) or ("Sub-agent batch/turn limit reached (launched %d); issue remaining work later."):format(launch_limit),
+      is_error = true,
+    }
+    st.pending = st.pending - 1
+    st.ui.tool_update(call.id, { status = "error", detail = "batch limit" })
   end
   st.launching = false
-  self:_parallel_maybe_finish(st)
+  self:_parallel_pump(st)
 end
 
 ---Append a tool result to the sequential batch's accumulator.
@@ -803,7 +942,7 @@ end
 
 ---Finish a sequential batch: splice results into the transcript and continue.
 function Agent:_tools_finish(st)
-  if self.cancelled then return end
+  if self.cancelled or self.epoch ~= st.epoch then return end
   table.insert(self.messages, { role = "user", content = st.results })
   self:_turn()
 end
@@ -811,6 +950,7 @@ end
 ---Before running the next tool, honor a pending interrupt or hand the remaining
 ---tail off to the parallel path. Returns true when control was redirected.
 function Agent:_tools_maybe_redirect(st)
+  if self.epoch ~= st.epoch then return true end
   if #self.interrupts > 0 then
     local remaining = {}
     for j = st.i + 1, #st.calls do
@@ -842,6 +982,20 @@ end
 function Agent:_tools_execute(st, call, tool)
   assert(type(tool) == "table" and type(tool.run) == "function", "_tools_execute: runnable tool required")
   local ui = st.ui
+  if call.name == "sub_agent" then
+    local cap = math.max(1, tonumber((config.options.subagents or {}).max_per_turn) or 12)
+    if (self.subagents_started or 0) >= cap then
+      self:_tools_record(
+        st,
+        call,
+        ("Sub-agent turn budget exhausted (max %d); continue after new user input."):format(cap),
+        true
+      )
+      ui.tool_update(call.id, { status = "error", detail = "turn budget" })
+      return self:_tools_run_next(st)
+    end
+    self.subagents_started = (self.subagents_started or 0) + 1
+  end
   ui.set_status("tool", call.name)
   ui.tool_update(call.id, { status = "running" })
   local touched = self:_snapshot(call)
@@ -851,7 +1005,7 @@ function Agent:_tools_execute(st, call, tool)
     call.input,
     self.ctx,
     vim.schedule_wrap(function(output, is_error, meta)
-      if self.cancelled then return end
+      if self.cancelled or self.epoch ~= st.epoch then return end
       if meta and meta.stream then
         if ui.tool_output then ui.tool_output(call.id, output or "") end
         return
@@ -880,13 +1034,17 @@ end
 ---Show the permission card for a gated tool and route the user's decision.
 function Agent:_tools_request_permission(st, call, tool)
   local ui = st.ui
-  local preview = tool.preview and tool.preview(call.input, self.ctx)
-    or { title = call.name, lines = vim.split(vim.inspect(call.input), "\n"), filetype = "lua" }
+  local preview
+  if tool.preview then
+    local ok, value = pcall(tool.preview, call.input, self.ctx)
+    if ok then preview = value end
+  end
+  preview = preview or { title = call.name, lines = vim.split(vim.inspect(call.input), "\n"), filetype = "lua" }
   ui.tool_update(call.id, { status = "waiting" })
   ui.set_status("waiting", call.name)
   self.pending_permission = ui.confirm(preview, function(decision, comment)
     self.pending_permission = nil
-    if self.cancelled then return end
+    if self.cancelled or self.epoch ~= st.epoch then return end
     if decision == "always" then
       self.allowed[call.name] = true
       return self:_tools_execute(st, call, tool)
@@ -914,7 +1072,7 @@ end
 
 ---Advance the sequential tool loop by one: validate, then execute or prompt.
 function Agent:_tools_run_next(st)
-  if self.cancelled then return end
+  if self.cancelled or self.epoch ~= st.epoch then return end
   if self:_tools_maybe_redirect(st) then return end
   st.i = st.i + 1
   local call = st.calls[st.i]
@@ -935,7 +1093,7 @@ function Agent:_tools_run_next(st)
     return self:_tools_run_next(st)
   end
 
-  local detail = tool.summary and tool.summary(call.input) or nil
+  local detail = tool_detail(tool, call.input)
   ui.tool_update(call.id, { name = call.name, detail = detail })
 
   local cfg = st.cfg
@@ -956,6 +1114,7 @@ function Agent:_run_tools(calls)
     ui = self:ui(),
     cfg = cfg,
     parallel_subagents = cfg.subagents and cfg.subagents.parallel ~= false,
+    epoch = self.epoch,
   }
   self:_tools_run_next(st)
 end
@@ -970,8 +1129,17 @@ function Agent:_finish(errored)
   -- partial assistant turn, so the just-sent user message survives a later exit.
   if config.options.sessions.autosave then require("advantage.session").save(self) end
   local changed = vim.tbl_count(self.turn_changed or {})
-  if changed > 0 and not self.cancelled then
-    ui.notice(("%d file%s changed — /review to inspect"):format(changed, changed == 1 and "" or "s"))
+  if changed > 0 then
+    if self.cancelled then
+      ui.notice(
+        ("%d file%s already changed before cancellation — /review to inspect"):format(
+          changed,
+          changed == 1 and "" or "s"
+        )
+      )
+    else
+      ui.notice(("%d file%s changed — /review to inspect"):format(changed, changed == 1 and "" or "s"))
+    end
     self.turn_changed = {}
   end
   -- dispatch the next queued message, if any
@@ -994,6 +1162,7 @@ function Agent:cancel(opts)
   if not self:busy() then return end
   local was_compacting = self.status == "compacting"
   self.cancelled = true
+  self.epoch = self.epoch + 1
   -- job.stop() below never invokes the summarizer's completion callback, which
   -- is the only place that otherwise clears this flag — reset it here so a
   -- cancelled compaction (manual /compact, or auto_compact_mode = "llm") can't

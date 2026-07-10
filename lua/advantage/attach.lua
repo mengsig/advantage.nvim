@@ -216,26 +216,30 @@ function M.expand_mentions(text, cwd)
   return table.concat(out, "\n"), files
 end
 
-local cache = { at = 0, files = nil }
+local cache = { at = 0, files = nil, cwd = nil }
 
 ---List project files (briefly cached) for @completion and pickers.
-function M.project_files(limit)
+function M.project_files(limit, cwd)
   limit = limit or 400
-  if not (cache.files and os.time() - cache.at < 5) then
-    local out
+  cwd = cwd or uv.cwd()
+  if not (cache.files and cache.cwd == cwd and os.time() - cache.at < 5) then
+    local cmd
     if has("rg") then
-      out = vim.fn.systemlist({ "rg", "--files", "--sortr", "modified" })
-    elseif has("git") and vim.fn.isdirectory(".git") == 1 then
-      out = vim.fn.systemlist({ "git", "ls-files" })
+      cmd = { "rg", "--files", "--sortr", "modified" }
+    elseif has("git") and vim.fs.find(".git", { path = cwd, upward = true })[1] then
+      cmd = { "git", "ls-files" }
     else
-      out = vim.fn.systemlist({ "find", ".", "-type", "f", "-not", "-path", "*/.git/*" })
+      cmd = { "find", ".", "-type", "f", "-not", "-path", "*/.git/*" }
     end
-    if vim.v.shell_error ~= 0 or type(out) ~= "table" then out = {} end
+    local ok, result = pcall(function()
+      return vim.system(cmd, { cwd = cwd, text = true }):wait(5000)
+    end)
+    local out = ok and result and result.code == 0 and vim.split(result.stdout or "", "\n", { trimempty = true }) or {}
     local files = {}
     for _, f in ipairs(out) do
       files[#files + 1] = (f:gsub("^%./", ""))
     end
-    cache = { at = os.time(), files = files }
+    cache = { at = os.time(), files = files, cwd = cwd }
   end
   return vim.list_slice(cache.files, 1, math.min(#cache.files, limit))
 end
