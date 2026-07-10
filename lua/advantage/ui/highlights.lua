@@ -64,7 +64,6 @@ local function resolve_palette(cfg, dark)
     ghost = blend(fg, bg, 0.28),
     hairline = blend(fg, bg, 0.12),
     border = blend(fg, bg, 0.25),
-    ok_dim = blend(ok_c, bg, 0.55), -- success trace on finished tool lines
   }
 end
 
@@ -91,13 +90,14 @@ local function highlight_groups(p)
     AdvNotice = { fg = p.faint, italic = true },
     AdvNoticeMark = { fg = p.accent_hex },
 
-    -- tool lines: live = accent, finished = ghost, failed = error color
+    -- tool lines: running = yellow, success = green, failure = red
     AdvToolGhost = { fg = p.ghost },
     AdvToolFaint = { fg = p.faint },
     AdvToolSpinner = { fg = p.accent_hex },
     AdvToolWaiting = { fg = p.accent_hex, bold = true },
     AdvToolActiveName = { fg = hex(p.fg) },
-    AdvToolOkDot = { fg = p.ok_dim },
+    AdvToolRunning = { fg = hex(p.warn) },
+    AdvToolOk = { fg = hex(p.ok_c) },
     AdvToolErr = { fg = hex(p.err) },
     AdvToolDenied = { fg = p.ghost, strikethrough = true },
     AdvToolOutput = { fg = p.ghost },

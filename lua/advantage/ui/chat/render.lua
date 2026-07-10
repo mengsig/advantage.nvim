@@ -51,19 +51,19 @@ function R.update_winbar()
   if util.win_valid(S.win) then opt("winbar", winbar_text(), S.win) end
 end
 
----Per-status tool-line style: live actions carry the accent, finished ones
----recede into the transcript, only failures keep a loud color.
+---Per-status tool-line style: a traffic-light signal — running is yellow,
+---success green, failure red — with the icon and name carrying the color.
 local function tool_style(status)
   local styles = {
     pending = { icon = "·", icon_hl = "AdvToolGhost", line = "AdvToolGhost", name = "AdvToolGhost" },
     waiting = { icon = "◇", icon_hl = "AdvToolWaiting", line = "AdvToolFaint", name = "AdvToolActiveName" },
     running = {
       icon = FRAMES[S.spinner],
-      icon_hl = "AdvToolSpinner",
+      icon_hl = "AdvToolRunning",
       line = "AdvToolFaint",
-      name = "AdvToolActiveName",
+      name = "AdvToolRunning",
     },
-    ok = { icon = "·", icon_hl = "AdvToolOkDot", line = "AdvToolGhost", name = "AdvToolGhost" },
+    ok = { icon = "✓", icon_hl = "AdvToolOk", line = "AdvToolFaint", name = "AdvToolOk" },
     error = { icon = "✗", icon_hl = "AdvToolErr", line = "AdvToolFaint", name = "AdvToolErr" },
     denied = { icon = "◌", icon_hl = "AdvToolDenied", line = "AdvToolDenied", name = "AdvToolDenied" },
   }
