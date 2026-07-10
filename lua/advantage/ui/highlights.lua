@@ -60,6 +60,7 @@ local function resolve_palette(cfg, dark)
     panel = blend(fg, bg, dark and 0.035 or 0.04),
     field = blend(fg, bg, dark and 0.075 or 0.075),
     soft = blend(accent, bg, dark and 0.16 or 0.12), -- tinted header wash
+    active = blend(accent, bg, dark and 0.22 or 0.16),
     faint = blend(fg, bg, 0.45),
     ghost = blend(fg, bg, 0.28),
     hairline = blend(fg, bg, 0.12),
@@ -77,13 +78,17 @@ local function highlight_groups(p)
     AdvPanel = { bg = p.panel },
     AdvPanelField = { bg = p.field },
     AdvPanelBar = { bg = p.panel },
+    AdvPanelGutter = { fg = p.hairline, bg = p.panel },
+    AdvPanelActive = { bg = p.active },
     AdvPanelBorder = { fg = p.hairline, bg = p.panel },
     AdvPromptSign = { fg = p.accent_hex, bg = p.field, bold = true },
 
     -- transcript
     AdvUserHead = { fg = hex(p.fg), bg = p.soft, bold = true },
     AdvUserBar = { fg = p.accent_hex, bg = p.soft, bold = true },
+    AdvUserBody = { fg = hex(p.fg) },
     AdvAssistHead = { fg = p.accent_hex, bold = true },
+    AdvAssistBody = { fg = hex(p.fg) },
     AdvMeta = { fg = p.ghost, italic = true },
     AdvThinking = { fg = hex(p.comment), italic = true },
     AdvRule = { fg = p.hairline },
@@ -125,6 +130,7 @@ local function highlight_groups(p)
     AdvFloatHint = { fg = p.ghost, bg = p.panel, italic = true },
     AdvFloatKey = { fg = p.accent_hex, bg = p.panel, bold = true },
     AdvFloatLabel = { fg = p.ghost },
+    AdvFloatActive = { fg = p.accent_hex, bg = p.active, bold = true },
   }
 end
 

@@ -451,6 +451,15 @@ do
     local bad = util.scrub_utf8(vim.json.encode({ t = "x\xe9\xff\xe2\x86 y" }))
     check(util.scrub_utf8(bad) == bad and not bad:find("\xff"), "scrub_utf8 makes an invalid body valid")
     check(util.utf8_safe_sub("ab→cd", 3) == "ab", "utf8_safe_sub backs off a mid-character cut")
+    local byte_limits = util.partition_byte_budget(7, 3)
+    check(
+      #byte_limits == 3 and byte_limits[1] + byte_limits[2] + byte_limits[3] == 7,
+      "fan-out byte partitions preserve the exact aggregate ceiling"
+    )
+    check(
+      #util.truncate_to_bytes("abcdefghij", 7, "…") <= 7,
+      "truncation markers stay inside (not beyond) the configured byte ceiling"
+    )
   end
 
   r = assert(run("edit_file", { path = "x/hello.txt", old_string = "beta", new_string = "BETA" }))
@@ -494,6 +503,21 @@ do
   check(
     nested_type_err and nested_type_err:find("input.edits[1].new_string must be string", 1, true),
     "validate_input recursively checks nested array item types"
+  )
+  local turn_bound_err = tools.validate_input("sub_agent", {
+    prompt = "inspect",
+    model = "sol",
+    effort = "medium",
+    max_turns = (require("advantage.config").options.subagents.max_turns_cap or 12) + 1,
+  })
+  check(
+    turn_bound_err and turn_bound_err:find("input.max_turns must be at most", 1, true),
+    "validate_input enforces live numeric maximums instead of silently clamping malformed scout calls"
+  )
+  local empty_batch_err = tools.validate_input("sub_agent_batch", { mode = "parallel", tasks = {} })
+  check(
+    empty_batch_err and empty_batch_err:find("input.tasks must contain at least 1 item", 1, true),
+    "validate_input enforces array minItems before a batch runner starts"
   )
 
   r = assert(run("bash", { command = "echo out; echo err >&2; exit 3" }))
@@ -671,16 +695,17 @@ do
   local old_env = vim.env.BRAVE_API_KEY
   vim.env.BRAVE_API_KEY = nil
 
-  local function has_web_search()
+  local function has_web_tool(name)
     for _, s in ipairs(tools.schemas()) do
-      if s.name == "web_search" then return true end
+      if s.name == name then return true end
     end
     return false
   end
 
-  check(not has_web_search(), "web_search is hidden from the schema without an API key")
+  check(has_web_tool("web_search"), "web_search keeps a keyless public fallback when no API key is configured")
+  check(has_web_tool("web_fetch"), "web_fetch is available independently of a search API key")
   wcfg.api_key = "test-key"
-  check(has_web_search(), "web_search appears once an API key is configured")
+  check(has_web_tool("web_search"), "web_search remains available once an API key is configured")
 
   local function fake_curl(dir, script_lines)
     vim.fn.mkdir(dir, "p")
@@ -729,7 +754,14 @@ do
       },
     },
   })
-  fake_curl(dir1, { "#!/usr/bin/env bash", "cat <<'JSON'", body, "JSON", "exit 0" })
+  fake_curl(dir1, {
+    "#!/usr/bin/env bash",
+    "case \"$*\" in *test-key*) echo 'secret leaked in argv' >&2; exit 97;; esac",
+    "cat <<'JSON'",
+    body,
+    "JSON",
+    "exit 0",
+  })
   local out1, err1 = run_with_path(dir1, function(cb)
     run({ query = "neovim release notes", count = 2 }, ctx, cb)
   end)
@@ -739,6 +771,7 @@ do
   check(out1s:find("Big & small changes", 1, true) ~= nil, "HTML entities decoded in the description")
   check(out1s:find("https://neovim.io/a", 1, true) ~= nil, "result URL is included")
   check(out1s:find("Third result", 1, true) == nil, "results capped at the requested count")
+  check(not out1s:find("test-key", 1, true), "Brave API secret never appears in tool output or curl argv")
 
   -- curl failure surfaces as a tool error
   local dir2 = vim.fn.tempname()
@@ -766,12 +799,64 @@ do
   local subagent = require("advantage.subagent")
   local sub_tools = subagent._readonly_tools and subagent._readonly_tools() or nil
   if sub_tools then
-    local sub_has = false
+    local sub_has, sub_fetch = false, false
     for _, s in ipairs(sub_tools) do
       if s.name == "web_search" then sub_has = true end
+      if s.name == "web_fetch" then sub_fetch = true end
     end
     check(sub_has, "web_search is available to read-only sub-agents")
+    check(sub_fetch, "web_fetch is available to read-only sub-agents without a Brave key")
   end
+
+  local web = require("advantage.web")
+  local blocked_urls = {
+    "file:///etc/passwd",
+    "http://user:pass@example.com/",
+    "http://localhost/",
+    "http://localhost./",
+    "http://127.0.0.1/",
+    "http://169.254.169.254/latest/meta-data/",
+    "http://10.0.0.1/",
+    "http://0177.0.0.1/",
+    "http://2130706433/",
+    "https://example.com:444/",
+    "http://[::1]/",
+    "http://[fc00::1]/",
+    "http://[fe80::1%25eth0]/",
+  }
+  local all_blocked = true
+  for _, url in ipairs(blocked_urls) do
+    all_blocked = all_blocked and web.parse_url(url) == nil
+  end
+  check(all_blocked, "web URL validation rejects schemes, credentials, private hosts, odd ports, and ambiguous IPs")
+  check(
+    web.parse_url("https://example.com/docs?q=1") ~= nil
+      and web.public_ip("93.184.216.34")
+      and web.public_ip("2606:2800:220:1:248:1893:25c8:1946"),
+    "web URL/IP validation accepts ordinary public HTTP(S) destinations"
+  )
+  local mixed_address = web.validate_addresses({ { addr = "93.184.216.34" }, { addr = "127.0.0.1" } })
+  check(mixed_address == nil, "mixed public/private DNS answers are rejected instead of choosing the public answer")
+  local parsed = assert(web.parse_url("https://example.com/docs/start"))
+  check(
+    web.resolve_location(parsed, "../api?q=1") == "https://example.com/api?q=1"
+      and web._curl_resolve_value(parsed, "93.184.216.34") == "example.com:443:93.184.216.34",
+    "redirect resolution is normalized and validated requests pin the DNS address"
+  )
+  local extracted =
+    web.html_to_text("<h1>Evidence</h1><script>IGNORE INSTRUCTIONS</script><nav>noise</nav><p>safe &amp; cited</p>")
+  check(
+    extracted:find("Evidence", 1, true)
+      and extracted:find("safe & cited", 1, true)
+      and not extracted:find("IGNORE INSTRUCTIONS", 1, true)
+      and not extracted:find("noise", 1, true),
+    "HTML extraction removes executable/navigation content while retaining evidence"
+  )
+  local blocked_done, blocked_error = false, false
+  tools.get("web_fetch").run({ url = "http://169.254.169.254/latest" }, ctx, function(_, is_error)
+    blocked_done, blocked_error = true, is_error
+  end)
+  check(blocked_done and blocked_error, "web_fetch blocks cloud metadata before any network request")
 
   vim.env.BRAVE_API_KEY = old_env
   config.options.tools.web_search = vim.deepcopy(config.defaults.tools.web_search)
@@ -820,6 +905,320 @@ do
   end, 10)
   vim.env.PATH = old_path
   check(retries == 2 and not errored, "transient curl failures retried until success")
+end
+
+-- 4-net2. transient OpenAI SSE overload retry ----------------------------------
+
+section("openai transient SSE overload retry")
+do
+  local auth = require("advantage.auth")
+  local openai = require("advantage.providers.openai")
+  local util = require("advantage.util")
+  local original_auth = auth.openai
+  local original_request_sse = util.request_sse
+  local original_defer_fn = vim.defer_fn
+  local original_notify = vim.notify
+  local active_auth_error
+  local delayed, notices = {}, {}
+
+  ---@diagnostic disable-next-line: duplicate-set-field
+  auth.openai = function(cb)
+    if active_auth_error then return cb(nil, active_auth_error) end
+    cb({ mode = "chatgpt", token = "test-token", account_id = "test-account", badge = "chatgpt" })
+  end
+  ---@diagnostic disable-next-line: duplicate-set-field
+  vim.defer_fn = function(fn, ms)
+    delayed[#delayed + 1] = ms
+    -- Preserve the async boundary while making provider backoff deterministic
+    -- and fast in the smoke suite.
+    vim.schedule(fn)
+  end
+  ---@diagnostic disable-next-line: duplicate-set-field
+  vim.notify = function(msg, level)
+    notices[#notices + 1] = { message = tostring(msg), level = level }
+  end
+
+  local function emit(opts, events)
+    for _, event in ipairs(events) do
+      opts.on_event(event[1], event[2])
+    end
+    opts.on_done()
+  end
+
+  local function run_case(name, script, auth_error)
+    local attempts, bodies = 0, {}
+    local delayed_from, notices_from = #delayed + 1, #notices + 1
+    local observed = {
+      complete = {},
+      errors = {},
+      text = {},
+      thinking = {},
+      tools = {},
+    }
+    active_auth_error = auth_error
+    ---@diagnostic disable-next-line: duplicate-set-field
+    util.request_sse = function(opts)
+      attempts = attempts + 1
+      local attempt_no = attempts
+      bodies[#bodies + 1] = vim.json.decode(opts.body)
+      vim.schedule(function()
+        script(attempt_no, opts)
+      end)
+      return { stop = function() end }
+    end
+
+    local ok, handle = pcall(openai.stream, {
+      model = {
+        provider = "openai",
+        id = "gpt-5.6-sol",
+        label = "sol",
+        reasoning_effort = "medium",
+        reasoning_efforts = { "low", "medium", "high", "xhigh", "max" },
+      },
+      messages = { { role = "user", content = { { type = "text", text = "retry " .. name } } } },
+      system = "OpenAI overload retry regression: " .. name,
+      tools = {},
+      session_id = "overload-retry-" .. name,
+      on = {
+        auth = function() end,
+        text = function(text)
+          observed.text[#observed.text + 1] = text
+        end,
+        thinking = function(text)
+          observed.thinking[#observed.thinking + 1] = text
+        end,
+        tool_start = function(id, tool_name)
+          observed.tools[#observed.tools + 1] = { id = id, name = tool_name }
+        end,
+        usage = function() end,
+        complete = function(blocks, stop)
+          observed.complete[#observed.complete + 1] = { blocks = blocks, stop = stop }
+        end,
+        error = function(msg, meta)
+          observed.errors[#observed.errors + 1] = { message = tostring(msg), meta = meta }
+        end,
+      },
+    })
+    if not ok then observed.errors[#observed.errors + 1] = { message = tostring(handle) } end
+    vim.wait(3000, function()
+      return #observed.complete + #observed.errors > 0
+    end, 5)
+    -- Drain callbacks deliberately scheduled by a broken implementation after
+    -- its first terminal callback; those must be visible as duplicates here.
+    vim.wait(30, function()
+      return false
+    end, 5)
+    if ok and handle and handle.stop then handle.stop() end
+
+    observed.attempts = attempts
+    observed.bodies = bodies
+    observed.delays = {}
+    observed.notices = {}
+    for i = delayed_from, #delayed do
+      observed.delays[#observed.delays + 1] = delayed[i]
+    end
+    for i = notices_from, #notices do
+      observed.notices[#observed.notices + 1] = notices[i]
+    end
+    return observed
+  end
+
+  local overloaded = "Our servers are currently overloaded. Please try again shortly."
+  local recovered = run_case("recovers", function(attempt, opts)
+    if attempt == 1 then return emit(opts, { { "error", { type = "error", error = { message = overloaded } } } }) end
+    if attempt == 2 then
+      return emit(opts, {
+        {
+          "response.failed",
+          { type = "response.failed", response = { error = { message = overloaded } } },
+        },
+      })
+    end
+    emit(opts, {
+      { "response.output_text.delta", { type = "response.output_text.delta", delta = "recovered" } },
+      {
+        "response.output_item.done",
+        {
+          type = "response.output_item.done",
+          item = {
+            type = "message",
+            id = "overload-recovered",
+            status = "completed",
+            content = { { type = "output_text", text = "recovered" } },
+          },
+        },
+      },
+      {
+        "response.completed",
+        { type = "response.completed", response = { usage = { input_tokens = 12, output_tokens = 3 } } },
+      },
+    })
+  end)
+  local same_request = #recovered.bodies == 3
+  for i = 2, #recovered.bodies do
+    same_request = same_request and vim.deep_equal(recovered.bodies[1], recovered.bodies[i])
+  end
+  local bounded_backoff = #recovered.delays == 2
+  for _, ms in ipairs(recovered.delays) do
+    bounded_backoff = bounded_backoff and type(ms) == "number" and ms > 0 and ms <= 10000
+  end
+  local retry_notice = false
+  for _, notice in ipairs(recovered.notices) do
+    local message = notice.message:lower()
+    if message:find("overload", 1, true) and message:find("retry", 1, true) then retry_notice = true end
+  end
+  check(
+    recovered.attempts == 3 and same_request,
+    "pre-payload SSE error/response.failed overloads retry the identical model request"
+  )
+  check(bounded_backoff, "SSE overload retries use positive bounded backoff")
+  check(retry_notice, "SSE overload recovery emits a visible retry notification")
+  check(
+    #recovered.complete == 1
+      and #recovered.errors == 0
+      and table.concat(recovered.text) == "recovered"
+      and recovered.complete[1].blocks[1].text == "recovered",
+    "success after overload retry streams and completes exactly once"
+  )
+
+  -- curl can report code 18 after the server has sent lifecycle SSE events but
+  -- before it has emitted any user-visible/model-action payload. Provider-level
+  -- retry safety must follow payload commitment, not util.request_sse's broader
+  -- "any event dispatched" transport guard.
+  local curl18 = "curl: (18) transfer closed with outstanding read data remaining"
+  local curl18_recovered = run_case("curl18-recovers", function(attempt, opts)
+    if attempt == 1 then
+      opts.on_event("response.created", { type = "response.created", response = { id = "first-attempt" } })
+      return opts.on_error(curl18, 200)
+    end
+    emit(opts, {
+      { "response.output_text.delta", { type = "response.output_text.delta", delta = "after curl 18" } },
+      {
+        "response.output_item.done",
+        {
+          type = "response.output_item.done",
+          item = {
+            type = "message",
+            id = "curl18-recovered",
+            status = "completed",
+            content = { { type = "output_text", text = "after curl 18" } },
+          },
+        },
+      },
+      {
+        "response.completed",
+        { type = "response.completed", response = { usage = { input_tokens = 8, output_tokens = 4 } } },
+      },
+    })
+  end)
+  check(
+    curl18_recovered.attempts == 2
+      and #curl18_recovered.delays == 1
+      and #curl18_recovered.complete == 1
+      and #curl18_recovered.errors == 0
+      and table.concat(curl18_recovered.text) == "after curl 18"
+      and vim.deep_equal(curl18_recovered.bodies[1], curl18_recovered.bodies[2]),
+    "curl 18 after lifecycle-only SSE events retries the identical request and completes once"
+  )
+
+  local curl18_after_text = run_case("curl18-after-text", function(_, opts)
+    opts.on_event("response.output_text.delta", { type = "response.output_text.delta", delta = "committed" })
+    opts.on_error(curl18, 200)
+  end)
+  check(
+    curl18_after_text.attempts == 1
+      and #curl18_after_text.delays == 0
+      and #curl18_after_text.complete == 0
+      and #curl18_after_text.errors == 1
+      and table.concat(curl18_after_text.text) == "committed",
+    "curl 18 after visible text never retries or duplicates committed output"
+  )
+
+  local payload_cases = {
+    text = { "response.output_text.delta", { type = "response.output_text.delta", delta = "partial" } },
+    thinking = {
+      "response.reasoning_summary_text.delta",
+      { type = "response.reasoning_summary_text.delta", delta = "considering" },
+    },
+    tool = {
+      "response.output_item.added",
+      {
+        type = "response.output_item.added",
+        item = { type = "function_call", id = "tool-item", call_id = "tool-call", name = "read_file" },
+      },
+    },
+  }
+  local all_payloads_guarded = true
+  for kind, payload in pairs(payload_cases) do
+    local committed = run_case("committed-" .. kind, function(_, opts)
+      emit(opts, {
+        payload,
+        { "error", { type = "error", error = { message = overloaded } } },
+      })
+    end)
+    local delivered = kind == "text" and table.concat(committed.text) == "partial"
+      or kind == "thinking" and table.concat(committed.thinking) == "considering"
+      or kind == "tool" and #committed.tools == 1 and committed.tools[1].name == "read_file"
+    all_payloads_guarded = all_payloads_guarded
+      and delivered
+      and committed.attempts == 1
+      and #committed.delays == 0
+      and #committed.complete == 0
+      and #committed.errors == 1
+  end
+  check(
+    all_payloads_guarded,
+    "an overload after text, thinking, or tool payload never retries or duplicates streamed work"
+  )
+
+  local bad_request = run_case("bad-request", function(_, opts)
+    opts.on_error("HTTP 400: invalid JSON request", 400)
+  end)
+  local missing_model = run_case("missing-model", function(_, opts)
+    opts.on_error("HTTP 404: Model not found gpt-5.6-sol", 404)
+  end)
+  local missing_auth = run_case("missing-auth", function()
+    error("request_sse must not start after auth rejection")
+  end, "No OpenAI credentials in deterministic test")
+  check(
+    bad_request.attempts == 1
+      and #bad_request.errors == 1
+      and #bad_request.delays == 0
+      and missing_model.attempts == 1
+      and #missing_model.errors == 1
+      and #missing_model.delays == 0
+      and missing_auth.attempts == 0
+      and #missing_auth.errors == 1
+      and #missing_auth.delays == 0,
+    "auth, model, and deterministic HTTP 400 failures remain non-retryable"
+  )
+
+  local exhausted = run_case("exhausted", function(_, opts)
+    emit(opts, {
+      {
+        "response.failed",
+        { type = "response.failed", response = { error = { message = overloaded } } },
+      },
+    })
+  end)
+  local exhaustion_delays_bounded = #exhausted.delays == exhausted.attempts - 1
+  for _, ms in ipairs(exhausted.delays) do
+    exhaustion_delays_bounded = exhaustion_delays_bounded and ms > 0 and ms <= 10000
+  end
+  check(
+    exhausted.attempts >= 2
+      and exhausted.attempts <= 4
+      and exhaustion_delays_bounded
+      and #exhausted.complete == 0
+      and #exhausted.errors == 1
+      and exhausted.errors[1].message:lower():find("overload", 1, true),
+    "bounded overload exhaustion surfaces one final error exactly once"
+  )
+
+  auth.openai = original_auth
+  util.request_sse = original_request_sse
+  vim.defer_fn = original_defer_fn
+  vim.notify = original_notify
 end
 
 -- 4a. context compaction ---------------------------------------------------------
@@ -1257,9 +1656,9 @@ do
     )
   end
 
-  -- agent-level path: Agent:compact({mode="llm"}) end-to-end. A message sent
-  -- mid-compaction has no "next tool call" to inject before, so it is refused
-  -- (not queued, not appended) — the user retries once compaction settles.
+  -- agent-level path: Agent:compact({mode="llm"}) end-to-end. Messages sent
+  -- mid-compaction queue behind the durable compaction boundary and dispatch
+  -- automatically once the compacted transcript has been adopted.
   do
     local ag = agent_mod.new({ model = { provider = "fakesummarizer", id = "mini", label = "mini" } })
     ag.messages = make_messages(10)
@@ -1272,12 +1671,17 @@ do
     check(ag:busy() == true, "agent reports busy while compacting")
 
     ag:send("during compaction")
-    check(#ag.queue == 0, "a message sent mid-compaction is refused, not queued")
-    check(#ag.messages == 10, "a message sent mid-compaction is not appended to the transcript")
+    check(#ag.queue == 1, "a message sent mid-compaction enters the normal queue")
+    check(#ag.messages == 10, "a queued compaction message is not appended before the transcript replacement")
 
     vim.wait(2000, function()
-      return ag.status == "idle"
+      return ag.status == "idle" and #ag.queue == 0
     end, 5)
+    local queued_seen = false
+    for _, message in ipairs(ag.messages) do
+      if message.original_text == "during compaction" then queued_seen = true end
+    end
+    check(queued_seen, "the queued message dispatches after compaction without being lost")
     check(cb_info ~= nil, "compact callback received info")
     check(#ag.messages < 10, "agent messages array was replaced with the compacted result")
     check(ag.usage.input >= 500, "summarizer usage was folded into session usage totals")
@@ -1601,16 +2005,121 @@ do
   end
   config.options.subagents.enabled = enabled
   check(not exposed, "sub_agent is removed from the model schema when disabled")
+  local sub_schema
+  for _, schema in ipairs(tools.schemas()) do
+    if schema.name == "sub_agent" then sub_schema = schema.input_schema end
+  end
+  check(
+    sub_schema
+      and vim.tbl_contains(sub_schema.required, "model")
+      and vim.tbl_contains(sub_schema.required, "effort")
+      and sub_schema.properties.model.minLength == 1
+      and sub_schema.properties.effort.minLength == 1
+      and vim.tbl_contains(sub_schema.properties.effort.enum, "medium")
+      and type(sub_schema.properties.model.enum) == "table"
+      and #sub_schema.properties.model.enum > 0
+      and vim.tbl_contains(sub_schema.properties.model.enum, "sol")
+      and vim.tbl_contains(sub_schema.properties.model.enum, "sonnet")
+      and not vim.tbl_contains(sub_schema.properties.model.enum, "openai/gpt-5.1-codex-mini")
+      and not vim.tbl_contains(sub_schema.properties.model.enum, ""),
+    "sub-agent schema requires one-shot short model aliases and explicit effort"
+  )
+  local expected_aliases = { "sol", "terra", "luna", "opus", "sonnet", "haiku" }
+  local all_aliases = true
+  for _, alias in ipairs(expected_aliases) do
+    all_aliases = all_aliases and vim.tbl_contains(sub_schema.properties.model.enum, alias)
+  end
+  check(
+    all_aliases and #sub_schema.properties.model.enum == #expected_aliases,
+    "default scout schema exposes exactly the three current Codex and three Claude aliases"
+  )
+  local function schema_aliases(parent_model)
+    for _, schema in ipairs(tools.schemas(parent_model)) do
+      if schema.name == "sub_agent" then return schema.input_schema.properties.model.enum or {} end
+    end
+    return {}
+  end
+  local openai_aliases = schema_aliases({ provider = "openai", id = "gpt-5.6-sol" })
+  local anthropic_aliases = schema_aliases({ provider = "anthropic", id = "claude-opus-4-8" })
+  check(
+    #openai_aliases == 3
+      and vim.tbl_contains(openai_aliases, "sol")
+      and vim.tbl_contains(openai_aliases, "terra")
+      and vim.tbl_contains(openai_aliases, "luna")
+      and not vim.tbl_contains(openai_aliases, "opus"),
+    "Codex parents expose only same-provider Sol/Terra/Luna scout aliases"
+  )
+  check(
+    #anthropic_aliases == 3
+      and vim.tbl_contains(anthropic_aliases, "opus")
+      and vim.tbl_contains(anthropic_aliases, "sonnet")
+      and vim.tbl_contains(anthropic_aliases, "haiku")
+      and not vim.tbl_contains(anthropic_aliases, "sol"),
+    "Claude parents expose only same-provider Opus/Sonnet/Haiku scout aliases"
+  )
+  local affinity_err = require("advantage.subagent").preflight({
+    prompt = "cross-provider probe",
+    model = "opus",
+    effort = "high",
+  }, { model = { provider = "openai", id = "gpt-5.6-sol" } })
+  check(
+    affinity_err
+      and affinity_err:find("cross-provider scouting is disabled", 1, true)
+      and require("advantage.subagent").preflight({
+          prompt = "same-provider probe",
+          model = "sol",
+          effort = "high",
+        }, { model = { provider = "openai", id = "gpt-5.6-sol" } })
+        == nil,
+    "execution preflight enforces provider affinity even for stale or fabricated tool calls"
+  )
+  local saved_cross_provider = config.options.subagents.allow_cross_provider
+  config.options.subagents.allow_cross_provider = true
+  local cross_aliases = schema_aliases({ provider = "openai", id = "gpt-5.6-sol" })
+  config.options.subagents.allow_cross_provider = saved_cross_provider
+  check(
+    #cross_aliases == 6 and vim.tbl_contains(cross_aliases, "opus"),
+    "explicit allow_cross_provider opt-in restores mixed OpenAI/Anthropic scout routing"
+  )
+  local alias_model, alias_ref = config.resolve_subagent_model("sol")
+  check(
+    alias_model and alias_model.id == "gpt-5.6-sol" and alias_ref == "openai/gpt-5.6-sol",
+    "the sol scout alias resolves to the configured current Codex model"
+  )
+  check(
+    config.resolve_subagent_model("openai/gpt-5.1-codex-mini") == nil
+      and config.resolve_subagent_model("openai/gpt-5.6") == nil,
+    "raw legacy or invented first-party model refs cannot reach a scout provider"
+  )
+  -- lazy.nvim can reload subagent.lua while the old config module remains in
+  -- package.loaded. The alias contract must keep working instead of throwing a
+  -- scheduled-callback traceback until Neovim is restarted.
+  local resolve_aliases, resolve_choice = config.subagent_model_aliases, config.resolve_subagent_model
+  local saved_alias_map = config.options.subagents.model_aliases
+  config.subagent_model_aliases, config.resolve_subagent_model = nil, nil
+  config.options.subagents.model_aliases = nil
+  local mixed_reload_ok, mixed_reload_err =
+    pcall(require("advantage.subagent").preflight, { prompt = "mixed reload probe", model = "sol", effort = "medium" })
+  config.subagent_model_aliases, config.resolve_subagent_model = resolve_aliases, resolve_choice
+  config.options.subagents.model_aliases = saved_alias_map
+  check(
+    mixed_reload_ok and mixed_reload_err == nil,
+    "new subagent code remains compatible with an old cached config module"
+  )
   local bad_model_result, bad_model_error
-  require("advantage.subagent").run({ prompt = "inspect", model = "not-a-ref" }, {
+  require("advantage.subagent").run({
+    prompt = "inspect",
+    model = "openai/gpt-5.1-codex-mini",
+    effort = "medium",
+  }, {
     cwd = vim.uv.cwd(),
     model = { provider = "fakesub", id = "model", label = "fake sub" },
   }, function(out, is_error)
     bad_model_result, bad_model_error = out, is_error
   end)
   check(
-    bad_model_error == true and tostring(bad_model_result):find("Invalid sub-agent model ref", 1, true),
-    "an invalid explicit scout model never silently falls back to the parent"
+    bad_model_error == true and tostring(bad_model_result):find("Invalid sub-agent model choice", 1, true),
+    "an observed transport-incompatible legacy Codex ref is rejected before provider startup"
   )
   local tmp = vim.fn.tempname()
   vim.fn.mkdir(tmp, "p")
@@ -1643,7 +2152,7 @@ do
     end,
   })
   local done, result, err = false, nil, nil
-  tools.get("sub_agent").run({ prompt = "inspect note", model = "fakesub/model", max_turns = 4 }, {
+  tools.get("sub_agent").run({ prompt = "inspect note", model = "fakesub/model", effort = "medium", max_turns = 4 }, {
     cwd = tmp,
     model = { provider = "fakesub", id = "model", label = "fake sub" },
   }, function(out, is_err)
@@ -1654,6 +2163,73 @@ do
   end, 10)
   check(turn == 2 and saw_tool_result, "sub-agent can use read-only tools in its own loop")
   check(err == false and assert(result):find("subagent evidence", 1, true), "sub-agent returns final report")
+
+  -- Model choice is intentional: an empty/whitespace ref must never silently
+  -- inherit a model the parent did not name.
+  turn, saw_tool_result, done, result, err = 0, false, false, nil, nil
+  tools.get("sub_agent").run({ prompt = "inspect note", model = "   ", effort = "" }, {
+    cwd = tmp,
+    model = { provider = "fakesub", id = "model", label = "fake sub" },
+  }, function(out, is_err)
+    result, err, done = out, is_err, true
+  end)
+  check(
+    done and turn == 0 and err == true and result and result:find("model is required", 1, true),
+    "empty sub-agent model is rejected instead of silently inheriting"
+  )
+  done, result, err = false, nil, nil
+  tools.get("sub_agent").run({ prompt = "inspect note", model = "fakesub/model", effort = "   " }, {
+    cwd = tmp,
+    model = { provider = "fakesub", id = "model", label = "fake sub" },
+  }, function(out, is_err)
+    result, err, done = out, is_err, true
+  end)
+  check(
+    done and turn == 0 and err == true and result and result:find("effort is required", 1, true),
+    "empty sub-agent effort is rejected instead of silently defaulting"
+  )
+
+  -- A provider-level auth failure removes every alias for that provider from
+  -- subsequent schemas, preventing Sonnet→Haiku→Opus retry roulette.
+  local subagent = require("advantage.subagent")
+  subagent._reset_route_health()
+  local saved_models = vim.deepcopy(config.options.models)
+  local saved_aliases = vim.deepcopy(config.options.subagents.model_aliases)
+  config.options.models[#config.options.models + 1] = { ref = "fakeauth/model", label = "fake auth" }
+  config.options.subagents.model_aliases.broken_auth = "fakeauth/model"
+  local auth_starts = 0
+  providers.register("fakeauth", {
+    stream = function(req)
+      auth_starts = auth_starts + 1
+      vim.schedule(function()
+        req.on.error("Claude token refresh failed (Rate limited. Please try again later.)")
+      end)
+      return { stop = function() end }
+    end,
+  })
+  local auth_done, auth_result = false, nil
+  subagent.run({ prompt = "auth probe", model = "broken_auth", effort = "medium" }, {
+    cwd = tmp,
+    model = { provider = "fakeauth", id = "model", label = "fake auth" },
+  }, function(out)
+    auth_done, auth_result = true, out
+  end)
+  vim.wait(1000, function()
+    return auth_done
+  end, 10)
+  local still_available = false
+  for _, item in ipairs(subagent.available_model_aliases()) do
+    if item.alias == "broken_auth" then still_available = true end
+  end
+  check(
+    auth_starts == 1
+      and not still_available
+      and tostring(auth_result):find("do not try another fakeauth model", 1, true),
+    "provider auth failure opens a cooldown and explicitly stops sibling-model retries"
+  )
+  config.options.models = saved_models
+  config.options.subagents.model_aliases = saved_aliases
+  subagent._reset_route_health()
 end
 
 -- 4b-limit. sub-agent turn-limit guarantees a real report ----------------------
@@ -1697,7 +2273,12 @@ do
   })
 
   local done, result, err = false, nil, nil
-  tools.get("sub_agent").run({ prompt = "bug-hunt note.txt", model = "fakesublimit/model", max_turns = 3 }, {
+  tools.get("sub_agent").run({
+    prompt = "bug-hunt note.txt",
+    model = "fakesublimit/model",
+    effort = "medium",
+    max_turns = 3,
+  }, {
     cwd = tmp,
     model = { provider = "fakesublimit", id = "model", label = "fake" },
   }, function(out, is_err)
@@ -1713,7 +2294,10 @@ do
   check(final_had_tools == true, "the final turn still DECLARES the tools (so prior tool_use blocks validate)")
   check(err == false, "a turn-limit stop is NOT flagged as an error")
   check(
-    result ~= nil and result:find("FINAL REPORT", 1, true) and result:find("note.txt:1", 1, true),
+    result ~= nil
+      and result:find("FINAL REPORT", 1, true)
+      and result:find("note.txt:1", 1, true)
+      and result:find("3/3 requests", 1, true),
     "the turn budget ends in a real report with findings, not an empty limit error"
   )
 
@@ -1735,7 +2319,7 @@ do
     end,
   })
   local done2, result2, err2 = false, nil, nil
-  tools.get("sub_agent").run({ prompt = "x", model = "fakesubdefiant/model", max_turns = 3 }, {
+  tools.get("sub_agent").run({ prompt = "x", model = "fakesubdefiant/model", effort = "medium", max_turns = 3 }, {
     cwd = tmp,
     model = { provider = "fakesubdefiant", id = "model", label = "fake" },
   }, function(out, is_err)
@@ -1768,7 +2352,7 @@ do
     end,
   })
   local done3 = false
-  tools.get("sub_agent").run({ prompt = "x", model = "fakesubfloor/model", max_turns = 1 }, {
+  tools.get("sub_agent").run({ prompt = "x", model = "fakesubfloor/model", effort = "medium", max_turns = 1 }, {
     cwd = tmp,
     model = { provider = "fakesubfloor", id = "model", label = "fake" },
   }, function()
@@ -1778,6 +2362,57 @@ do
     return done3
   end, 10)
   check(turns3 == 2, "max_turns=1 is floored to 2 (one investigation turn + one report turn)")
+
+  local checkpoint_turns, checkpoint_seen = 0, false
+  providers.register("fakesubsufficient", {
+    stream = function(req)
+      checkpoint_turns = checkpoint_turns + 1
+      if checkpoint_turns == 5 then
+        for _, message in ipairs(req.messages or {}) do
+          for _, block in ipairs(message.content or {}) do
+            if block.type == "text" and tostring(block.text):find("Sufficiency checkpoint", 1, true) then
+              checkpoint_seen = true
+            end
+          end
+        end
+      end
+      vim.defer_fn(function()
+        if checkpoint_turns == 5 then
+          req.on.complete({ { type = "text", text = "checkpoint report" } }, "end_turn")
+        else
+          req.on.tool_start("c" .. checkpoint_turns, "read_file")
+          req.on.complete({
+            {
+              type = "tool_use",
+              id = "c" .. checkpoint_turns,
+              name = "read_file",
+              input = { path = "note.txt" },
+            },
+          }, "tool_use")
+        end
+      end, 5)
+      return { stop = function() end }
+    end,
+  })
+  local checkpoint_done, checkpoint_result = false, nil
+  tools.get("sub_agent").run({
+    prompt = "stop once evidence is sufficient",
+    model = "fakesubsufficient/model",
+    effort = "medium",
+    max_turns = 6,
+  }, {
+    cwd = tmp,
+    model = { provider = "fakesubsufficient", id = "model", label = "fake" },
+  }, function(out)
+    checkpoint_result, checkpoint_done = out, true
+  end)
+  vim.wait(5000, function()
+    return checkpoint_done
+  end, 10)
+  check(
+    checkpoint_seen and checkpoint_turns == 5 and checkpoint_result and checkpoint_result:find("5/6 requests", 1, true),
+    "turn-four sufficiency checkpoint encourages an evidence-complete scout to report before its hard ceiling"
+  )
 end
 
 -- 4b-tc. providers forward tool_choice to the request body ---------------------
@@ -1884,14 +2519,21 @@ do
       and haiku_body.output_config == nil,
     "Haiku 4.5 retains the legacy fixed-budget thinking path"
   )
+  assert(effort.set_anthropic(haiku, "xhigh"))
+  check(
+    anthropic_body(haiku).thinking.budget_tokens == 16384,
+    "provider-neutral xhigh maps to Haiku's legacy highest budget"
+  )
 
   local sol = assert(config.resolve_model("openai/gpt-5.6-sol"))
   local luna = assert(config.resolve_model("openai/gpt-5.6-luna"))
   local chatgpt_sol = effort.openai_levels(sol, "chatgpt")
   local api_sol = effort.openai_levels(sol, "api_key")
   check(
-    vim.tbl_contains(chatgpt_sol, "ultra") and not vim.tbl_contains(chatgpt_sol, "none"),
-    "ChatGPT-login Sol exposes subscription-native ultra but not raw-API none"
+    vim.tbl_contains(chatgpt_sol, "max")
+      and not vim.tbl_contains(chatgpt_sol, "ultra")
+      and not vim.tbl_contains(chatgpt_sol, "none"),
+    "ChatGPT-login Sol exposes real wire efforts through max; Ultra belongs to the harness picker"
   )
   check(
     vim.tbl_contains(api_sol, "none") and not vim.tbl_contains(api_sol, "ultra"),
@@ -1907,7 +2549,7 @@ do
   local gpt55_login, gpt55_login_err = effort.resolve_openai(gpt55, "chatgpt", "ultra")
   local sol_api, sol_api_err = effort.resolve_openai(sol, "api_key", "ultra")
   check(
-    sol_login == "ultra"
+    sol_login == "max"
       and sol_login_err == nil
       and luna_login == "max"
       and luna_login_err == nil
@@ -1915,15 +2557,49 @@ do
       and gpt55_login_err == nil
       and sol_api == "max"
       and sol_api_err == nil,
-    "inherited provider ultra clamps to each model/transport maximum without weakening Sol login"
+    "ultra resolves to maximum wire effort while preserving model/transport clamping"
+  )
+  local ultra_body = openai._build_body(config.options.providers.openai, {
+    model = { id = "gpt-5.6-sol", reasoning_effort = "ultra" },
+    messages = messages,
+    tools = {},
+  })
+  check(
+    ultra_body.reasoning.effort == "max",
+    "OpenAI Ultra is a harness mode and never sends an invalid literal ultra effort"
+  )
+  local login_url, login_headers = openai._endpoint_for(
+    { mode = "chatgpt", token = "token", account_id = "account" },
+    config.options.providers.openai,
+    ultra_body,
+    { session_id = "session-probe" }
+  )
+  local header_text = table.concat(login_headers, "\n"):lower()
+  check(
+    login_url == "https://chatgpt.com/backend-api/codex/responses"
+      and header_text:find("session%-id: session%-probe") ~= nil
+      and header_text:find("thread%-id: session%-probe") ~= nil
+      and header_text:find("session_id:", 1, true) == nil
+      and header_text:find("openai%-beta:") == nil,
+    "ChatGPT login uses current Codex identity headers without the stale Responses beta"
+  )
+  local ultra_prompt = require("advantage.agent").system_prompt(nil, nil, nil, sol, "ultra")
+  local ultra_prompt_lower = ultra_prompt:lower()
+  check(
+    ultra_prompt:find("Harness mode: ultra", 1, true) ~= nil
+      and ultra_prompt_lower:find("proactively consider delegation", 1, true) ~= nil
+      and ultra_prompt_lower:find("task-proportional", 1, true) ~= nil,
+    "Ultra adds proactive parallel-delegation policy to the parent harness"
+  )
+  local explicit_parallel_guide = require("advantage.harness").guide("auto", sol, true)
+  check(
+    explicit_parallel_guide:find("Emit all independent sub_agent calls together", 1, true) ~= nil,
+    "an explicit user parallel request forces same-response scout fan-out guidance"
   )
   local explicit_api_sol = vim.deepcopy(sol)
   explicit_api_sol.reasoning_effort = "ultra"
   local explicit_value, explicit_err = effort.resolve_openai(explicit_api_sol, "api_key", "ultra")
-  check(
-    explicit_value == nil and type(explicit_err) == "string" and explicit_err:find("explicit model override", 1, true),
-    "an explicit unsupported per-model effort remains an error instead of being clamped"
-  )
+  check(explicit_value == "max" and explicit_err == nil, "a persisted pre-migration Ultra effort safely aliases to max")
 
   local none_body = openai._build_body(config.options.providers.openai, {
     model = { id = "gpt-5.6-sol", reasoning_effort = "none" },
@@ -1941,6 +2617,91 @@ do
   check(
     #unknown_items == 1 and unknown_items[1].value == "default" and unknown_body.thinking == nil,
     "unknown Claude IDs omit generation-specific thinking knobs until capabilities are declared"
+  )
+end
+
+-- 4a2. independent harness orchestration modes ---------------------------------
+
+section("harness modes")
+do
+  local harness = require("advantage.harness")
+  local config = require("advantage.config")
+  local agent_mod = require("advantage.agent")
+  local sol = assert(config.resolve_model("openai/gpt-5.6-sol"))
+
+  local low, high, max, ultra =
+    harness.policy("low", sol), harness.policy("high", sol), harness.policy("max", sol), harness.policy("ultra", sol)
+  check(
+    not low.proactive
+      and not low.parallel
+      and low.max_parallel == 1
+      and high.proactive
+      and high.max_parallel == 2
+      and not max.proactive
+      and ultra.proactive
+      and ultra.max_parallel == 8,
+    "harness presets progressively control proactive and parallel delegation"
+  )
+  local auto_model = vim.deepcopy(sol)
+  auto_model.reasoning_effort = "xhigh"
+  check(harness.effective("auto", auto_model) == "xhigh", "auto harness mode follows the current effort")
+
+  local preset_model = vim.deepcopy(sol)
+  assert(harness.sync_effort(preset_model, "high"))
+  check(preset_model.reasoning_effort == "high", "selecting a harness preset initializes matching model effort")
+  assert(harness.sync_effort(preset_model, "ultra"))
+  check(
+    preset_model.reasoning_effort == "max",
+    "Ultra initializes max model effort while remaining a separate harness setting"
+  )
+
+  local ag = agent_mod.new({ model = preset_model, harness_mode = "high" })
+  check(
+    ag:harness_policy().mode == "high" and ag:harness_policy().max_parallel == 2,
+    "each agent owns an independent harness mode and concurrency policy"
+  )
+  check(
+    agent_mod.new({ model = preset_model, harness_mode = "tampered" }).harness_mode == "auto",
+    "invalid persisted harness modes normalize safely to auto"
+  )
+  local high_prompt = agent_mod.system_prompt(nil, ag.ctx.cwd, ag._base_system_prompt, ag.model, ag.harness_mode)
+  check(
+    high_prompt:find("Harness mode: high", 1, true) ~= nil
+      and high_prompt:find('model="sol"', 1, true) ~= nil
+      and high_prompt:find("Never invent", 1, true) ~= nil,
+    "the exact parent prompt names its known-working scout alias and forbids model guessing"
+  )
+  assert(require("advantage.effort").set_openai(ag.model, "low"))
+  local independent_body = require("advantage.providers.openai")._build_body(config.options.providers.openai, {
+    model = ag.model,
+    messages = {},
+    tools = {},
+  })
+  check(
+    ag:harness_policy().mode == "high" and independent_body.reasoning.effort == "low",
+    "reasoning effort remains independently adjustable after selecting a harness preset"
+  )
+
+  local saved_subagents = vim.deepcopy(config.options.subagents)
+  config.options.subagents.parallel = false
+  local sequential_guide = harness.guide("ultra", sol)
+  config.options.subagents.enabled = false
+  local disabled_guide = harness.guide("ultra", sol)
+  config.options.subagents = saved_subagents
+  check(
+    sequential_guide:find('mode="sequential"', 1, true) ~= nil
+      and sequential_guide:find("globally disabled parallel scheduler", 1, true) ~= nil
+      and disabled_guide:find("Sub-agents are disabled", 1, true) ~= nil,
+    "harness guidance respects global sequential and disabled overrides"
+  )
+
+  local advantage = require("advantage")
+  check(
+    vim.tbl_contains(advantage._subcommands, "harness")
+      and vim.tbl_contains(advantage._harness_modes, "ultra")
+      and vim.tbl_contains(advantage._effort_modes, "xhigh")
+      and config.defaults.keymaps.harness == "<leader>ch",
+    "commands and defaults expose harness modes through <leader>ch"
   )
 end
 
@@ -2371,6 +3132,16 @@ do
   local ok = pcall(ui.notice, "error: first line\nsecond line")
   local text = table.concat(vim.api.nvim_buf_get_lines(ui.state.buf, 0, -1, false), "\n")
   check(ok and text:find("second line", 1, true) ~= nil, "multiline notices render without crashing")
+  local failed_line = require("advantage.ui.chat.render").tool_line({
+    name = "sub_agent",
+    status = "error",
+    detail = "audit provider architecture",
+    error = "Claude token refresh failed (rate limited)",
+  })
+  check(
+    failed_line:find("audit provider architecture", 1, true) and failed_line:find("token refresh failed", 1, true),
+    "failed tool rows retain their task and show the actionable error reason"
+  )
 end
 
 -- 9. attachments / @mentions -------------------------------------------------------
@@ -2775,17 +3546,23 @@ do
   })
 
   local pturn, final_results, requested_parallel = 0, nil, nil
+  local fanout_size = 13 -- exceeds both removed legacy caps (8/batch, 12/turn)
   providers.register("fakepar", {
     stream = function(req)
       pturn = pturn + 1
       if pturn == 1 then requested_parallel = req.parallel_tool_calls end
       vim.defer_fn(function()
         if pturn == 1 then
-          req.on.complete({
-            { type = "tool_use", id = "s1", name = "sub_agent", input = { prompt = "alpha", model = "fakesubpar/m" } },
-            { type = "tool_use", id = "s2", name = "sub_agent", input = { prompt = "beta", model = "fakesubpar/m" } },
-            { type = "tool_use", id = "s3", name = "sub_agent", input = { prompt = "gamma", model = "fakesubpar/m" } },
-          }, "tool_use")
+          local calls = {}
+          for i = 1, fanout_size do
+            calls[i] = {
+              type = "tool_use",
+              id = "s" .. i,
+              name = "sub_agent",
+              input = { prompt = "investigation " .. i, model = "fakesubpar/m", effort = "medium" },
+            }
+          end
+          req.on.complete(calls, "tool_use")
         else
           for _, m in ipairs(req.messages) do
             if m.role == "user" then
@@ -2793,7 +3570,7 @@ do
               for _, b in ipairs(m.content) do
                 if b.type == "tool_result" then trs[#trs + 1] = b end
               end
-              if #trs == 3 then final_results = trs end
+              if #trs == fanout_size then final_results = trs end
             end
           end
           req.on.complete({ { type = "text", text = "all done" } }, "end_turn")
@@ -2809,15 +3586,132 @@ do
     return pturn >= 2 and final_results ~= nil
   end, 10)
 
-  check(sub_started == 3, "all three sub-agents ran")
+  check(sub_started == fanout_size, "every requested sub-agent runs without batch or cumulative rejection")
   check(requested_parallel == true, "main-agent provider request permits parallel tool calls")
   check(max_concurrent >= 2, "sub-agents overlapped instead of running one-at-a-time")
-  check(final_results and #final_results == 3, "three tool_results merged into one user turn")
+  check(
+    max_concurrent <= ag:harness_policy().max_parallel,
+    "max_parallel bounds concurrent streams while excess scouts wait in the queue"
+  )
+  check(final_results and #final_results == fanout_size, "all queued tool_results merge into one user turn")
   local ids = {}
   for _, tr in ipairs(final_results or {}) do
     ids[tr.tool_use_id] = true
   end
-  check(ids.s1 and ids.s2 and ids.s3, "each sub_agent call got its matching tool_result")
+  local all_ids = true
+  for i = 1, fanout_size do
+    all_ids = all_ids and ids["s" .. i]
+  end
+  check(all_ids, "each queued sub_agent call got its matching tool_result")
+
+  -- Exact initialization policy: a model may include `model = ""` on every
+  -- scout. Reject all four before provider startup so the parent must make an
+  -- explicit model choice rather than silently running unintended workers.
+  local empty_parent_turn, empty_scouts, empty_batch_results = 0, 0, nil
+  providers.register("fakeemptybatch", {
+    stream = function(req)
+      local is_scout = req.system and req.system:find("read%-only sub%-agent") ~= nil
+      vim.defer_fn(function()
+        if is_scout then
+          empty_scouts = empty_scouts + 1
+          req.on.complete({ { type = "text", text = "inherited-model report" } }, "end_turn")
+          return
+        end
+        empty_parent_turn = empty_parent_turn + 1
+        if empty_parent_turn == 1 then
+          local calls = {}
+          for i = 1, 4 do
+            calls[i] = {
+              type = "tool_use",
+              id = "e" .. i,
+              name = "sub_agent",
+              input = { prompt = "empty override " .. i, model = "", effort = "" },
+            }
+          end
+          req.on.complete(calls, "tool_use")
+        else
+          for _, m in ipairs(req.messages) do
+            if m.role == "user" then
+              local found = {}
+              for _, b in ipairs(m.content) do
+                if b.type == "tool_result" then found[#found + 1] = b end
+              end
+              if #found == 4 then empty_batch_results = found end
+            end
+          end
+          req.on.complete({ { type = "text", text = "empty batch done" } }, "end_turn")
+        end
+      end, 10)
+      return { stop = function() end }
+    end,
+  })
+  local empty_agent = agent_mod.new({
+    model = { provider = "fakeemptybatch", id = "parent", label = "empty batch" },
+    harness_mode = "ultra",
+  })
+  empty_agent:send("fan out with empty optional model fields")
+  vim.wait(6000, function()
+    return empty_parent_turn >= 2 and empty_batch_results ~= nil
+  end, 10)
+  local all_model_errors = empty_batch_results and #empty_batch_results == 4
+  for _, result_item in ipairs(empty_batch_results or {}) do
+    local content = tostring(result_item.content)
+    all_model_errors = all_model_errors
+      and result_item.is_error == true
+      and (content:find("input.model", 1, true) ~= nil or content:find("input.effort", 1, true) ~= nil)
+  end
+  check(empty_scouts == 0 and all_model_errors, "four blank-intent scouts are rejected before provider startup")
+
+  -- Low harness mode keeps provider multi-call support (so batching remains
+  -- available) but executes scout results sequentially by policy.
+  sub_started, concurrent, max_concurrent = 0, 0, 0
+  local low_turn, low_results, low_requested_parallel = 0, nil, nil
+  providers.register("fakeparlow", {
+    stream = function(req)
+      low_turn = low_turn + 1
+      if low_turn == 1 then low_requested_parallel = req.parallel_tool_calls end
+      vim.defer_fn(function()
+        if low_turn == 1 then
+          req.on.complete({
+            {
+              type = "tool_use",
+              id = "l1",
+              name = "sub_agent",
+              input = { prompt = "one", model = "fakesubpar/m", effort = "medium" },
+            },
+            {
+              type = "tool_use",
+              id = "l2",
+              name = "sub_agent",
+              input = { prompt = "two", model = "fakesubpar/m", effort = "medium" },
+            },
+          }, "tool_use")
+        else
+          for _, m in ipairs(req.messages) do
+            if m.role == "user" then
+              local found = {}
+              for _, b in ipairs(m.content) do
+                if b.type == "tool_result" then found[#found + 1] = b end
+              end
+              if #found == 2 then low_results = found end
+            end
+          end
+          req.on.complete({ { type = "text", text = "low done" } }, "end_turn")
+        end
+      end, 10)
+      return { stop = function() end }
+    end,
+  })
+  local low_agent = agent_mod.new({
+    model = { provider = "fakeparlow", id = "m", label = "low" },
+    harness_mode = "low",
+  })
+  low_agent:send("batch but execute sequentially")
+  vim.wait(6000, function()
+    return low_turn >= 2 and low_results ~= nil
+  end, 10)
+  check(low_requested_parallel == true, "low harness keeps provider multi-call batching available")
+  check(max_concurrent == 1 and low_results and #low_results == 2, "low harness executes sub-agents sequentially")
 
   -- mixed batch: a leading todo_write must not demote the trailing sub_agents
   -- to one-at-a-time (plan first, then fan out — the canonical agent pattern)
@@ -2840,12 +3734,17 @@ do
                 },
               },
             },
-            { type = "tool_use", id = "m1", name = "sub_agent", input = { prompt = "delta", model = "fakesubpar/m" } },
+            {
+              type = "tool_use",
+              id = "m1",
+              name = "sub_agent",
+              input = { prompt = "delta", model = "fakesubpar/m", effort = "medium" },
+            },
             {
               type = "tool_use",
               id = "m2",
               name = "sub_agent",
-              input = { prompt = "epsilon", model = "fakesubpar/m" },
+              input = { prompt = "epsilon", model = "fakesubpar/m", effort = "medium" },
             },
           }, "tool_use")
         else
@@ -2876,6 +3775,98 @@ do
   check(
     mixed_results ~= nil and #mixed_results == 3 and mixed_results[1].tool_use_id == "t0",
     "mixed batch: todo_write result leads the merged reply, fan-out results follow"
+  )
+
+  -- Regression: providers may place a safe ordinary lookup *after* a leading
+  -- scout wave in the same response. The scheduler must fan out that contiguous
+  -- scout prefix once, then run the ordinary tail, without reordering or
+  -- duplicating any function_call_output blocks.
+  local function run_leading_scout_prefix(provider_name, id_prefix)
+    local state = { turn = 0, results = nil }
+    providers.register(provider_name, {
+      stream = function(req)
+        state.turn = state.turn + 1
+        local turn = state.turn
+        vim.defer_fn(function()
+          if turn == 1 then
+            req.on.complete({
+              {
+                type = "tool_use",
+                id = id_prefix .. "1",
+                name = "sub_agent",
+                input = { prompt = id_prefix .. " scout one", model = "fakesubpar/m", effort = "medium" },
+              },
+              {
+                type = "tool_use",
+                id = id_prefix .. "2",
+                name = "sub_agent",
+                input = { prompt = id_prefix .. " scout two", model = "fakesubpar/m", effort = "medium" },
+              },
+              {
+                type = "tool_use",
+                id = id_prefix .. "3",
+                name = "sub_agent",
+                input = { prompt = id_prefix .. " scout three", model = "fakesubpar/m", effort = "medium" },
+              },
+              {
+                type = "tool_use",
+                id = id_prefix .. "tail",
+                name = "list_dir",
+                input = { path = "." },
+              },
+            }, "tool_use")
+          else
+            for _, message in ipairs(req.messages or {}) do
+              if message.role == "user" then
+                local results = {}
+                for _, block in ipairs(type(message.content) == "table" and message.content or {}) do
+                  if block.type == "tool_result" then results[#results + 1] = block end
+                end
+                if #results == 4 then state.results = results end
+              end
+            end
+            req.on.complete({ { type = "text", text = "leading scout prefix done" } }, "end_turn")
+          end
+        end, 10)
+        return { stop = function() end }
+      end,
+    })
+    local ag = agent_mod.new({
+      model = { provider = provider_name, id = "m", label = provider_name },
+      harness_mode = "ultra",
+    })
+    ag:send("run a leading scout prefix and then inspect the directory")
+    vim.wait(6000, function()
+      return state.turn >= 2 and state.results ~= nil and ag.status == "idle"
+    end, 10)
+    return state
+  end
+
+  sub_started, concurrent, max_concurrent = 0, 0, 0
+  local leading = run_leading_scout_prefix("fakeleadingscouts", "lead-")
+  local leading_ordered = leading.results and #leading.results == 4
+  for i, expected in ipairs({ "lead-1", "lead-2", "lead-3", "lead-tail" }) do
+    leading_ordered = leading_ordered and leading.results[i].tool_use_id == expected
+  end
+  check(
+    sub_started == 3 and max_concurrent >= 2,
+    "leading sub-agent prefix runs exactly once and overlaps before a trailing ordinary tool"
+  )
+  check(leading_ordered, "leading scout results and the ordinary tail preserve exact call order")
+
+  local config = require("advantage.config")
+  local saved_parallel = config.options.subagents.parallel
+  config.options.subagents.parallel = false
+  sub_started, concurrent, max_concurrent = 0, 0, 0
+  local serial_leading = run_leading_scout_prefix("fakeleadingscoutsserial", "serial-")
+  config.options.subagents.parallel = saved_parallel
+  local serial_ordered = serial_leading.results and #serial_leading.results == 4
+  for i, expected in ipairs({ "serial-1", "serial-2", "serial-3", "serial-tail" }) do
+    serial_ordered = serial_ordered and serial_leading.results[i].tool_use_id == expected
+  end
+  check(
+    sub_started == 3 and max_concurrent == 1 and serial_ordered,
+    "global parallel=false runs the same leading scout prefix serially without reordering"
   )
 end
 
@@ -2918,6 +3909,853 @@ do
     twice[1].content[1].text:find("OLDEST-MARKER-01", 1, true) ~= nil,
     "second compaction still preserves the oldest history (no destructive re-truncation)"
   )
+end
+
+-- Explicit sub_agent_batch orchestration lets the model choose parallel or
+-- sequential execution without relying on same-response tool-call grouping.
+section("explicit sub-agent batches")
+do
+  local providers = require("advantage.providers")
+  local tools = require("advantage.tools")
+  local config = require("advantage.config")
+  local active, peak = 0, 0
+  providers.register("fakebatch", {
+    stream = function(req)
+      active = active + 1
+      peak = math.max(peak, active)
+      vim.defer_fn(function()
+        active = active - 1
+        req.on.complete({ { type = "text", text = "batch scout report" } }, "end_turn")
+      end, 20)
+      return { stop = function() end }
+    end,
+  })
+  local function run_batch(mode, ctx)
+    local done, out, err = false, nil, nil
+    tools.get("sub_agent_batch").run(
+      {
+        mode = mode,
+        tasks = {
+          { prompt = "one", model = "fakebatch/model", effort = "medium", max_turns = 2 },
+          { prompt = "two", model = "fakebatch/model", effort = "medium", max_turns = 2 },
+          { prompt = "three", model = "fakebatch/model", effort = "medium", max_turns = 2 },
+        },
+      },
+      ctx or { cwd = vim.fn.getcwd() },
+      function(result, is_error)
+        out, err, done = result, is_error, true
+      end
+    )
+    vim.wait(5000, function()
+      return done
+    end, 10)
+    return out, err
+  end
+  local _, parallel_err = run_batch("parallel")
+  check(parallel_err == false and peak >= 2, "explicit parallel batch overlaps scouts")
+  peak = 0
+  local _, sequential_err = run_batch("sequential")
+  check(sequential_err == false and peak == 1, "explicit sequential batch runs one scout at a time")
+
+  peak = 0
+  local low_policy_err = select(
+    2,
+    run_batch("parallel", {
+      cwd = vim.fn.getcwd(),
+      agent = {
+        harness_policy = function()
+          return { parallel = false, max_parallel = 1 }
+        end,
+      },
+    })
+  )
+  check(
+    low_policy_err == false and peak == 1,
+    "explicit parallel batch obeys a sequential Low harness policy instead of bypassing it"
+  )
+
+  local saved_parallel = config.options.subagents.parallel
+  config.options.subagents.parallel = false
+  peak = 0
+  local disabled_parallel_err = select(2, run_batch("parallel"))
+  config.options.subagents.parallel = saved_parallel
+  check(
+    disabled_parallel_err == false and peak == 1,
+    "explicit parallel batch obeys the global subagents.parallel=false override"
+  )
+
+  local saved_width = config.options.subagents.max_parallel
+  config.options.subagents.max_parallel = 2
+  peak = 0
+  local width_err = select(
+    2,
+    run_batch("parallel", {
+      cwd = vim.fn.getcwd(),
+      agent = {
+        harness_policy = function()
+          return { parallel = true, max_parallel = 8 }
+        end,
+      },
+    })
+  )
+  config.options.subagents.max_parallel = saved_width
+  check(width_err == false and peak == 2, "explicit parallel batch obeys the configured live concurrency width")
+
+  local rendered_details = {}
+  local fake_ui = {
+    tool_begin = function() end,
+    tool_update = function(_, update)
+      if update and update.detail then rendered_details[#rendered_details + 1] = update.detail end
+    end,
+  }
+  peak = 0
+  local telemetry_err = select(
+    2,
+    run_batch("parallel", {
+      cwd = vim.fn.getcwd(),
+      agent = {
+        harness_policy = function()
+          return { parallel = true, max_parallel = 4 }
+        end,
+        ui = function()
+          return fake_ui
+        end,
+      },
+    })
+  )
+  local saw_request_progress = false
+  for _, detail in ipairs(rendered_details) do
+    if detail:find("Fakebatch · fakebatch/model/medium · request 1/2", 1, true) then saw_request_progress = true end
+  end
+  check(
+    telemetry_err == false and saw_request_progress,
+    "batch child rows distinguish provider, scout route, and live request progress"
+  )
+end
+
+-- The harness policy is deliberately compact, so phase-transition reminders
+-- ride tool-result turns instead of bloating every cached request. Exercise the
+-- real parent loop here: scout fan-out -> bounded read-only confirmation -> edit
+-- -> passing test -> repeated test -> later edit -> passing test -> repeated
+-- test. Action and verification reminders are one-shot at their respective
+-- phase boundaries, not one-shot forever.
+section("orchestration phase guidance & cache identity")
+do
+  local config = require("advantage.config")
+  local providers = require("advantage.providers")
+  local agent_mod = require("advantage.agent")
+  local tools = require("advantage.tools")
+  local harness = require("advantage.harness")
+  local saved_yolo = config.options.tools.yolo
+  local saved_auto_compact = config.options.context.auto_compact
+  config.options.tools.yolo = true
+  config.options.context.auto_compact = false
+
+  local function has_any(text, needles)
+    text = tostring(text or ""):lower()
+    for _, needle in ipairs(needles) do
+      if text:find(needle, 1, true) then return true end
+    end
+    return false
+  end
+
+  local function has_all_concepts(text, concepts)
+    for _, alternatives in ipairs(concepts) do
+      if not has_any(text, alternatives) then return false end
+    end
+    return true
+  end
+
+  local base_discipline = agent_mod.base_system_prompt(vim.fn.getcwd())
+  check(
+    has_all_concepts(base_discipline, {
+      { "narrowest", "smallest compatible", "minimal compatible" },
+      { "compatib" },
+      { "report" },
+      { "evidence" },
+      { "preserv" },
+      { "contract", "existing test", "regression test" },
+    }),
+    "base instructions demand narrow compatible fixes and treat reports as evidence while preserving contracts"
+  )
+  check(
+    has_all_concepts(base_discipline, {
+      { "do not weaken", "never weaken", "don't weaken" },
+      { "passing assertion", "passing test", "regression assertion" },
+      { "green", "make the suite pass", "make tests pass" },
+      { "hermetic", "self-contained test", "isolated test" },
+    }),
+    "base instructions forbid weakening passing assertions and require hermetic tests"
+  )
+
+  require("advantage.subagent")._reset_route_health()
+  local saved_models = vim.deepcopy(config.options.models)
+  local saved_aliases = vim.deepcopy(config.options.subagents.model_aliases)
+  config.options.models[#config.options.models + 1] = { ref = "fakephase/parent", label = "phase parent" }
+  config.options.subagents.model_aliases = config.options.subagents.model_aliases or {}
+  config.options.subagents.model_aliases.phase_policy = "fakephase/parent"
+  local proportional = harness.guide("ultra", { provider = "fakephase", id = "parent" }):lower()
+  config.options.models = saved_models
+  config.options.subagents.model_aliases = saved_aliases
+  check(
+    proportional:find("proportional", 1, true) ~= nil
+      and proportional:find("simple", 1, true) ~= nil
+      and proportional:find("complex", 1, true) ~= nil,
+    "harness policy makes delegation explicitly proportional to task complexity"
+  )
+  check(
+    proportional:find("self-contained", 1, true) ~= nil
+      and (
+        proportional:find("separate parent turn", 1, true) ~= nil
+        or proportional:find("later parent turn", 1, true) ~= nil
+      ),
+    "sequential batch guidance reserves dependent scouts for separate parent turns"
+  )
+
+  local identity_root_a, identity_root_b = vim.fn.tempname(), vim.fn.tempname()
+  vim.fn.mkdir(identity_root_a, "p")
+  vim.fn.mkdir(identity_root_b, "p")
+  local identity_a1 = agent_mod.new({
+    id = "same-persisted-conversation",
+    model = { provider = "fakeidentity", id = "m", label = "identity" },
+    cwd = identity_root_a,
+  })
+  local identity_a2 = agent_mod.new({
+    id = "same-persisted-conversation",
+    model = { provider = "fakeidentity", id = "m", label = "identity" },
+    cwd = identity_root_a,
+  })
+  local identity_b = agent_mod.new({
+    id = "same-persisted-conversation",
+    model = { provider = "fakeidentity", id = "m", label = "identity" },
+    cwd = identity_root_b,
+  })
+  check(
+    identity_a1.request_key == identity_a2.request_key and identity_a1.request_key ~= identity_b.request_key,
+    "request identity is stable for the same id/root and distinct across project roots"
+  )
+
+  local budget_prompts = {}
+  providers.register("fakebudgetcap", {
+    stream = function(req)
+      budget_prompts[#budget_prompts + 1] = req.system
+      vim.defer_fn(function()
+        req.on.complete({ { type = "text", text = "budget captured" } }, "end_turn")
+      end, 5)
+      return { stop = function() end }
+    end,
+  })
+  local function capture_budget(max_turns)
+    local done = false
+    local input = { prompt = "capture scout budget", model = "fakebudgetcap/m", effort = "medium" }
+    if max_turns ~= nil then input.max_turns = max_turns end
+    tools.get("sub_agent").run(input, { cwd = identity_root_a }, function()
+      done = true
+    end)
+    vim.wait(3000, function()
+      return done
+    end, 10)
+  end
+  capture_budget(nil)
+  capture_budget(99)
+  check(
+    config.options.subagents.max_turns == 6
+      and config.options.subagents.max_turns_cap == 12
+      and budget_prompts[1]
+      and budget_prompts[1]:find("budget of about 6 turns", 1, true) ~= nil
+      and budget_prompts[2]
+      and budget_prompts[2]:find("budget of about 12 turns", 1, true) ~= nil,
+    "scouts default to six turns while explicit requests are hard-capped at twelve"
+  )
+  check(
+    has_all_concepts(budget_prompts[1], {
+      { "root cause" },
+      { "evidence" },
+      { "minimal touch", "smallest touch", "minimal file", "minimal compatible" },
+      { "preserv" },
+      { "contract", "existing test" },
+      { "focused" },
+      { "case", "test" },
+      { "optional" },
+      { "hardening" },
+      { "separate" },
+    }),
+    "scout report contract asks for cause, evidence, minimal touch set, preserved contracts, focused cases, and separate hardening"
+  )
+  check(
+    has_all_concepts(budget_prompts[1], {
+      { "concise", "tight" },
+      { "900 words", "900-word", "under 900", "at most 900", "no more than 900", "about 900" },
+      { "decisive evidence", "decisive findings", "decision-relevant evidence", "most relevant evidence" },
+      { "minimal touch", "smallest touch", "minimal compatible" },
+      { "do not include exhaustive", "avoid exhaustive", "not an exhaustive" },
+      { "edge-case catalog", "edge case catalog", "edge-case inventory", "edge case inventory" },
+      { "not a play-by-play", "no play-by-play", "avoid play-by-play" },
+    }),
+    "scout report contract is bounded near 900 words and prioritizes decisive evidence over exhaustive catalogs or play-by-play"
+  )
+
+  local function guidance_texts(messages)
+    local found = {}
+    local function walk(value)
+      if type(value) == "string" then
+        if value:find("<harness-guidance>", 1, true) then found[#found + 1] = value end
+      elseif type(value) == "table" then
+        for _, child in pairs(value) do
+          walk(child)
+        end
+      end
+    end
+    walk(messages)
+    return found
+  end
+
+  local function tool_result_count(messages, id)
+    local count = 0
+    for _, message in ipairs(messages or {}) do
+      for _, block in ipairs(type(message.content) == "table" and message.content or {}) do
+        if block.type == "tool_result" and block.tool_use_id == id then count = count + 1 end
+      end
+    end
+    return count
+  end
+
+  local function tool_result_failed(messages, id)
+    for _, message in ipairs(messages or {}) do
+      for _, block in ipairs(type(message.content) == "table" and message.content or {}) do
+        if block.type == "tool_result" and block.tool_use_id == id then return block.is_error == true end
+      end
+    end
+    return false
+  end
+
+  local function verification_reminders(messages)
+    local found = {}
+    for _, guidance in ipairs(guidance_texts(messages)) do
+      if
+        has_all_concepts(guidance, {
+          { "verif" },
+          { "completed", "passed", "succeeded", "successful" },
+        })
+      then
+        found[#found + 1] = guidance
+      end
+    end
+    return found
+  end
+
+  local function failed_verification_reminders(messages)
+    local found = {}
+    for _, guidance in ipairs(guidance_texts(messages)) do
+      if
+        has_all_concepts(guidance, {
+          { "verif", "test command" },
+          { "failed", "failure", "non-zero", "nonzero" },
+          { "generation" },
+        })
+      then
+        found[#found + 1] = guidance
+      end
+    end
+    return found
+  end
+
+  local function action_checkpoint_reminders(messages)
+    local found = {}
+    for _, guidance in ipairs(guidance_texts(messages)) do
+      if
+        has_all_concepts(guidance, {
+          { "confirmation", "investigation pass" },
+          { "complete", "completed", "done" },
+          { "narrowest", "smallest compatible", "minimal touch", "minimal compatible" },
+          { "implement", "implementation" },
+        })
+      then
+        found[#found + 1] = guidance
+      end
+    end
+    return found
+  end
+
+  local tmp = vim.fn.tempname()
+  vim.fn.mkdir(tmp, "p")
+  vim.fn.writefile({
+    vim.json.encode({
+      scripts = {
+        test = "node -e \"const fs=require('fs');const s=fs.readFileSync('phase.txt','utf8');if(!s.includes('phase'))process.exit(1)\"",
+      },
+    }),
+  }, tmp .. "/package.json")
+  local parent_turn = 0
+  local phase_seen = {}
+  local phase_messages = {}
+  local scout_starts = {}
+  providers.register("fakephase", {
+    stream = function(req)
+      local is_scout = req.system and req.system:find("You are a read-only sub-agent", 1, true) ~= nil
+      if is_scout then
+        local prompt = req.messages[1].content[1].text
+        scout_starts[prompt] = (scout_starts[prompt] or 0) + 1
+        vim.defer_fn(function()
+          req.on.complete({ { type = "text", text = "report for " .. prompt } }, "end_turn")
+        end, 5)
+        return { stop = function() end }
+      end
+
+      parent_turn = parent_turn + 1
+      local turn = parent_turn
+      phase_seen[turn] = guidance_texts(req.messages)
+      phase_messages[turn] = vim.deepcopy(req.messages)
+      vim.defer_fn(function()
+        if turn == 1 then
+          req.on.complete({
+            {
+              type = "tool_use",
+              id = "phase-scout-1",
+              name = "sub_agent",
+              input = { prompt = "phase scout one", model = "fakephase/scout", effort = "medium" },
+            },
+            {
+              type = "tool_use",
+              id = "phase-scout-2",
+              name = "sub_agent",
+              input = { prompt = "phase scout two", model = "fakephase/scout", effort = "medium" },
+            },
+          }, "tool_use")
+        elseif turn == 2 then
+          req.on.complete({
+            {
+              type = "tool_use",
+              id = "phase-confirm-read",
+              name = "read_file",
+              input = { path = "package.json" },
+            },
+            {
+              type = "tool_use",
+              id = "phase-confirm-list",
+              name = "list_dir",
+              input = { path = "." },
+            },
+          }, "tool_use")
+        elseif turn == 3 then
+          req.on.complete({
+            {
+              type = "tool_use",
+              id = "phase-write-1",
+              name = "write_file",
+              input = { path = "phase.txt", content = "phase one\n" },
+            },
+          }, "tool_use")
+        elseif turn == 4 then
+          req.on.complete({
+            {
+              type = "tool_use",
+              id = "phase-test-1",
+              name = "bash",
+              input = { command = "npm test" },
+            },
+          }, "tool_use")
+        elseif turn == 5 then
+          req.on.complete({
+            {
+              type = "tool_use",
+              id = "phase-test-repeat-1",
+              name = "bash",
+              input = { command = "npm test" },
+            },
+          }, "tool_use")
+        elseif turn == 6 then
+          req.on.complete({
+            {
+              type = "tool_use",
+              id = "phase-write-2",
+              name = "edit_file",
+              input = { path = "phase.txt", old_string = "phase one", new_string = "phase two" },
+            },
+          }, "tool_use")
+        elseif turn == 7 then
+          req.on.complete({
+            {
+              type = "tool_use",
+              id = "phase-test-2",
+              name = "bash",
+              input = { command = "npm test" },
+            },
+          }, "tool_use")
+        elseif turn == 8 then
+          req.on.complete({
+            {
+              type = "tool_use",
+              id = "phase-test-repeat-2",
+              name = "bash",
+              input = { command = "npm test" },
+            },
+          }, "tool_use")
+        else
+          req.on.complete({ { type = "text", text = "phase run complete" } }, "end_turn")
+        end
+      end, 5)
+      return { stop = function() end }
+    end,
+  })
+
+  local phase_agent = agent_mod.new({
+    id = "phase-guidance-parent",
+    model = { provider = "fakephase", id = "parent", label = "phase parent" },
+    harness_mode = "ultra",
+    cwd = tmp,
+  })
+  phase_agent:send("Use two parallel scouts, then implement and test the result")
+  vim.wait(8000, function()
+    return parent_turn >= 9 and phase_agent.status == "idle"
+  end, 10)
+
+  check(
+    scout_starts["phase scout one"] == 1
+      and scout_starts["phase scout two"] == 1
+      and tool_result_count(phase_messages[2], "phase-scout-1") == 1
+      and tool_result_count(phase_messages[2], "phase-scout-2") == 1,
+    "same-response sub-agent tail calls execute and return exactly once each"
+  )
+  check(
+    phase_seen[2]
+      and #phase_seen[2] == 1
+      and phase_seen[2][1]:lower():find("scout", 1, true) ~= nil
+      and (
+        phase_seen[2][1]:lower():find("synth", 1, true) ~= nil
+        or phase_seen[2][1]:lower():find("reconcil", 1, true) ~= nil
+      ),
+    "first scout wave injects one model-visible synthesis reminder"
+  )
+  check(phase_seen[2] and has_all_concepts(phase_seen[2][1], {
+    { "report" },
+    { "evidence" },
+    { "validat", "reconcil", "synth" },
+  }), "scout-wave reminder treats reports as evidence to reconcile rather than implementation authority")
+  check(
+    phase_seen[3]
+      and #phase_seen[3] == 2
+      and tool_result_count(phase_messages[3], "phase-confirm-read") == 1
+      and tool_result_count(phase_messages[3], "phase-confirm-list") == 1,
+    "one bounded read-only confirmation batch completes before the first mutation"
+  )
+  local first_action_checkpoint = phase_seen[3] and action_checkpoint_reminders(phase_seen[3]) or {}
+  check(#first_action_checkpoint == 1 and has_all_concepts(first_action_checkpoint[1], {
+    { "stop expanding", "do not expand", "don't expand" },
+    { "re-audit", "reaudit", "re-auditing", "re auditing" },
+    { "narrowest", "smallest compatible", "minimal touch", "minimal compatible" },
+    { "now", "next turn" },
+  }), "completed confirmation pass stops expansion/re-auditing and requires the narrowest implementation next")
+  local action_checkpoint_once = true
+  for turn = 4, 9 do
+    action_checkpoint_once = action_checkpoint_once
+      and phase_seen[turn] ~= nil
+      and #action_checkpoint_reminders(phase_seen[turn]) == 1
+  end
+  check(action_checkpoint_once, "the post-confirmation action checkpoint does not repeat on later parent turns")
+  check(
+    phase_seen[4]
+      and #phase_seen[4] == 3
+      and (phase_seen[4][3]:lower():find("edit", 1, true) ~= nil or phase_seen[4][3]:lower():find("mutation", 1, true) ~= nil)
+      and (
+        phase_seen[4][3]:lower():find("verif", 1, true) ~= nil
+        or phase_seen[4][3]:lower():find("test", 1, true) ~= nil
+      ),
+    "first successful mutation injects one verification-phase reminder"
+  )
+  check(phase_seen[4] and has_all_concepts(phase_seen[4][3], {
+    { "narrowest", "smallest compatible", "minimal compatible" },
+    { "preserv" },
+    { "contract", "existing test", "passing assertion" },
+    { "do not weaken", "never weaken", "don't weaken" },
+    { "green", "make the suite pass", "make tests pass" },
+    { "hermetic", "self-contained test", "isolated test" },
+  }), "mutation reminder keeps the fix compatible, preserves assertions, and requests hermetic regression coverage")
+  check(
+    phase_seen[5] and #verification_reminders(phase_seen[5]) == 1,
+    "first passing verification emits one reminder for the first edit generation"
+  )
+  check(
+    phase_seen[6] and #verification_reminders(phase_seen[6]) == 1,
+    "repeating verification without another successful edit does not emit a duplicate reminder"
+  )
+  check(
+    phase_seen[7] and #verification_reminders(phase_seen[7]) == 1,
+    "a later successful edit opens a new verification generation but does not claim success early"
+  )
+  local second_generation_reminders = phase_seen[8] and verification_reminders(phase_seen[8]) or {}
+  check(
+    #second_generation_reminders == 2,
+    "passing verification after a later successful edit emits a second generation reminder"
+  )
+  check(
+    phase_seen[9] and #verification_reminders(phase_seen[9]) == 2,
+    "repeated verification after the second edit generation remains reminder-free"
+  )
+  local final_verification = second_generation_reminders[#second_generation_reminders]
+  check(
+    has_all_concepts(final_verification, {
+      { "diff" },
+      { "audit", "review" },
+      { "bounded", "single", "one" },
+      { "stop", "finish" },
+    }),
+    "successful-generation reminder directs one bounded diff audit and then stops"
+  )
+
+  -- A red suite carries different evidence from a green one. The harness must
+  -- surface that evidence once for the current edit generation, without
+  -- declaring the generation verified or repeating the same warning forever.
+  -- A later successful edit re-arms the warning because it may have introduced
+  -- a distinct regression. The fixture owns all state and always fails on the
+  -- deliberately written "broken" value, so it is independent of the host repo.
+  local failure_tmp = vim.fn.tempname()
+  vim.fn.mkdir(failure_tmp, "p")
+  vim.fn.writefile({
+    vim.json.encode({
+      scripts = {
+        test = "node -e \"const fs=require('fs');const s=fs.readFileSync('failure.txt','utf8');process.exit(s.includes('broken')?1:0)\"",
+      },
+    }),
+  }, failure_tmp .. "/package.json")
+  local failure_turn = 0
+  local failure_seen = {}
+  local failure_messages = {}
+  providers.register("fakephasefailure", {
+    stream = function(req)
+      failure_turn = failure_turn + 1
+      local turn = failure_turn
+      failure_seen[turn] = guidance_texts(req.messages)
+      failure_messages[turn] = vim.deepcopy(req.messages)
+      vim.defer_fn(function()
+        if turn == 1 then
+          req.on.complete({
+            {
+              type = "tool_use",
+              id = "failure-write-1",
+              name = "write_file",
+              input = { path = "failure.txt", content = "broken one\n" },
+            },
+          }, "tool_use")
+        elseif turn == 2 then
+          req.on.complete({
+            {
+              type = "tool_use",
+              id = "failure-test-1",
+              name = "bash",
+              input = { command = "npm test" },
+            },
+          }, "tool_use")
+        elseif turn == 3 then
+          req.on.complete({
+            {
+              type = "tool_use",
+              id = "failure-test-repeat-1",
+              name = "bash",
+              input = { command = "npm test" },
+            },
+          }, "tool_use")
+        elseif turn == 4 then
+          req.on.complete({
+            {
+              type = "tool_use",
+              id = "failure-write-2",
+              name = "edit_file",
+              input = { path = "failure.txt", old_string = "broken one", new_string = "broken two" },
+            },
+          }, "tool_use")
+        elseif turn == 5 then
+          req.on.complete({
+            {
+              type = "tool_use",
+              id = "failure-test-2",
+              name = "bash",
+              input = { command = "npm test" },
+            },
+          }, "tool_use")
+        elseif turn == 6 then
+          req.on.complete({
+            {
+              type = "tool_use",
+              id = "failure-test-repeat-2",
+              name = "bash",
+              input = { command = "npm test" },
+            },
+          }, "tool_use")
+        else
+          req.on.complete({ { type = "text", text = "failed-verification run complete" } }, "end_turn")
+        end
+      end, 5)
+      return { stop = function() end }
+    end,
+  })
+
+  local failure_agent = agent_mod.new({
+    id = "phase-failed-verification-parent",
+    model = { provider = "fakephasefailure", id = "parent", label = "failed verification parent" },
+    harness_mode = "ultra",
+    cwd = failure_tmp,
+  })
+  failure_agent:send("Implement the fixture and run its deliberately failing regression suite")
+  vim.wait(8000, function()
+    return failure_turn >= 7 and failure_agent.status == "idle"
+  end, 10)
+
+  local first_failure = failure_seen[3] and failed_verification_reminders(failure_seen[3]) or {}
+  check(
+    tool_result_failed(failure_messages[3], "failure-test-1") and #first_failure == 1,
+    "a failed verification after edits emits one failure reminder for that generation"
+  )
+  check(
+    has_all_concepts(first_failure[1], {
+      { "previously passing", "existing" },
+      { "assertion", "test" },
+      { "contract", "regression" },
+      { "evidence" },
+      { "fix the implementation", "implementation first" },
+      { "do not weaken", "do not change", "don't weaken", "don't change" },
+      { "green", "make the suite pass", "make tests pass" },
+    }),
+    "failed-verification guidance treats existing assertions as evidence and fixes implementation before tests"
+  )
+  check(
+    failure_seen[4] and #failed_verification_reminders(failure_seen[4]) == 1,
+    "repeating a failed verification without edits does not spam the same warning"
+  )
+  check(
+    failure_seen[5] and #failed_verification_reminders(failure_seen[5]) == 1,
+    "a later successful edit re-arms failed-verification guidance without firing before a test"
+  )
+  check(
+    tool_result_failed(failure_messages[6], "failure-test-2") and #failed_verification_reminders(failure_seen[6]) == 2,
+    "a failed verification after a later edit generation emits a second warning"
+  )
+  check(
+    failure_seen[7] and #failed_verification_reminders(failure_seen[7]) == 2,
+    "repeated failure in the second edit generation remains warning-free"
+  )
+
+  -- Cache identity has two separate jobs: the cache key names reusable static
+  -- prompt bytes, while the session id identifies one live conversation. Equal
+  -- parent prefixes and equal scout prefixes should therefore reuse keys without
+  -- ever sharing a session id. Scouts deliberately spread identical prefixes
+  -- across a tiny deterministic bucket set to avoid one provider hot key.
+  local captured = { parent = {}, scout = {} }
+  local scout_rounds = {}
+  providers.register("fakecacheidentity", {
+    stream = function(req)
+      local kind = req.system and req.system:find("You are a read-only sub-agent", 1, true) and "scout" or "parent"
+      captured[kind][#captured[kind] + 1] = {
+        system = req.system,
+        tools = vim.json.encode(req.tools or {}),
+        cache = req.prompt_cache_key,
+        session = req.session_id,
+      }
+      vim.defer_fn(function()
+        if kind == "scout" then
+          scout_rounds[req.session_id] = (scout_rounds[req.session_id] or 0) + 1
+          if scout_rounds[req.session_id] == 1 then
+            req.on.complete({
+              {
+                type = "tool_use",
+                id = "cache-read-" .. req.session_id,
+                name = "read_file",
+                input = { path = "package.json" },
+              },
+            }, "tool_use")
+            return
+          end
+        end
+        req.on.complete({ { type = "text", text = kind .. " done" } }, "end_turn")
+      end, 5)
+      return { stop = function() end }
+    end,
+  })
+
+  local function run_parent(id)
+    local ag = agent_mod.new({
+      id = id,
+      model = { provider = "fakecacheidentity", id = "same", label = "cache parent" },
+      harness_mode = "high",
+      cwd = tmp,
+    })
+    ag:send("finish directly")
+    vim.wait(3000, function()
+      return ag.status == "idle"
+    end, 10)
+  end
+  for i = 1, 2 do
+    run_parent("cache-parent-" .. i)
+  end
+  local saved_diagnostics = config.options.tools.diagnostics.enabled
+  config.options.tools.diagnostics.enabled = not saved_diagnostics
+  run_parent("cache-parent-schema-variant")
+  config.options.tools.diagnostics.enabled = saved_diagnostics
+
+  for i = 1, 8 do
+    local done = false
+    tools.get("sub_agent").run({
+      prompt = "cache scout prompt " .. i,
+      model = "fakecacheidentity/scout",
+      effort = "medium",
+      max_turns = 3,
+    }, { cwd = tmp }, function()
+      done = true
+    end)
+    vim.wait(3000, function()
+      return done
+    end, 10)
+  end
+
+  local p1, p2 = captured.parent[1], captured.parent[2]
+  local p3 = captured.parent[3]
+  check(
+    p1 and p2 and p1.system == p2.system and p1.cache == p2.cache and p1.session ~= p2.session,
+    "identical parent prefixes reuse a cache key while sessions stay unique"
+  )
+
+  check(
+    p1 and p3 and p1.system == p3.system and p1.tools ~= p3.tools and p1.cache ~= p3.cache,
+    "parent cache identity includes the exact tool schema as well as the system prefix"
+  )
+
+  local scout_sessions, scout_keys, scout_system = {}, {}, nil
+  local stable_scout_turns = true
+  for _, item in ipairs(captured.scout) do
+    scout_system = scout_system or item.system
+    stable_scout_turns = stable_scout_turns and item.system == scout_system
+    local session = scout_sessions[item.session]
+    if not session then
+      session = { count = 0, cache = item.cache }
+      scout_sessions[item.session] = session
+    end
+    session.count = session.count + 1
+    stable_scout_turns = stable_scout_turns and session.cache == item.cache
+    scout_keys[item.cache] = true
+  end
+  local scout_session_count, scout_key_count = vim.tbl_count(scout_sessions), vim.tbl_count(scout_keys)
+  for _, session in pairs(scout_sessions) do
+    stable_scout_turns = stable_scout_turns and session.count == 2
+  end
+  check(
+    stable_scout_turns and scout_session_count == 8,
+    "each scout keeps one cache key across turns while every scout session stays unique"
+  )
+  check(
+    scout_key_count > 1 and scout_key_count <= 4,
+    "identical scout prefixes distribute over two to four deterministic cache-key buckets"
+  )
+  check(
+    p1
+      and captured.scout[1]
+      and p1.system ~= captured.scout[1].system
+      and p1.cache ~= captured.scout[1].cache
+      and p1.session ~= captured.scout[1].session,
+    "different parent/scout prefixes never alias cache or session identity"
+  )
+
+  config.options.tools.yolo = saved_yolo
+  config.options.context.auto_compact = saved_auto_compact
 end
 
 -- 16. project-root containment --------------------------------------------------
@@ -3616,16 +5454,36 @@ do
     vim.tbl_contains(errs, "subagents.max_parallel must be a positive integer"),
     "validation rejects malformed sub-agent concurrency limits"
   )
+  errs = config._validate(vim.tbl_extend("force", vim.deepcopy(config.defaults), {
+    subagents = vim.tbl_extend("force", vim.deepcopy(config.defaults.subagents), {
+      max_turns = 31,
+      max_turns_cap = 31,
+    }),
+  }))
+  check(
+    vim.tbl_contains(errs, "subagents.max_turns_cap must be at most 30"),
+    "validation rejects configured scout ceilings that runtime would otherwise silently clamp"
+  )
+  errs = config._validate(vim.tbl_extend("force", vim.deepcopy(config.defaults), {
+    harness = { mode = "reckless", sync_effort = "yes" },
+  }))
+  check(
+    vim.tbl_contains(errs, "harness.mode is not recognized")
+      and vim.tbl_contains(errs, "harness.sync_effort must be boolean"),
+    "validation rejects malformed harness policy"
+  )
   local malformed = vim.deepcopy(config.defaults)
   malformed.providers.openai = false
-  malformed.subagents.max_per_turn = 0
   malformed.subagents.max_output_tokens = "huge"
+  malformed.subagents.allow_cross_provider = "sometimes"
+  malformed.subagents.model_aliases.sol = "not-a-provider-ref"
   errs = config._validate(malformed)
   check(
     vim.tbl_contains(errs, "providers.openai must be a table")
-      and vim.tbl_contains(errs, "subagents.max_per_turn must be a positive integer")
-      and vim.tbl_contains(errs, "subagents.max_output_tokens must be a positive integer"),
-    "validation rejects malformed nested provider and cumulative/output scout controls"
+      and vim.tbl_contains(errs, "subagents.max_output_tokens must be a positive integer")
+      and vim.tbl_contains(errs, "subagents.allow_cross_provider must be boolean")
+      and vim.tbl_contains(errs, "subagents.model_aliases entries must map simple aliases to provider/model-id"),
+    "validation rejects malformed nested provider, alias, affinity, and scout output controls"
   )
 
   config.options = saved
@@ -3707,6 +5565,7 @@ do
       id = raw_id,
       title = "unsafe id",
       model = { provider = "fake", id = "m" },
+      harness_mode = "xhigh",
       messages = {},
       usage = {},
       ctx = { cwd = (vim.uv or vim.loop).cwd() },
@@ -3717,6 +5576,11 @@ do
     end
     local mode = bit.band(((vim.uv or vim.loop).fs_stat(tmp) or {}).mode or 0, 511)
     check(saved == true and #names == 1, "session save accepts a persisted id through an opaque filename token")
+    local persisted = session.list((vim.uv or vim.loop).cwd())
+    check(
+      persisted[1] and persisted[1].harness_mode == "xhigh",
+      "session save/load preserves the per-conversation harness mode"
+    )
     check(
       not names[1]:find("tampered", 1, true) and not names[1]:find("/", 1, true),
       "session filename never embeds the raw id"
@@ -3961,7 +5825,7 @@ do
     local tmp = vim.fn.tempname()
     vim.fn.mkdir(tmp, "p")
     local done, result, err = false, nil, nil
-    tools.get("sub_agent").run({ prompt = "loop", model = "fakeloop/m", max_turns = 2 }, {
+    tools.get("sub_agent").run({ prompt = "loop", model = "fakeloop/m", effort = "medium", max_turns = 2 }, {
       cwd = tmp,
       model = { provider = "fakeloop", id = "m", label = "loop" },
     }, function(out, is_err)
@@ -4022,14 +5886,19 @@ do
     "preview shows the exact system-prompt bytes (memory included)"
   )
   check(blob:find("no active session", 1, true) ~= nil, "no-session preview is labeled a fresh render")
+  check(blob:find("Harness mode:", 1, true) ~= nil, "no-session preview resolves the configured default harness policy")
 
   -- with a live agent: frozen block + real transcript + provider-aware economics
-  local ag = agent_mod.new({ model = { provider = "anthropic", id = "claude-x", label = "x" } })
+  local ag = agent_mod.new({
+    model = { provider = "anthropic", id = "claude-x", label = "x" },
+    harness_mode = "xhigh",
+  })
   ag.messages = { { role = "user", content = { { type = "text", text = "one transcript message here" } } } }
   local pblob = table.concat((preview.build(ag)), "\n")
   check(pblob:find("memory frozen", 1, true) ~= nil, "live preview marks the memory block frozen")
   check(pblob:find("1 messages", 1, true) ~= nil, "live preview counts transcript messages")
   check(pblob:find("prompt cache", 1, true) ~= nil, "anthropic preview notes the ~10% cache discount")
+  check(pblob:find("Harness mode: xhigh", 1, true) ~= nil, "live preview shows the exact per-session harness policy")
 
   -- a mid-session remember writes to disk but not the frozen prefix — preview
   -- must surface the drift so the ~10% cache win is legible, not silent
@@ -4849,9 +6718,11 @@ do
   local ctx = { cwd = vim.fn.tempname(), system = "PARENT-SYSTEM-WITH-MEMORY-BLOCK-XYZ" }
   vim.fn.mkdir(ctx.cwd, "p")
   local done, result = false, nil
-  tools.get("sub_agent").run({ prompt = "scout the thing", model = "fakesublean/m" }, ctx, function(out)
-    result, done = out, true
-  end)
+  tools
+    .get("sub_agent")
+    .run({ prompt = "scout the thing", model = "fakesublean/m", effort = "medium" }, ctx, function(out)
+      result, done = out, true
+    end)
   vim.wait(3000, function()
     return done
   end, 10)

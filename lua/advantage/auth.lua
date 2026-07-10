@@ -286,4 +286,65 @@ function M.openai_mode_hint()
   return "api_key"
 end
 
+---Stable, non-secret identity for sub-agent route health. A failed ChatGPT
+---model must not poison the raw-API route (or another account), and changing
+---credentials should immediately select a fresh circuit instead of waiting for
+---an old cooldown. Only a short SHA-256 fingerprint is returned; credentials
+---never leave this module.
+---@param provider string
+---@return string
+function M.route_scope_hint(provider)
+  local function fingerprint(value)
+    if type(value) ~= "string" or value == "" then return "none" end
+    return vim.fn.sha256(value):sub(1, 12)
+  end
+  if provider == "openai" then
+    local file = read_json(codex_auth_path())
+    local mode = M.openai_mode_hint()
+    if mode == "chatgpt" then
+      local account = file and file.tokens and codex_account_id(file.tokens)
+      return "openai:chatgpt:" .. fingerprint(account)
+    end
+    local key = (file and file.OPENAI_API_KEY and file.OPENAI_API_KEY ~= vim.NIL and file.OPENAI_API_KEY)
+      or require("advantage.config").api_key("openai")
+    return "openai:api_key:" .. fingerprint(key)
+  elseif provider == "anthropic" then
+    local file = read_json(claude_creds_path())
+    local oauth = file and file.claudeAiOauth
+    if oauth and oauth.accessToken then
+      return "anthropic:oauth:" .. fingerprint(oauth.refreshToken or oauth.accessToken)
+    end
+    return "anthropic:api_key:" .. fingerprint(require("advantage.config").api_key("anthropic"))
+  end
+  return tostring(provider) .. ":default"
+end
+
+---Cheap synchronous credential readiness used only to decide whether multiple
+---scouts may start in parallel. Refresh-token-only logins remain a single
+---flight probe; a currently valid token/API key has passed local checks.
+function M.route_credentials_ready(provider)
+  if provider == "openai" then
+    local file = read_json(codex_auth_path())
+    local mode = M.openai_mode_hint()
+    if mode == "chatgpt" then
+      local tokens = file and file.tokens
+      local claims = tokens and jwt_payload(tokens.access_token)
+      return tokens ~= nil
+        and tokens.access_token ~= nil
+        and codex_account_id(tokens) ~= nil
+        and claims ~= nil
+        and (claims.exp or 0) > os.time() + 60
+    end
+    local key = (file and file.OPENAI_API_KEY and file.OPENAI_API_KEY ~= vim.NIL and file.OPENAI_API_KEY)
+      or require("advantage.config").api_key("openai")
+    return type(key) == "string" and key ~= ""
+  elseif provider == "anthropic" then
+    local file = read_json(claude_creds_path())
+    local oauth = file and file.claudeAiOauth
+    if oauth and oauth.accessToken then return (oauth.expiresAt or 0) / 1000 > os.time() + 60 end
+    return require("advantage.config").api_key("anthropic") ~= nil
+  end
+  return false
+end
+
 return M

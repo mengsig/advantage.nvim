@@ -327,8 +327,10 @@ function M.stream(req)
   attempt = function(force)
     auth.anthropic(function(cred, autherr)
       if cancelled then return end
-      if not cred then return req.on.error(autherr) end
-      if req.on.auth then req.on.auth(cred.badge) end
+      if not cred then
+        return req.on.error(autherr, { kind = "auth", scope = "provider", retryable = false, provider = "anthropic" })
+      end
+      if req.on.auth then req.on.auth(cred.badge, { transport = cred.mode, provider = "anthropic" }) end
 
       local headers, system = build_headers(pcfg, req, cred)
       local body = build_body(pcfg, req, system)
@@ -350,10 +352,29 @@ function M.stream(req)
             reauthed = true
             return attempt(true)
           end
-          req.on.error(msg)
+          local kind = (status == 401 or status == 403) and "auth"
+            or status == 404 and "model"
+            or status == 429 and "capacity"
+            or "http"
+          req.on.error(msg, {
+            kind = kind,
+            scope = kind == "auth" and "provider" or kind == "model" and "model" or "request",
+            retryable = status == 429 or (status and status >= 500) or false,
+            status = status,
+            provider = "anthropic",
+            transport = cred.mode,
+          })
         end),
         on_done = vim.schedule_wrap(function()
-          if not is_completed() then req.on.error("stream ended unexpectedly") end
+          if not is_completed() then
+            req.on.error("stream ended unexpectedly", {
+              kind = "transport",
+              scope = "request",
+              retryable = true,
+              provider = "anthropic",
+              transport = cred.mode,
+            })
+          end
         end),
       })
     end, force)

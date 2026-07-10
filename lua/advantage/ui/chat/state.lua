@@ -45,6 +45,7 @@ local S = {
   auth_badge = nil,
   model_label = "",
   effort_label = nil,
+  harness_label = nil,
   welcome_mark = nil,
   on_submit = nil,
   attachments = {}, -- pending prompt images: {name=, path=, media_type=, data=}

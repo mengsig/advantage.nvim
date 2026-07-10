@@ -242,6 +242,20 @@ local SLASH = {
       require("advantage").pick_effort()
     end
   end,
+  harness = function(arg)
+    if arg and arg ~= "" then
+      require("advantage").set_harness(arg)
+    else
+      require("advantage").pick_harness()
+    end
+  end,
+  mode = function(arg)
+    if arg and arg ~= "" then
+      require("advantage").set_harness(arg)
+    else
+      require("advantage").pick_harness()
+    end
+  end,
   help = function()
     M.show_help()
   end,
@@ -274,18 +288,10 @@ local function submit(mode)
       M.notify(
         "unknown command: /"
           .. cmd
-          .. "  (try /usage, /compact, /context, /review, /yolo, /effort, /new, /model, /resume, /help)",
+          .. "  (try /usage, /compact, /context, /review, /yolo, /effort, /harness, /new, /model, /resume, /help)",
         vim.log.levels.WARN
       )
     end
-    return
-  end
-
-  -- Context compaction is a brief, blocking operation with no "next tool call"
-  -- to inject before; block the send (keeping the typed text intact) instead of
-  -- silently queuing it. Slash commands above still work during compaction.
-  if S.status == "compacting" then
-    M.notify("compacting context — wait for it to finish before sending", vim.log.levels.WARN)
     return
   end
 
@@ -331,6 +337,7 @@ local function help_lines()
     "  /context repo memory + skills (init · curate · verify · preview · forget <text>)",
     "  /yolo    skip permissions",
     "  /effort [mode]  model-aware reasoning (run /effort to see the active model's supported levels)",
+    "  /harness [mode] orchestration policy (auto · low · medium · high · xhigh · max · ultra)",
     "",
     "commands",
     "  :Advantage            toggle panel",
@@ -345,6 +352,7 @@ local function help_lines()
     "  :Advantage review     diff the agent's changes",
     "  :Advantage yolo       toggle skip-all-permissions",
     "  :Advantage effort [mode] tune thinking/reasoning level",
+    "  :Advantage harness [mode] tune orchestration policy (<leader>ch)",
     "  :Advantage add        add current file to the prompt",
     "  :Advantage files      pick a project file to add",
     "  :Advantage attach {p} attach an image / mention a file",
@@ -587,11 +595,13 @@ function M.open(focus)
   opt("winfixwidth", true, S.win)
   opt("fillchars", "eob: ", S.win)
   -- the panel is its own quiet surface, with a 1-col breathing gutter
-  opt("statuscolumn", "%#AdvPanel# ", S.win)
+  opt("statuscolumn", "%#AdvPanelGutter# ", S.win)
+  opt("scrolloff", 3, S.win)
+  opt("sidescrolloff", 2, S.win)
   opt(
     "winhighlight",
     "Normal:AdvPanel,NormalNC:AdvPanel,EndOfBuffer:AdvPanel,SignColumn:AdvPanel"
-      .. ",WinSeparator:AdvPanelBorder,WinBar:AdvPanelBar,WinBarNC:AdvPanelBar,CursorLine:AdvPanel",
+      .. ",WinSeparator:AdvPanelBorder,WinBar:AdvPanelBar,WinBarNC:AdvPanelBar,CursorLine:AdvPanelActive",
     S.win
   )
 
@@ -605,13 +615,15 @@ function M.open(focus)
   opt("signcolumn", "no", S.input_win)
   opt("winfixheight", true, S.input_win)
   opt("wrap", true, S.input_win)
+  opt("scrolloff", 1, S.input_win)
+  opt("sidescrolloff", 2, S.input_win)
   opt("fillchars", "eob: ", S.input_win)
   -- the prompt reads as a field: a deeper surface with a ❯ caret in the gutter
   opt("statuscolumn", "%#AdvPromptSign#%{(v:virtnum == 0 && v:lnum == 1) ? '❯ ' : '  '}", S.input_win)
   opt(
     "winhighlight",
     "Normal:AdvPanelField,NormalNC:AdvPanelField,EndOfBuffer:AdvPanelField"
-      .. ",SignColumn:AdvPanelField,WinSeparator:AdvPanelBorder,CursorLine:AdvPanelField",
+      .. ",SignColumn:AdvPanelField,WinSeparator:AdvPanelBorder,CursorLine:AdvPanelActive",
     S.input_win
   )
 
@@ -798,7 +810,7 @@ function M.tool_begin(id, name)
   autoscroll()
 end
 
----@param patch {status?: string, detail?: string, name?: string}
+---@param patch {status?: string, detail?: string, name?: string, error?: string}
 function M.tool_update(id, patch)
   local pending = S.tool_streams[id]
   if pending and patch.status and patch.status ~= "running" and patch.status ~= "pending" and pending.flush then
@@ -809,6 +821,7 @@ function M.tool_update(id, patch)
   t.status = patch.status or t.status
   t.detail = patch.detail or t.detail
   t.name = patch.name or t.name
+  t.error = patch.error or t.error
   redraw_tool(id)
   autoscroll()
 end
@@ -1007,6 +1020,11 @@ function M.set_effort_label(label)
   update_winbar()
 end
 
+function M.set_harness_label(label)
+  S.harness_label = label
+  update_winbar()
+end
+
 function M.notify(msg, level)
   vim.notify(msg, level or vim.log.levels.INFO, { title = "advantage" })
 end
@@ -1061,6 +1079,8 @@ function M.float(opts)
     footer_pos = footer and "center" or nil,
   })
   opt("wrap", false, win)
+  opt("scrolloff", 2, win)
+  opt("sidescrolloff", 2, win)
   opt("cursorline", false, win)
   opt(
     "winhighlight",
@@ -1187,10 +1207,17 @@ function M.render_transcript(messages, model_label)
           end
           -- look ahead for the result to color the card
           local status = "ok"
+          local result_error
           local nxt = messages[mi + 1]
           if nxt and nxt.role == "user" then
             for _, r in ipairs(nxt.content) do
-              if r.type == "tool_result" and r.tool_use_id == block.id and r.is_error then status = "error" end
+              if r.type == "tool_result" and r.tool_use_id == block.id and r.is_error then
+                status = "error"
+                result_error = tostring(r.content or "tool failed"):gsub("[%c%s]+", " ")
+                if #result_error > 220 then
+                  result_error = require("advantage.util").utf8_safe_sub(result_error, 217) .. "…"
+                end
+              end
             end
           end
           local def = require("advantage.tools").get(block.name)
@@ -1203,6 +1230,7 @@ function M.render_transcript(messages, model_label)
           M.tool_update(block.id, {
             status = status,
             detail = ok_detail and detail or nil,
+            error = result_error,
           })
         end
       end

@@ -49,7 +49,7 @@ M.defaults = {
       context_window = 372000,
       api_context_window = 1050000,
       max_output_tokens = 128000,
-      reasoning_efforts = { "low", "medium", "high", "xhigh", "max", "ultra" },
+      reasoning_efforts = { "low", "medium", "high", "xhigh", "max" },
       api_reasoning_efforts = { "none", "low", "medium", "high", "xhigh", "max" },
     }, -- Codex subscription window; raw API has 1.05M
     {
@@ -58,7 +58,7 @@ M.defaults = {
       context_window = 372000,
       api_context_window = 1050000,
       max_output_tokens = 128000,
-      reasoning_efforts = { "low", "medium", "high", "xhigh", "max", "ultra" },
+      reasoning_efforts = { "low", "medium", "high", "xhigh", "max" },
       api_reasoning_efforts = { "none", "low", "medium", "high", "xhigh", "max" },
     }, -- Codex subscription window; raw API has 1.05M
     {
@@ -118,15 +118,18 @@ M.defaults = {
       -- this request knob, so context budgeting reserves the model's native
       -- `max_output_tokens` instead (128k on GPT-5.6/5.5).
       max_output_tokens = 64000,
-      -- Strong global default. The provider clamps an inherited ultra downward
-      -- to the deepest level supported by the selected model/transport (for
-      -- example Luna→max, GPT-5.5→xhigh, or raw-API Sol→max). An explicit
-      -- per-model override remains strict and errors when unsupported.
-      reasoning_effort = "ultra",
+      -- Deepest wire-level reasoning default. Ultra lives in `harness.mode` and
+      -- combines this Max parent effort with proactive parallel delegation.
+      reasoning_effort = "max",
       ---Stream a short reasoning summary into the UI. Set false to reduce
       ---latency; scouts and summarizers disable it automatically because they
       ---discard thinking output.
       reasoning_summary = "auto", -- "auto" | "concise" | "detailed" | false
+      ---Some subscription streams return a retryable overload/transport event
+      ---inside HTTP 200 SSE. Retry only when no text/thinking/tool payload was
+      ---delivered, so recovery can never duplicate visible work or tool calls.
+      stream_error_retries = 2,
+      stream_error_retry_base_ms = 2000,
     },
   },
 
@@ -206,13 +209,13 @@ M.defaults = {
       max_results = 60, -- cap on symbols / references / matches returned per call
     },
 
-    ---Web search via the Brave Search API (https://api.search.brave.com) — a
-    ---single lightweight GET request, no page-scraping/fetch step. Needs an API
-    ---key (Brave's free tier covers casual use); the tool is hidden entirely
-    ---from the schema until one is configured, so a model never wastes a turn
-    ---calling a search tool that can't work.
+    ---Web search. `auto` prefers the stable Brave JSON API when keyed, otherwise
+    ---uses Brave's public HTML results as a best-effort fallback. Page retrieval
+    ---is a separate hardened `web_fetch` tool below.
     web_search = {
       enabled = true,
+      backend = "auto", -- "auto" | "brave_api" | "brave_html"
+      allow_unkeyed = true,
       ---Env var read for the key. Set `api_key` directly instead if you'd rather
       ---not use an env var.
       api_key_env = "BRAVE_API_KEY",
@@ -220,6 +223,21 @@ M.defaults = {
       base_url = "https://api.search.brave.com/res/v1/web/search",
       max_results = 5, -- default result count (hard cap: 10)
       timeout_ms = 15000,
+      max_response_bytes = 1048576,
+      fallback_url = "https://search.brave.com/search",
+    },
+
+    ---Static, GET-only public page retrieval for parent and sub-agent research.
+    ---Every URL/redirect is DNS-validated and pinned; local/private networks,
+    ---credentials, non-default ports, binaries, oversized bodies and HTTPS→HTTP
+    ---downgrades are blocked. Returned page text is explicitly untrusted data.
+    web_fetch = {
+      enabled = true,
+      timeout_ms = 20000,
+      max_redirects = 3,
+      max_response_bytes = 2097152,
+      max_text_bytes = 64000,
+      max_lines = 1000,
     },
   },
 
@@ -284,37 +302,64 @@ M.defaults = {
   subagents = {
     ---Expose the read-only `sub_agent` tool for delegation / fan-out.
     enabled = true,
-    ---Model for sub-agents, as "provider/model-id". `nil` = use the parent's
-    ---model. Set a fast/cheap model (e.g. "anthropic/claude-haiku-4-5" or
-    ---"openai/gpt-5.1-codex-mini") to make read-only fan-out cheaper and faster;
-    ---the sub_agent tool's `model` arg overrides this per call.
+    ---Preferred sub-agent alias shown to the parent (for example "sol" or
+    ---"haiku"). The parent must still name a model on every call; this guides
+    ---that explicit choice without making the harness silently select one.
     model = nil,
-    ---Maximum provider turns a sub-agent may take, including tool loops (the
-    ---sub_agent tool's `max_turns` arg overrides this per call, hard-capped at 30).
+    ---Stable, model-facing aliases for scout selection. The parent chooses one
+    ---explicitly on every call, while versioned provider IDs remain centralized
+    ---here so the model never has to guess a fragile slug. Update the target when
+    ---a newer family member becomes the configured default.
+    model_aliases = {
+      sol = "openai/gpt-5.6-sol",
+      terra = "openai/gpt-5.6-terra",
+      luna = "openai/gpt-5.6-luna",
+      opus = "anthropic/claude-opus-4-8",
+      sonnet = "anthropic/claude-sonnet-5",
+      haiku = "anthropic/claude-haiku-4-5",
+    },
+    ---Keep scout routing in the active parent's provider family by default.
+    ---An OpenAI/Codex parent therefore sees sol/terra/luna, while an Anthropic
+    ---parent sees opus/sonnet/haiku. Cross-provider orchestration remains an
+    ---explicit user choice instead of a model-selected surprise.
+    allow_cross_provider = false,
+    ---Default provider turns a sub-agent may take, including tool loops.
     ---The last turn is always report-only (tools withheld), so a fan-out scout
     ---investigating a whole subsystem always returns a real report instead of an
     ---empty "hit the turn limit" error; budget for the investigation accordingly.
-    max_turns = 12,
-    ---Cumulative number of scouts the parent may launch for one user turn,
-    ---across multiple model responses. Prevents repeated batches from bypassing
-    ---the per-response cap below.
-    max_per_turn = 12,
+    max_turns = 6,
+    ---User-controlled ceiling for a model-supplied `max_turns`. This bounds one
+    ---worker's loop, not scout admission: the parent may still spawn any number
+    ---of workers and excess concurrent work still queues.
+    max_turns_cap = 12,
     ---Visible output ceiling for scout requests on transports that accept one
     ---(Anthropic and raw OpenAI API). ChatGPT login has no confirmed hard-cap
     ---field, so it retains the native reserve and is bounded by the scout's turn,
-    ---delegation, result, and report limits instead.
+    ---result, and report limits instead.
     max_output_tokens = 16000,
-    ---Scouts are scoped evidence-gatherers, so medium is a better quality/latency
-    ---point than blindly inheriting a parent's xhigh/max. Set "inherit" to keep
-    ---the parent level, or override per sub_agent call.
+    ---Preferred scout effort shown to the parent. Every call must still name
+    ---its effort explicitly; this guides intent without a silent fallback.
     effort = "medium",
     ---Run a fan-out batch of `sub_agent` calls concurrently (overlapping their
-    ---network latency) instead of one-at-a-time. Only pure read-only sub_agent
-    ---batches are parallelised; mutating/permissioned tools always run in order.
+    ---network latency) instead of one-at-a-time. This controls scheduling, not
+    ---admission: every valid scout requested by the parent runs, and excess work
+    ---waits in the local queue. Mutating/permissioned tools still run in order.
     parallel = true,
-    max_parallel = 4, -- concurrent provider streams; excess scouts queue
-    max_per_batch = 8, -- extra same-response scouts get a synthetic error result
+    max_parallel = 4, -- concurrent provider streams; excess scouts queue (never reject)
     max_result_bytes = 64000, -- aggregate parent-context budget for a fan-out
+    ---Hard watchdog for each read-only tool invoked inside a scout. Individual
+    ---tools normally finish sooner; this catches a broken callback/process so
+    ---one worker cannot hold its provider turn and the parent queue forever.
+    tool_timeout_ms = 45000,
+  },
+
+  harness = {
+    ---Orchestration policy. `auto` derives it from the active effort; explicit
+    ---modes remain independent after their initial effort synchronization.
+    mode = "auto", -- "auto" | "low" | "medium" | "high" | "xhigh" | "max" | "ultra"
+    ---Selecting a harness preset also initializes model effort to its matching
+    ---level. `/effort` can then override reasoning without changing the harness.
+    sync_effort = true,
   },
 
   ---Per-repo self-learning harness: the agent records durable facts about a repo
@@ -364,6 +409,7 @@ M.defaults = {
     review = "<leader>cd", -- review the agent's file changes (diff)
     yolo = "<leader>cy", -- toggle skip-all-permissions mode
     effort = "<leader>ce", -- tune reasoning effort / thinking
+    harness = "<leader>ch", -- tune harness orchestration policy
     help = "<leader>c?", -- keybind & command cheatsheet
   },
 
@@ -471,6 +517,26 @@ local function validate(o)
     if p.max_output_tokens ~= nil and (type(p.max_output_tokens) ~= "number" or p.max_output_tokens <= 0) then
       errs[#errs + 1] = "providers.openai.max_output_tokens must be positive"
     end
+    if
+      p.stream_error_retries ~= nil
+      and (
+        type(p.stream_error_retries) ~= "number"
+        or p.stream_error_retries < 0
+        or p.stream_error_retries ~= math.floor(p.stream_error_retries)
+      )
+    then
+      errs[#errs + 1] = "providers.openai.stream_error_retries must be a non-negative integer"
+    end
+    if
+      p.stream_error_retry_base_ms ~= nil
+      and (
+        type(p.stream_error_retry_base_ms) ~= "number"
+        or p.stream_error_retry_base_ms < 0
+        or p.stream_error_retry_base_ms ~= math.floor(p.stream_error_retry_base_ms)
+      )
+    then
+      errs[#errs + 1] = "providers.openai.stream_error_retry_base_ms must be a non-negative integer"
+    end
   end
   if type(o.providers) == "table" and type(o.providers.anthropic) == "table" then
     local p = o.providers.anthropic
@@ -478,7 +544,7 @@ local function validate(o)
       errs[#errs + 1] = "providers.anthropic.max_tokens must be positive"
     end
   end
-  for _, key in ipairs({ "tools", "context", "ui", "memory", "subagents", "sessions" }) do
+  for _, key in ipairs({ "tools", "context", "ui", "memory", "subagents", "harness", "sessions" }) do
     if o[key] ~= nil and type(o[key]) ~= "table" then errs[#errs + 1] = key .. " must be a table" end
   end
   if type(o.context) == "table" then
@@ -532,32 +598,105 @@ local function validate(o)
   if type(o.subagents) == "table" then
     local s = o.subagents
     if s.effort ~= nil and type(s.effort) ~= "string" then errs[#errs + 1] = "subagents.effort must be a string" end
-    if s.model ~= nil and (type(s.model) ~= "string" or not s.model:match("^[^/]+/.+$")) then
-      errs[#errs + 1] = "subagents.model must be a 'provider/model-id' string or nil"
+    if s.model_aliases ~= nil and type(s.model_aliases) ~= "table" then
+      errs[#errs + 1] = "subagents.model_aliases must be an alias-to-model table"
+    elseif type(s.model_aliases) == "table" then
+      local configured_refs = {}
+      for _, model in ipairs(o.models or {}) do
+        if type(model) == "table" and type(model.ref) == "string" then configured_refs[model.ref] = true end
+      end
+      for alias, ref in pairs(s.model_aliases) do
+        if
+          type(alias) ~= "string"
+          or not alias:match("^[%l%d_-]+$")
+          or type(ref) ~= "string"
+          or not ref:match("^[^/]+/.+$")
+        then
+          errs[#errs + 1] = "subagents.model_aliases entries must map simple aliases to provider/model-id"
+          break
+        elseif not configured_refs[ref] then
+          errs[#errs + 1] = ("subagents.model_aliases.%s targets %s, which is absent from models"):format(alias, ref)
+        end
+      end
     end
-    for _, field in ipairs({ "enabled", "parallel" }) do
+    if s.model ~= nil then
+      if type(s.model) ~= "string" or vim.trim(s.model) == "" then
+        errs[#errs + 1] = "subagents.model must be a non-empty model alias"
+      elseif type(s.model_aliases) ~= "table" or s.model_aliases[vim.trim(s.model)] == nil then
+        errs[#errs + 1] = "subagents.model must name a key from subagents.model_aliases"
+      end
+    end
+    for _, field in ipairs({ "enabled", "parallel", "allow_cross_provider" }) do
       if s[field] ~= nil and type(s[field]) ~= "boolean" then
         errs[#errs + 1] = "subagents." .. field .. " must be boolean"
       end
     end
     for _, field in ipairs({
       "max_turns",
-      "max_per_turn",
+      "max_turns_cap",
       "max_output_tokens",
       "max_parallel",
-      "max_per_batch",
       "max_result_bytes",
+      "tool_timeout_ms",
     }) do
       local value = s[field]
       if value ~= nil and (type(value) ~= "number" or value < 1 or value ~= math.floor(value)) then
         errs[#errs + 1] = "subagents." .. field .. " must be a positive integer"
       end
     end
+    if type(s.max_turns_cap) == "number" and s.max_turns_cap > 30 then
+      errs[#errs + 1] = "subagents.max_turns_cap must be at most 30"
+    end
+    if type(s.max_turns) == "number" and type(s.max_turns_cap) == "number" and s.max_turns > s.max_turns_cap then
+      errs[#errs + 1] = "subagents.max_turns must not exceed subagents.max_turns_cap"
+    end
+  end
+  if type(o.harness) == "table" then
+    if
+      o.harness.mode ~= nil
+      and not vim.tbl_contains({ "auto", "low", "medium", "high", "xhigh", "max", "ultra" }, o.harness.mode)
+    then
+      errs[#errs + 1] = "harness.mode is not recognized"
+    end
+    if o.harness.sync_effort ~= nil and type(o.harness.sync_effort) ~= "boolean" then
+      errs[#errs + 1] = "harness.sync_effort must be boolean"
+    end
   end
   if type(o.tools) == "table" and type(o.tools.diagnostics) == "table" then
     local sev = o.tools.diagnostics.severity
     if sev ~= nil and sev ~= "error" and sev ~= "warn" and sev ~= "all" then
       errs[#errs + 1] = "tools.diagnostics.severity must be 'error', 'warn', or 'all'"
+    end
+  end
+  if type(o.tools) == "table" then
+    local search = o.tools.web_search
+    if search ~= nil and type(search) ~= "table" then
+      errs[#errs + 1] = "tools.web_search must be a table"
+    elseif type(search) == "table" then
+      if search.backend ~= nil and not vim.tbl_contains({ "auto", "brave_api", "brave_html" }, search.backend) then
+        errs[#errs + 1] = "tools.web_search.backend must be 'auto', 'brave_api', or 'brave_html'"
+      end
+      if search.allow_unkeyed ~= nil and type(search.allow_unkeyed) ~= "boolean" then
+        errs[#errs + 1] = "tools.web_search.allow_unkeyed must be boolean"
+      end
+      for _, field in ipairs({ "max_results", "timeout_ms", "max_response_bytes" }) do
+        if search[field] ~= nil and (type(search[field]) ~= "number" or search[field] < 1) then
+          errs[#errs + 1] = "tools.web_search." .. field .. " must be positive"
+        end
+      end
+    end
+    local fetch = o.tools.web_fetch
+    if fetch ~= nil and type(fetch) ~= "table" then
+      errs[#errs + 1] = "tools.web_fetch must be a table"
+    elseif type(fetch) == "table" then
+      if fetch.max_redirects ~= nil and (type(fetch.max_redirects) ~= "number" or fetch.max_redirects < 0) then
+        errs[#errs + 1] = "tools.web_fetch.max_redirects must be non-negative"
+      end
+      for _, field in ipairs({ "timeout_ms", "max_response_bytes", "max_text_bytes", "max_lines" }) do
+        if fetch[field] ~= nil and (type(fetch[field]) ~= "number" or fetch[field] < 1) then
+          errs[#errs + 1] = "tools.web_fetch." .. field .. " must be positive"
+        end
+      end
     end
   end
   return errs
@@ -568,11 +707,43 @@ M._validate = validate
 function M.setup(opts)
   opts = opts or {}
   M.options = merge(vim.deepcopy(M.defaults), opts)
+  -- Replacing the model catalogue wholesale must not leave six inherited scout
+  -- aliases pointing at models that no longer exist. Keep only surviving
+  -- defaults unless the user supplied an explicit alias catalogue alongside
+  -- their custom models.
+  if
+    opts.models ~= nil
+    and type(M.options.models) == "table"
+    and not (type(opts.subagents) == "table" and opts.subagents.model_aliases ~= nil)
+  then
+    local refs = {}
+    for _, model in ipairs(M.options.models) do
+      if type(model) == "table" and type(model.ref) == "string" then refs[model.ref] = true end
+    end
+    local aliases = ((M.options.subagents or {}).model_aliases or {})
+    for alias, ref in pairs(aliases) do
+      if not refs[ref] then aliases[alias] = nil end
+    end
+    if M.options.subagents and M.options.subagents.model and not aliases[M.options.subagents.model] then
+      M.options.subagents.model = nil
+    end
+  end
   local errs = validate(M.options)
   -- Structural options must be tables; revert any scalar override (e.g. a
   -- mistaken `tools = false`) to its default so it can't crash a later
   -- `config.options.tools.x` access. The mistake is still surfaced via `errs`.
-  for _, key in ipairs({ "tools", "context", "ui", "providers", "memory", "subagents", "sessions", "keymaps", "usage" }) do
+  for _, key in ipairs({
+    "tools",
+    "context",
+    "ui",
+    "providers",
+    "memory",
+    "subagents",
+    "harness",
+    "sessions",
+    "keymaps",
+    "usage",
+  }) do
     if M.options[key] ~= nil and type(M.options[key]) ~= "table" then
       M.options[key] = vim.deepcopy(M.defaults[key] --[[@as table]])
     end
@@ -625,6 +796,66 @@ function M.resolve_model(ref)
   local provider, id = ref:match("^([^/]+)/(.+)$")
   if provider then return { provider = provider, id = id, label = id } end
   return nil
+end
+
+local SUBAGENT_ALIAS_ORDER = { "sol", "terra", "luna", "opus", "sonnet", "haiku" }
+
+local function configured_model(ref)
+  if type(ref) ~= "string" then return nil end
+  for _, model in ipairs(M.options.models or {}) do
+    if model.ref == ref then return M.resolve_model(ref) end
+  end
+end
+
+---Stable aliases exposed to the parent model for one-shot scout selection.
+---Only aliases whose target is actually present in `models` are advertised.
+---@return table[] choices ordered `{ alias, ref }` records
+function M.subagent_model_aliases()
+  local aliases = ((M.options.subagents or {}).model_aliases or {})
+  local ordered, seen = {}, {}
+  local function add(alias)
+    local ref = aliases[alias]
+    if type(ref) == "string" and configured_model(ref) then
+      ordered[#ordered + 1] = { alias = alias, ref = ref }
+      seen[alias] = true
+    end
+  end
+  for _, alias in ipairs(SUBAGENT_ALIAS_ORDER) do
+    add(alias)
+  end
+  local extras = {}
+  for alias in pairs(aliases) do
+    if not seen[alias] then extras[#extras + 1] = alias end
+  end
+  table.sort(extras)
+  for _, alias in ipairs(extras) do
+    add(alias)
+  end
+  return ordered
+end
+
+---Resolve an explicit scout model choice. Short aliases are preferred; exact
+---configured refs and unique configured bare IDs remain accepted for migration.
+---First-party OpenAI/Anthropic slugs must be configured, preventing plausible-
+---looking hallucinations from reaching the network.
+---@param choice string
+---@return table|nil model
+---@return string|nil resolved_ref
+function M.resolve_subagent_model(choice)
+  if type(choice) ~= "string" then return nil end
+  choice = vim.trim(choice)
+  if choice == "" then return nil end
+  for _, item in ipairs(M.subagent_model_aliases()) do
+    if choice == item.alias then return configured_model(item.ref), item.ref end
+  end
+  local provider = choice:match("^([^/]+)/")
+  -- First-party scouts intentionally use aliases only. Even a configured legacy
+  -- ref can be incompatible with the current subscription transport; keeping it
+  -- out of this resolver prevents the parent from falling back to stale IDs.
+  if provider == "openai" or provider == "anthropic" or not provider then return nil end
+  -- Third-party provider plugins do not necessarily participate in the built-in
+  -- alias catalogue, so retain their explicit provider/model escape hatch.
+  return M.resolve_model(choice), choice
 end
 
 ---Context window for the transport that OpenAI is expected to use. Subscription

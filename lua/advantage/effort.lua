@@ -14,7 +14,7 @@ local OPENAI_LABELS = {
   high = "high",
   xhigh = "xhigh · extra high",
   max = "max · maximum",
-  ultra = "ultra · delegation",
+  ultra = "max · legacy Ultra alias",
 }
 
 -- Reasoning levels are ordered so a provider-wide quality default can be
@@ -82,7 +82,7 @@ function M.openai_levels(model, transport)
   local id = tostring(model.id or ""):lower()
   if transport == "chatgpt" then
     if id:find("gpt%-5%.6%-sol") or id:find("gpt%-5%.6%-terra") then
-      return { "low", "medium", "high", "xhigh", "max", "ultra" }
+      return { "low", "medium", "high", "xhigh", "max" }
     end
     if id:find("gpt%-5%.6%-luna") then return { "low", "medium", "high", "xhigh", "max" } end
     return { "low", "medium", "high", "xhigh" }
@@ -127,6 +127,11 @@ function M.resolve_openai(model, transport, provider_effort)
   local requested = inherited and provider_effort or explicit
 
   if requested == nil then return nil, nil, { inherited = true, clamped_from = nil } end
+  -- Sessions/configs from before harness modes stored Ultra in the effort
+  -- field. Preserve them as Max reasoning; orchestration is now independent.
+  if requested == "ultra" and allowed.max then
+    return "max", nil, { inherited = inherited, clamped_from = nil, legacy_ultra = true }
+  end
   if allowed[requested] then return requested, nil, { inherited = inherited, clamped_from = nil } end
 
   if inherited then
@@ -174,6 +179,7 @@ end
 ---the API choose its default and therefore would not actually turn it off.
 function M.set_openai(model, mode)
   mode = tostring(mode or ""):lower()
+  if mode == "ultra" then mode = "max" end -- pre-harness-mode compatibility
   if mode == "auto" then mode = "default" end
   if mode == "off" or mode == "disabled" then mode = "none" end
   if mode == "default" then
@@ -245,6 +251,10 @@ end
 function M.set_anthropic(model, mode)
   mode = tostring(mode or ""):lower()
   local thinking_mode = M.anthropic_mode(model)
+  -- Keep the sub-agent effort contract provider-neutral: `xhigh` is the modern
+  -- spelling and maps to the legacy 16k "highest" budget on Haiku 4.5/manual
+  -- models instead of forcing the parent to memorize generation-specific names.
+  if thinking_mode == "manual" and mode == "xhigh" then mode = "highest" end
   local items = M.anthropic_items(model)
   local item = find_item(items, mode)
   if not item then

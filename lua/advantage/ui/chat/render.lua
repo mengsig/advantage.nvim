@@ -21,6 +21,7 @@ local R = {}
 local function winbar_text()
   local left = ("%%#AdvBarIcon# %s %%#AdvBarTitle#%s"):format(ICON, esc_bar(S.model_label))
   if S.effort_label then left = left .. (" %%#AdvBarFaint#· %s"):format(esc_bar(S.effort_label)) end
+  if S.harness_label then left = left .. (" %%#AdvBarFaint#· %s"):format(esc_bar(S.harness_label)) end
   if S.auth_badge then left = left .. (" %%#AdvBarFaint#· %s"):format(esc_bar(S.auth_badge)) end
   if config.options.tools.yolo then left = left .. " %#AdvBarDanger#⚡ yolo" end
   local right = ""
@@ -75,6 +76,7 @@ local function tool_line(t)
   local style = tool_style(t.status)
   local text = ("  %s %s"):format(style.icon, one_line(t.name or "?"))
   if t.detail and t.detail ~= "" then text = text .. "  " .. one_line(t.detail) end
+  if t.error and t.error ~= "" then text = text .. "  · " .. one_line(t.error) end
   return text, style
 end
 R.tool_line = tool_line

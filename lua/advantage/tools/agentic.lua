@@ -2,6 +2,7 @@
 ---(the plan tool). Registered by tools/init.lua; behaviour is identical to when
 ---these lived inline in that file.
 local util = require("advantage.util")
+local config = require("advantage.config")
 
 local TODO_MARKS = { pending = "·", in_progress = "▶", completed = "✓" }
 
@@ -11,26 +12,53 @@ return function(tool, s)
   assert(type(tool) == "function", "agentic tools: tool registrar required")
   assert(type(s) == "table", "agentic tools: support module required")
 
+  local preferred_model = (config.options.subagents or {}).model
+  local preferred_effort = (config.options.subagents or {}).effort
+  local model_description =
+    "Required explicit scout route. Use exactly one short alias from the live enum; never guess a versioned model ID, omit the field, or send an empty string."
+  if type(preferred_model) == "string" and vim.trim(preferred_model) ~= "" then
+    model_description = model_description .. " The user-configured preference is " .. vim.trim(preferred_model) .. "."
+  end
+  local effort_description =
+    "Required explicit scout reasoning level. Choose it deliberately; never omit it or send an empty string. Use inherit only when retaining the selected model's configured effort is intentional."
+  if type(preferred_effort) == "string" and vim.trim(preferred_effort) ~= "" then
+    effort_description = effort_description
+      .. " The user-configured preference is "
+      .. vim.trim(preferred_effort)
+      .. "."
+  end
+  local turn_cap = math.max(2, math.min(tonumber((config.options.subagents or {}).max_turns_cap) or 12, 30))
+
   tool({
     name = "sub_agent",
     safe = true,
     feature = "subagents",
-    description = "Spawn a read-only sub-agent for independent investigation. The sub-agent can read/search/list files and returns a concise report; it cannot edit files. Batch several sub_agent calls in a single response to run them concurrently — best for independent questions. Issue them one per turn only when a later investigation depends on an earlier result.",
+    description = "Spawn one read-only scout for a specific investigation whose evidence will materially reduce parent work. It can inspect files and research the web, but cannot edit, run shell commands, create fixtures, or execute a CLI. Do not delegate generic repository/test surveys, runtime validation, duplicate review, or work the parent can do directly. If 2+ independent scouts are justified, emit them together (prefer sub_agent_batch mode=parallel); never serialize independent scouts across turns. After implementation starts, delegate again only for a concrete unresolved blocker—not post-hoc review.",
     input_schema = {
       type = "object",
       properties = {
         prompt = { type = "string", description = "Investigation task for the sub-agent" },
-        model = { type = "string", description = "Optional model ref provider/model-id; defaults to the current model" },
+        model = {
+          type = "string",
+          minLength = 1,
+          description = model_description,
+        },
         max_turns = {
           type = "integer",
-          description = "Maximum sub-agent turns including tool loops (default from config, capped at 30). The final turn is always report-only, so give a package-wide investigation ample budget (e.g. 15-25).",
+          minimum = 2,
+          maximum = turn_cap,
+          description = ("Requested ceiling including the final report-only turn (user cap: %d). This is a ceiling, not a target: use 3-6 for a focused investigation and 8-12 only for one genuinely deep isolated blocker. Never assign the maximum to every scout in a breadth wave."):format(
+            turn_cap
+          ),
         },
         effort = {
           type = "string",
-          description = "Scout reasoning effort (e.g. low/medium/high/xhigh, or inherit). Defaults to config.subagents.effort.",
+          minLength = 1,
+          enum = { "low", "medium", "high", "xhigh", "max", "inherit" },
+          description = effort_description,
         },
       },
-      required = { "prompt" },
+      required = { "prompt", "model", "effort" },
     },
     summary = function(input)
       local p = (input.prompt or ""):gsub("%s+", " ")
@@ -38,6 +66,57 @@ return function(tool, s)
     end,
     run = function(input, ctx, cb)
       return require("advantage.subagent").run(input, ctx, cb)
+    end,
+  })
+
+  tool({
+    name = "sub_agent_batch",
+    safe = true,
+    parent_only = true,
+    feature = "subagents",
+    description = "Orchestrate one task-sized wave of read-only scouts. Use mode=parallel for independent domains. Scouts can inspect/research but cannot run shell commands, create fixtures, or execute a CLI; the parent owns runtime evidence and verification. Sequential mode only serializes already self-contained tasks; it does not pass an earlier report into later prompts, so genuinely dependent investigations require separate parent turns. Do not add generic architecture/test/reviewer roles or start a second wave after implementation unless a concrete blocker remains. Every task explicitly provides prompt, model alias, effort, and an optional proportional turn ceiling; results return in task order.",
+    input_schema = {
+      type = "object",
+      properties = {
+        mode = {
+          type = "string",
+          enum = { "parallel", "sequential" },
+          description = "parallel for independent tasks; sequential only to serialize self-contained tasks (not for data dependencies)",
+        },
+        tasks = {
+          type = "array",
+          minItems = 1,
+          description = "Self-contained scout tasks; omit generic survey/reviewer extras. Put data-dependent investigations in separate parent turns.",
+          items = {
+            type = "object",
+            properties = {
+              prompt = { type = "string", minLength = 1, description = "Investigation task" },
+              model = {
+                type = "string",
+                minLength = 1,
+                description = "Explicit short scout alias from the live sub_agent enum",
+              },
+              effort = { type = "string", minLength = 1, enum = { "low", "medium", "high", "xhigh", "max", "inherit" } },
+              max_turns = {
+                type = "integer",
+                minimum = 2,
+                maximum = turn_cap,
+                description = ("Optional per-scout ceiling (user cap: %d); 3-6 is normally sufficient and a whole breadth wave must not use the maximum"):format(
+                  turn_cap
+                ),
+              },
+            },
+            required = { "prompt", "model", "effort" },
+          },
+        },
+      },
+      required = { "mode", "tasks" },
+    },
+    summary = function(input)
+      return ("%s · %d scouts"):format(input.mode or "parallel", type(input.tasks) == "table" and #input.tasks or 0)
+    end,
+    run = function(input, ctx, cb)
+      return require("advantage.subagent").run_batch(input, ctx, cb)
     end,
   })
 

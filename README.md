@@ -10,7 +10,7 @@ feeds on the fallout, and keeps swinging until the task is dead.
   OpenAI GPT/Codex (GPT-5.6 Sol, Terra, Luna, gpt-5.5, and the gpt-5.1-codex
   family) out of the box; the provider interface is ~100 lines if you want to add more.
 - **Editor-native tools.** `read_file`, `edit_file`, `write_file`, `bash`, `grep`,
-  `find_files`, `list_dir`, `diagnostics`, `sub_agent`, `web_search` — executed
+  `find_files`, `list_dir`, `diagnostics`, `sub_agent`, `sub_agent_batch`, `web_search`, `web_fetch` — executed
   inside Neovim, so edited buffers reload live, edits get an **LSP/linter feedback
   loop**, and every mutation is gated behind a permission card with a real diff.
 - **Semantic code navigation (LSP).** `document_symbols`, `goto_definition`,
@@ -116,6 +116,7 @@ task-critical state.
     { "<leader>cd", function() require("advantage").review() end, desc = "advantage: review changes" },
     { "<leader>cy", function() require("advantage").toggle_yolo() end, desc = "advantage: toggle yolo" },
     { "<leader>ce", function() require("advantage").pick_effort() end, desc = "advantage: tune effort" },
+    { "<leader>ch", function() require("advantage").pick_harness() end, desc = "advantage: harness mode" },
     { "<leader>c?", function() require("advantage").help() end, desc = "advantage: help" },
   },
   opts = {},
@@ -194,7 +195,7 @@ X11 `xclip`, macOS `pngpaste`) and drops a `[image: …]` chip into the text —
 delete the chip to detach. `:Advantage attach shot.png` attaches a file.
 
 **Slash commands** in the prompt: `/usage` · `/compact` · `/context` · `/review` ·
-`/yolo` · `/effort` · `/new` · `/model` · `/resume` · `/help`.
+`/yolo` · `/effort` · `/harness` · `/new` · `/model` · `/resume` · `/help`.
 
 **Review mode.** The agent snapshots every file before its first edit. After a
 turn that changed files you'll see *"n files changed — /review to inspect"*:
@@ -212,13 +213,11 @@ it's on. Use at your own risk.
 `:Advantage effort [mode]`, `<leader>ce`) tunes the active model before the next
 turn. The choices are model- and transport-aware:
 
-- Current OpenAI/Codex models use `reasoning.effort`. Subscription GPT-5.6 Sol
-  and Terra expose `low` through `ultra`, Luna through `max`, and GPT-5.5 through
-  `xhigh`; API-key profiles expose their declared API levels. `default` removes
-  the per-model override and inherits `providers.openai.reasoning_effort`
-  (`ultra` by default). An inherited value is clamped downward to the deepest
-  level that model/transport supports—Sol stays `ultra` on login, Luna becomes
-  `max`, GPT-5.5 becomes `xhigh`, and raw-API Sol becomes `max`. An explicit
+- Current OpenAI/Codex models use the real wire-level `reasoning.effort` values.
+  Sol/Terra/Luna expose through `max`, GPT-5.5 through `xhigh`, and API-key
+  profiles expose their declared API levels. `default` removes the per-model
+  override and inherits `providers.openai.reasoning_effort` (`max` by default).
+  Inherited values clamp to the deepest level that model/transport supports. An explicit
   unsupported per-model choice remains an error. `off` is an alias for the
   explicit API value `none` and is only
   offered when that model/transport supports it — merely omitting `reasoning`
@@ -232,6 +231,23 @@ turn. The choices are model- and transport-aware:
   `low`=`1k`, `medium`=`4k`, `high`=`8k`, `higher`=`10k`, `highest`=`16k`, and
   `max`=`32k` (aliases include `think`, `think-hard`, `think-harder`, and
   `ultrathink`).
+
+**Harness mode.** `/harness` (or `:Advantage harness [mode]`, `<leader>ch`)
+controls orchestration separately from model reasoning. Selecting an explicit
+preset initializes the corresponding effort, but `/effort` can then override it
+without changing the harness. `auto` follows the active effort.
+
+| Mode | Orchestration policy |
+|---|---|
+| `low` | Direct work; scouts execute sequentially |
+| `medium` | Selective delegation with modest concurrency |
+| `high` | Proactively split clearly independent investigations |
+| `xhigh` | Deep parent reasoning with selective, task-sized fan-out |
+| `max` | Maximum parent depth; delegation stays deliberate |
+| `ultra` | Max reasoning; proactive parallelism only when work divides cleanly |
+
+`subagents.parallel = false` keeps every harness mode sequential, while
+`max_parallel` remains a concurrency width rather than a spawn quota.
 
 **Usage dashboard.** `/usage` (or `:Advantage usage`, `<leader>cu`) shows
 session/today/7-day token totals, cache savings (cached input bills at ~10%, and
@@ -282,6 +298,8 @@ runs in one of two modes:
   `/compact heuristic` (or `:Advantage compact heuristic`) to skip the model
   call and use the free heuristic instead for a single invocation, or set
   `context.compact_mode = "heuristic"` to make that the default everywhere.
+  Messages submitted while manual compaction is running enter the normal queue
+  and dispatch automatically once the compacted transcript is safely adopted.
 
 **Semantic navigation (LSP).** advantage exposes the language servers your editor
 already runs as read-only tools, so the agent navigates code *semantically*
@@ -409,38 +427,79 @@ with `tools = { diagnostics = { enabled = false } }` (or just the auto-attach wi
 
 **Sub-agents.** The model has a `sub_agent` tool for read-only fan-out: a worker
 gets its own short loop and can use read/search/list tools, then returns a
-concise report to the parent agent. It cannot edit files. A model may call one
-worker and wait (sequential delegation) or emit several `sub_agent` calls in one
-turn; with `subagents.parallel = true`, a same-turn fan-out runs
+concise report to the parent agent. It cannot edit files, run shell commands,
+create fixtures, or execute a CLI; runtime testing stays in the parent. A model may call one
+worker and wait (sequential delegation), emit several `sub_agent` calls in one
+turn, or use `sub_agent_batch` with an explicit `mode = "parallel"` or
+`mode = "sequential"`; with `subagents.parallel = true`, a same-turn fan-out runs
 **concurrently** and overlaps network latency. Parallelism is supported, not
 required, and setting `parallel = false` makes batches run sequentially. Fan-out
-is bounded by `max_parallel` concurrent streams, `max_per_batch` workers in one
-response, and `max_per_turn` workers cumulatively across the whole parent turn;
-reports share a `max_result_bytes` parent-context budget, each scout request is
-held to `max_output_tokens` on Anthropic/raw-API transports, and excess work is
-reported explicitly instead of growing without limit. ChatGPT-login scouts keep
+is never rejected because of its batch size or cumulative count. `max_parallel`
+only controls how many provider streams run at once; every additional valid
+scout waits in the local queue and still runs. The active harness mode may choose
+a narrower concurrency width. Low mode is sequential; High/XHigh/Ultra can
+proactively fan out when the task divides cleanly. The default policy uses one
+task-sized investigation wave, then has the parent synthesize and act; a later
+wave remains available for a new concrete blocker, but generic architecture,
+test-survey, and post-implementation reviewer waves are deliberately discouraged.
+This is steering, not a quota: every valid scout the model requests still runs.
+Independent scouts emitted beside ordinary tool calls run as a concurrent
+contiguous group while all tool results retain their original call order. Batch
+`mode = "sequential"` only serializes self-contained prompts; a genuinely
+dependent scout must be issued from a later parent turn after the earlier report
+is available. Reports share a
+`max_result_bytes` parent-context budget, each scout request is
+held to `max_output_tokens` on Anthropic/raw-API transports. ChatGPT-login scouts keep
 the model's native output reserve because that transport has no confirmed hard
-cap field; their turn, delegation, result, and report limits still bound them.
-Scouts default to
-`subagents.effort = "medium"` rather than inheriting an expensive parent setting;
-each `sub_agent` call can override `effort` or request `"inherit"`. Sub-agents
+cap field; their individual turn, result, and report limits still bound them.
+Every `sub_agent` call must explicitly choose a stable short model alias and an
+effort level. By default, routes stay in the active parent's provider family:
+a Codex/OpenAI parent sees only `sol`/`terra`/`luna`, while a Claude/Anthropic
+parent sees only `opus`/`sonnet`/`haiku`. Set
+`subagents.allow_cross_provider = true` to deliberately expose both families.
+The aliases resolve centrally to current configured provider IDs, so the parent
+never guesses version strings. Blank, raw first-party IDs, and unavailable
+aliases are rejected locally; `subagents.model` and `subagents.effort` are
+preferences exposed to the parent, never silent harness fallbacks. A provider
+authentication or unsupported-model failure temporarily removes its affected
+aliases from the next tool schema, preventing sibling-model retry loops. The
+parent may explicitly choose `effort = "inherit"` when intentional. Sub-agents
 run on a **lean context**: they get the base instructions (and the read-only tool set,
 including the LSP navigation tools) but **not** the repo-memory block or skills
 index — a scout can't `remember`/`use_skill` anyway, and re-shipping the full
 learned context to every worker (and to each worker of a parallel fan-out,
 cold-cached) is exactly the token leak fan-out exists to avoid. Their returned
 report is size-capped before it's spliced into the parent transcript, so a chatty
-worker can't bloat the parent's context.
+worker can't bloat the parent's context. Scouts are steered to stay under roughly
+900 words, and each returned report is hard-capped at 6,000 bytes. Ordinary
+scouts default to six provider requests, including the final report-only
+request; the model may explicitly request up to the configured 12-request hard
+cap for one genuinely deep blocker. At request four, a sufficiency checkpoint
+asks an evidence-complete scout to report instead of consuming its ceiling.
+Child rows display provider, route/effort, and live `request n/N` progress, so
+provider requests are never confused with the number of scouts. Reports separate root
+cause/evidence, the minimal compatible touch set, contracts to preserve, focused
+regression cases, and optional hardening. The parent receives compact phase
+guidance to treat reports as leads rather than authority, preserve previously
+passing test contracts, and keep new tests hermetic. After a scout wave, the
+parent gets one batched source-confirmation pass and is then explicitly steered
+to implement instead of re-auditing the repository. Verification is tracked per
+edit generation: repeated tests do not spam reminders, but editing after a
+passing suite makes that verification stale and re-arms one bounded final diff
+audit after the next successful suite.
 
-**Web search.** A `web_search` tool backed by the [Brave Search
-API](https://api.search.brave.com) — one lightweight GET request, no
-page-scraping step, results returned as compact `title — url` + snippet lines
-(HTML stripped, capped at `max_results`, hard ceiling 10). Needs an API key
-(Brave's free tier covers casual use): set `$BRAVE_API_KEY` or
-`tools.web_search.api_key`. **Without a key the tool is hidden from the schema
-entirely** — the model never wastes a turn calling a search tool that can't
-work. It's `safe` (no permission prompt, like `grep`/`read_file`) and
-automatically available to read-only sub-agents.
+**Web research.** Scouts have two independent, safe research tools. `web_search`
+uses the [Brave Search API](https://api.search.brave.com) when
+`$BRAVE_API_KEY`/`tools.web_search.api_key` is configured, and otherwise tries a
+best-effort public Brave/Bing HTML fallback. The fallback can be rate-limited;
+the API is the stable option. `web_fetch` reads a known public HTTP(S) page so a
+scout can verify a result instead of trusting a snippet. Fetches are GET-only,
+DNS-pinned, manually redirect-validated, limited to public default web ports and
+text content, and bounded by response/text/time limits. Private/metadata hosts,
+credentials, binaries, oversized responses and HTTPS→HTTP downgrades are
+blocked. Returned pages are explicitly marked **untrusted web data**: page text
+can never change the task or authorize tools. Both tools are read-only and
+available to sub-agents; no API key is required for `web_fetch`.
 
 **Repo memory & skills (self-learning harness).** advantage keeps a lightweight,
 per-repo memory so the agent gets *better and cheaper* at your codebase over time.
@@ -563,11 +622,11 @@ require("advantage").setup({
       thinking_mode = "manual", context_window = 200000, max_output_tokens = 64000 },
     { ref = "openai/gpt-5.6-sol", label = "gpt-5.6 sol", context_window = 372000,
       api_context_window = 1050000, max_output_tokens = 128000,
-      reasoning_efforts = { "low", "medium", "high", "xhigh", "max", "ultra" },
+      reasoning_efforts = { "low", "medium", "high", "xhigh", "max" },
       api_reasoning_efforts = { "none", "low", "medium", "high", "xhigh", "max" } },
     { ref = "openai/gpt-5.6-terra", label = "gpt-5.6 terra", context_window = 372000,
       api_context_window = 1050000, max_output_tokens = 128000,
-      reasoning_efforts = { "low", "medium", "high", "xhigh", "max", "ultra" },
+      reasoning_efforts = { "low", "medium", "high", "xhigh", "max" },
       api_reasoning_efforts = { "none", "low", "medium", "high", "xhigh", "max" } },
     { ref = "openai/gpt-5.6-luna", label = "gpt-5.6 luna", context_window = 372000,
       api_context_window = 1050000, max_output_tokens = 128000,
@@ -592,9 +651,15 @@ require("advantage").setup({
     openai = {
       auth_mode = "auto",         -- "auto" | "chatgpt" | "api_key"
       max_output_tokens = 64000,  -- raw API request cap; login reserves model max
-      reasoning_effort = "ultra", -- inherited + clamped per model/transport
+      reasoning_effort = "max",   -- deepest single-agent wire effort
       reasoning_summary = "auto", -- "auto" | "concise" | "detailed" | false
+      stream_error_retries = 2,   -- retry only pre-payload overload/truncated SSE
+      stream_error_retry_base_ms = 2000, -- bounded exponential backoff
     },
+  },
+  harness = {
+    mode = "auto",               -- auto | low | medium | high | xhigh | max | ultra
+    sync_effort = true,           -- preset selection initializes matching effort
   },
   system_prompt = nil,           -- string to replace, function(default) to extend
   max_agent_turns = 100,         -- safety cap on tool-loop round-trips per user turn
@@ -631,13 +696,24 @@ require("advantage").setup({
                                  -- to attach (tsserver/vtsls/jdtls in a big project)
       max_results = 60,          -- cap on symbols / references / matches per call
     },
-    web_search = {               -- Brave Search API; hidden from the schema with no key
+    web_search = {               -- Brave API, then public Brave/Bing fallback
       enabled = true,
+      backend = "auto",          -- "auto" | "brave_api" | "brave_html"
+      allow_unkeyed = true,
       api_key_env = "BRAVE_API_KEY", -- or set api_key directly below
       api_key = nil,
       base_url = "https://api.search.brave.com/res/v1/web/search",
       max_results = 5,            -- default result count (hard cap: 10)
       timeout_ms = 15000,
+      max_response_bytes = 1048576,
+    },
+    web_fetch = {                 -- public, bounded, DNS-pinned page reading
+      enabled = true,
+      timeout_ms = 20000,
+      max_redirects = 3,
+      max_response_bytes = 2097152,
+      max_text_bytes = 64000,
+      max_lines = 1000,
     },
   },
   context = {
@@ -661,17 +737,23 @@ require("advantage").setup({
   },
   subagents = {
     enabled = true,              -- exposes the read-only `sub_agent` tool
-    model = nil,                 -- nil = parent's model; set a fast model
-                                 -- (e.g. "anthropic/claude-haiku-4-5") for cheaper fan-out
-    max_turns = 12,              -- per-sub-agent turn budget (last turn is report-only,
-                                 -- so a scout always returns findings, not an empty error)
-    max_per_turn = 12,           -- cumulative scouts across the whole parent turn
+    model = nil,                 -- optional preference shown to the parent;
+                                 -- every sub_agent call still names its model explicitly
+    model_aliases = {            -- stable one-shot syntax → current provider IDs
+      sol = "openai/gpt-5.6-sol", terra = "openai/gpt-5.6-terra",
+      luna = "openai/gpt-5.6-luna", opus = "anthropic/claude-opus-4-8",
+      sonnet = "anthropic/claude-sonnet-5", haiku = "anthropic/claude-haiku-4-5",
+    },
+    allow_cross_provider = false,-- same provider family as parent unless explicitly enabled
+    max_turns = 6,               -- default provider-request budget per scout
+    max_turns_cap = 12,          -- user ceiling for model-requested budgets;
+                                 -- last turn remains report-only
     max_output_tokens = 16000,   -- per-scout Anthropic/raw-API output ceiling
-    effort = "medium",           -- per-call `effort` can override; "inherit" uses parent
+    effort = "medium",           -- preference shown to parent; every call sets effort
     parallel = true,             -- support concurrent fan-out; false preserves sequential runs
-    max_parallel = 4,            -- concurrent provider streams; excess scouts queue
-    max_per_batch = 8,           -- bounded same-response fan-out
+    max_parallel = 4,            -- safe default width; XHigh/Max/Ultra support an explicit 8
     max_result_bytes = 64000,    -- shared parent-context budget for batch results
+    tool_timeout_ms = 45000,     -- watchdog for each scout read-only tool
   },
   memory = {                     -- per-repo self-learning harness (remember/use_skill)
     enabled = true,
@@ -697,6 +779,7 @@ require("advantage").setup({
     review = "<leader>cd",        -- review agent changes (diff)
     yolo = "<leader>cy",          -- toggle skip-all-permissions
     effort = "<leader>ce",        -- tune reasoning effort / thinking
+    harness = "<leader>ch",       -- tune harness orchestration policy
     help = "<leader>c?",          -- keybind & command cheatsheet
   },
   usage = {
@@ -717,13 +800,19 @@ require("advantage").setup({
   within a turn; disable with
   `providers = { anthropic = { interleaved_thinking = false } }` if your account
   rejects it.
-- OpenAI Responses calls use a stable per-chat `prompt_cache_key`; the ChatGPT
-  transport also keeps one stable `session_id` across the tool loop. Together
-  with the frozen system prefix, this preserves provider cache/session routing
-  instead of defeating it with a new identifier every request.
+- OpenAI Responses calls route byte-identical system/tool prefixes through a
+  stable content-derived `prompt_cache_key` across chats. The ChatGPT transport
+  separately keeps a unique, stable `session-id`/`thread-id` for each chat, so
+  cache reuse never merges conversation state. Scout cache keys use four
+  round-robin buckets for a shared prefix to retain reuse without concentrating
+  concurrent fan-out on one hot route.
 - Codex subscription access goes through the same backend the codex CLI uses;
   model availability can differ from the raw API catalogue. The API-key path is
   selected with `providers.openai.auth_mode = "api_key"` when needed.
+- OpenAI overload/truncated-stream events retry only before any text, thinking,
+  or tool payload is delivered. Retries preserve the exact request, use bounded
+  backoff, and surface a visible notice. After payload delivery—or for
+  deterministic auth/model/400 errors—the failure is never replayed.
 - Request bodies and credentials are passed to curl via files/stdin, never
   argv, so nothing sensitive shows up in the process list.
 

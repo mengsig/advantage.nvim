@@ -275,6 +275,10 @@ local function build_body(pcfg, req)
   local otools = to_tools(req.tools)
   local effort = req.model.reasoning_effort
   if effort == nil then effort = pcfg.reasoning_effort end
+  -- `ultra` is an advantage/Codex orchestration mode. Never put it on the
+  -- wire: Responses accepts the underlying single-agent effort (`max`), while
+  -- the agent harness supplies proactive parallel delegation.
+  if effort == "ultra" then effort = "max" end
   -- Backward compatibility for sessions saved by the old picker, where `false`
   -- meant "off" but accidentally omitted the reasoning object (which merely
   -- restored the API default). Current sessions store the real API value `none`.
@@ -315,17 +319,19 @@ M._build_body = build_body
 local function endpoint_for(cred, pcfg, body, req)
   assert(type(cred) == "table" and cred.mode ~= nil, "openai.endpoint_for: resolved credential required")
   if cred.mode == "chatgpt" then
+    local session_id = (req and req.session_id) or uuid()
     return "https://chatgpt.com/backend-api/codex/responses",
       {
         "content-type: application/json",
         "accept: text/event-stream",
         "authorization: Bearer " .. cred.token,
         "chatgpt-account-id: " .. cred.account_id,
-        "OpenAI-Beta: responses=experimental",
         "originator: codex_cli_rs",
-        -- Keep one stable conversation id across tool-loop requests. A fresh UUID
-        -- per request defeats the subscription backend's cache/session routing.
-        "session_id: " .. ((req and req.session_id) or uuid()),
+        -- Match current Codex's hyphenated identity headers. Underscored HTTP
+        -- headers can be dropped by proxies, silently defeating sticky routing.
+        "session-id: " .. session_id,
+        "thread-id: " .. session_id,
+        "x-client-request-id: " .. uuid(),
       }
   end
   body.max_output_tokens = config.effective_max_output_tokens(req.model, "openai", "api_key") or pcfg.max_output_tokens
@@ -335,19 +341,65 @@ local function endpoint_for(cred, pcfg, body, req)
       "authorization: Bearer " .. cred.key,
     }
 end
+M._endpoint_for = endpoint_for
 
 function M.stream(req)
   assert(type(req) == "table" and type(req.on) == "table", "openai.stream: req with on handlers required")
   local pcfg = config.options.providers.openai
   local cancelled, inner, reauthed, effort_retried = false, nil, false, false
+  local stream_error_retries = 0
   local effort_override
   local attempt
+
+  local function retryable_stream_error(message, meta)
+    if type(meta) == "table" and meta.retryable == true then return true end
+    local lower = tostring(message or ""):lower()
+    return lower:find("overloaded", 1, true) ~= nil
+      or lower:find("try again later", 1, true) ~= nil
+      or lower:find("temporarily unavailable", 1, true) ~= nil
+      or lower:find("at capacity", 1, true) ~= nil
+      or lower:find("curl: (18)", 1, true) ~= nil
+      or lower:find("curl exited with code 18", 1, true) ~= nil
+      or lower:find("transfer closed with outstanding", 1, true) ~= nil
+  end
+
+  local function deliver_or_retry(message, meta, saw_payload)
+    local max_retries = math.max(0, math.floor(tonumber(pcfg.stream_error_retries) or 2))
+    if
+      not cancelled
+      and not saw_payload
+      and retryable_stream_error(message, meta)
+      and stream_error_retries < max_retries
+    then
+      stream_error_retries = stream_error_retries + 1
+      local base = math.max(0, math.floor(tonumber(pcfg.stream_error_retry_base_ms) or 2000))
+      local delay = math.min(base * 2 ^ (stream_error_retries - 1), 10000)
+      local notice = ("OpenAI stream overloaded/interrupted; retrying the same request (%d/%d) in %.1fs"):format(
+        stream_error_retries,
+        max_retries,
+        delay / 1000
+      )
+      if type(req.on.retry) == "function" then
+        pcall(req.on.retry, notice, { attempt = stream_error_retries, delay_ms = delay, provider = "openai" })
+      else
+        vim.schedule(function()
+          vim.notify(notice, vim.log.levels.WARN)
+        end)
+      end
+      return vim.defer_fn(function()
+        if not cancelled then attempt(false) end
+      end, delay)
+    end
+    req.on.error(message, meta)
+  end
 
   attempt = function(force)
     auth.openai(function(cred, autherr)
       if cancelled then return end
-      if not cred then return req.on.error(autherr) end
-      if req.on.auth then req.on.auth(cred.badge) end
+      if not cred then
+        return req.on.error(autherr, { kind = "auth", scope = "provider", retryable = false, provider = "openai" })
+      end
+      if req.on.auth then req.on.auth(cred.badge, { transport = cred.mode, provider = "openai" }) end
 
       local effective_req = req
       if req.model.reasoning_effort == false then
@@ -366,7 +418,15 @@ function M.stream(req)
         effective_req.model.reasoning_effort = cached_cap
       end
       local selected, effort_err = effort_controls.resolve_openai(effective_req.model, cred.mode, pcfg.reasoning_effort)
-      if effort_err then return req.on.error(effort_err) end
+      if effort_err then
+        return req.on.error(effort_err, {
+          kind = "request",
+          scope = "request",
+          retryable = false,
+          provider = "openai",
+          transport = cred.mode,
+        })
+      end
       -- Freeze the resolved inherited value into this request. build_body is also
       -- exported for unit tests and normally consults provider config itself; a
       -- clone here prevents that generic path from undoing transport-aware
@@ -378,7 +438,19 @@ function M.stream(req)
 
       local body = build_body(pcfg, effective_req)
       local url, headers = endpoint_for(cred, pcfg, body, effective_req)
-      local on_event, is_completed = make_handler(req.on, selected)
+      local saw_payload = false
+      local handler_on = vim.tbl_extend("force", {}, req.on)
+      for _, key in ipairs({ "text", "thinking", "tool_start" }) do
+        local callback = req.on[key]
+        handler_on[key] = function(...)
+          saw_payload = true
+          if callback then return callback(...) end
+        end
+      end
+      handler_on.error = function(message, meta)
+        deliver_or_retry(message, meta, saw_payload)
+      end
+      local on_event, is_completed = make_handler(handler_on, selected)
 
       inner = util.request_sse({
         url = url,
@@ -393,26 +465,25 @@ function M.stream(req)
             reauthed = true
             return attempt(true)
           end
-          -- The subscription catalogue can lag the local model metadata. In
-          -- particular, some login pools advertise Sol but reject `ultra` with
-          -- a 400 listing support only through xhigh. Recover once at the
-          -- deepest value the server explicitly advertised rather than losing
-          -- the entire coding turn.
+          -- Some ChatGPT-login pools currently cap the parent request at xhigh
+          -- even though the Codex catalogue exposes Max/Ultra. Ultra's
+          -- delegation still runs in the harness; recover the parent stream at
+          -- the deepest effort this route explicitly advertises.
           local lower = tostring(msg):lower()
           if
             status == 400
             and not effort_retried
-            and selected
+            and selected == "max"
             and lower:find("invalid value", 1, true)
-            and lower:find("ultra", 1, true)
             and lower:find("xhigh", 1, true)
+            and (lower:find("max", 1, true) or lower:find("ultra", 1, true))
           then
             effort_retried = true
             effort_override = "xhigh"
             server_effort_caps[cred.mode .. ":" .. tostring(effective_req.model.id)] = "xhigh"
             vim.schedule(function()
               vim.notify(
-                ("OpenAI %s rejected Ultra for %s; retrying at xhigh"):format(
+                ("Ultra mode active; OpenAI %s caps parent reasoning for %s at xhigh (delegation remains enabled)"):format(
                   cred.mode == "chatgpt" and "login" or "API",
                   tostring(effective_req.model.id)
                 ),
@@ -421,10 +492,29 @@ function M.stream(req)
             end)
             return attempt(false)
           end
-          req.on.error(msg)
+          local kind = (status == 401 or status == 403) and "auth"
+            or status == 404 and "model"
+            or status == 429 and "capacity"
+            or "http"
+          deliver_or_retry(msg, {
+            kind = kind,
+            scope = kind == "auth" and "provider" or kind == "model" and "model" or "request",
+            retryable = status == 429 or (status and status >= 500) or false,
+            status = status,
+            provider = "openai",
+            transport = cred.mode,
+          }, saw_payload)
         end),
         on_done = vim.schedule_wrap(function()
-          if not is_completed() then req.on.error("stream ended unexpectedly") end
+          if not is_completed() then
+            deliver_or_retry("stream ended unexpectedly", {
+              kind = "transport",
+              scope = "request",
+              retryable = true,
+              provider = "openai",
+              transport = cred.mode,
+            }, saw_payload)
+          end
         end),
       })
     end, force)

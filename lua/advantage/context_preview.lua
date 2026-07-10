@@ -81,9 +81,9 @@ end
 
 ---Render the tool-schema breakdown with a wrapped list of tool names.
 ---@return integer tools_tok token subtotal for the encoded tool schemas
-local function render_tools_section(add, tools)
+local function render_tools_section(add, tools, parent_model)
   assert(type(add) == "function", "render_tools_section: add sink required")
-  local schemas = tools.schemas()
+  local schemas = tools.schemas(parent_model)
   assert(type(schemas) == "table", "render_tools_section: schemas must be a table")
   local ok_json, json = pcall(vim.json.encode, schemas)
   local tools_tok = ok_json and tok(json) or 0
@@ -152,6 +152,8 @@ function M.build(agent)
 
   return memory.with_root(cwd, function()
     local model = resolve_model(agent, config)
+    local prompt_model = (agent and agent.model) or config.resolve_model(config.options.default_model)
+    local harness_mode = (agent and agent.harness_mode) or ((config.options.harness or {}).mode or "auto")
 
     -- The memory block that will actually be sent: the agent's session-frozen
     -- block, or a fresh render when there is no session. Passing it through the
@@ -159,8 +161,8 @@ function M.build(agent)
     -- sent — including the frozen-vs-disk state.
     local frozen = agent and agent:_memory_prompt_block() or nil
     local frozen_base = agent and agent._base_system_prompt or nil
-    local sys_parts = agentmod.system_prompt_parts(frozen, cwd, frozen_base)
-    local raw_system = agentmod.system_prompt(frozen, cwd, frozen_base)
+    local sys_parts = agentmod.system_prompt_parts(frozen, cwd, frozen_base, prompt_model, harness_mode)
+    local raw_system = agentmod.system_prompt(frozen, cwd, frozen_base, prompt_model, harness_mode)
     assert(type(raw_system) == "string", "context_preview: system_prompt must return a string")
 
     local lines = {}
@@ -178,7 +180,7 @@ function M.build(agent)
     add("")
 
     local system_total = render_system_section(add, agent, memory, frozen, sys_parts)
-    local tools_tok = render_tools_section(add, tools)
+    local tools_tok = render_tools_section(add, tools, prompt_model)
     local trans_tok = render_transcript_section(add, agent, compact)
     render_totals_section(add, system_total, tools_tok, trans_tok, model.provider)
 

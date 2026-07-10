@@ -1,6 +1,40 @@
 ---@brief Utilities: async curl SSE streaming, small helpers.
 local M = {}
 
+---Split one aggregate byte budget deterministically across `count` results.
+---There is deliberately no per-result floor: a model may emit an arbitrarily
+---large read-only fan-out, but that must never turn the configured aggregate
+---context ceiling into `count × floor` bytes.
+---@param total number
+---@param count integer
+---@return integer[]
+function M.partition_byte_budget(total, count)
+  count = math.max(0, math.floor(tonumber(count) or 0))
+  if count == 0 then return {} end
+  total = math.max(0, math.floor(tonumber(total) or 0))
+  local base, remainder = math.floor(total / count), total % count
+  local out = {}
+  for i = 1, count do
+    out[i] = base + (i <= remainder and 1 or 0)
+  end
+  return out
+end
+
+---UTF-8-safe truncation whose marker is included inside the byte ceiling.
+---@param text string
+---@param max_bytes integer
+---@param marker? string
+---@return string
+function M.truncate_to_bytes(text, max_bytes, marker)
+  text = tostring(text or "")
+  max_bytes = math.max(0, math.floor(tonumber(max_bytes) or 0))
+  if #text <= max_bytes then return text end
+  if max_bytes == 0 then return "" end
+  marker = marker or "\n… [truncated]"
+  if #marker >= max_bytes then return M.utf8_safe_sub(text, max_bytes) end
+  return M.utf8_safe_sub(text, max_bytes - #marker) .. marker
+end
+
 local uv = vim.uv or vim.loop
 
 function M.buf_valid(buf)

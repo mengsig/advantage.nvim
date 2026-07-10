@@ -64,12 +64,16 @@ With lazy.nvim: >lua
                         Force conversation compaction. Defaults to
                         `context.compact_mode`; "llm" spends one call on
                         `context.summarizer_model` for a real summary,
-                        "heuristic" stays free/offline.
+                        "heuristic" stays free/offline. Messages submitted
+                        meanwhile queue and send after compaction completes.
 :Advantage context      Show/manage per-repo memory (see |advantage-memory|).
 :Advantage review       Review the agent's file changes (diff).
 :Advantage yolo [on|off]
                         Toggle skip-all-permissions mode.
-:Advantage effort       Tune reasoning effort / thinking.
+:Advantage effort [mode]
+                        Tune reasoning effort / thinking.
+:Advantage harness [mode]
+                        Tune harness orchestration mode.
 :Advantage help         Keybinding & command cheatsheet.
 :Advantage add          Send the current file / selection to the prompt
                         (with a range, e.g. `:'<,'>Advantage add`, sends
@@ -100,6 +104,7 @@ Defaults (configurable under `keymaps`):
   <leader>cd   review file changes (diff)
   <leader>cy   toggle yolo mode
   <leader>ce   tune reasoning effort
+  <leader>ch   tune harness mode
   <leader>c?   keybinding cheatsheet
 
 In the prompt: <CR> sends; `@` completes project files; `/` runs a slash
@@ -121,7 +126,7 @@ Full defaults live in `lua/advantage/config.lua`. Key options: >lua
         { ref = "openai/gpt-5.6-sol", label = "gpt-5.6 sol",
           context_window = 372000, api_context_window = 1050000,
           max_output_tokens = 128000,
-          reasoning_efforts = { "low", "medium", "high", "xhigh", "max", "ultra" },
+          reasoning_efforts = { "low", "medium", "high", "xhigh", "max" },
           api_reasoning_efforts = { "none", "low", "medium", "high", "xhigh", "max" } },
       },
       providers = {
@@ -129,9 +134,15 @@ Full defaults live in `lua/advantage/config.lua`. Key options: >lua
         openai = {
           auth_mode = "auto",         -- "auto" | "chatgpt" | "api_key"
           max_output_tokens = 64000, -- raw API request cap
-          reasoning_effort = "ultra", -- inherited, clamped per model/transport
+          reasoning_effort = "max", -- deepest single-agent wire effort
           reasoning_summary = "auto", -- "auto" | "concise" | "detailed" | false
+          stream_error_retries = 2,
+          stream_error_retry_base_ms = 2000,
         },
+      },
+      harness = {
+        mode = "auto",            -- auto/low/medium/high/xhigh/max/ultra
+        sync_effort = true,        -- presets initialize matching effort
       },
       ui = { width = 0.42, input_height = 4, border = "rounded" },
       tools = {
@@ -160,14 +171,20 @@ Full defaults live in `lua/advantage/config.lua`. Key options: >lua
       },
       subagents = {
         enabled = true,
-        max_turns = 12,
-        max_per_turn = 12,       -- cumulative scouts in one parent turn
+        model_aliases = {
+          sol = "openai/gpt-5.6-sol", terra = "openai/gpt-5.6-terra",
+          luna = "openai/gpt-5.6-luna", opus = "anthropic/claude-opus-4-8",
+          sonnet = "anthropic/claude-sonnet-5", haiku = "anthropic/claude-haiku-4-5",
+        },
+        allow_cross_provider = false, -- stay in the active parent's provider family
+        max_turns = 6,
+        max_turns_cap = 12,      -- user ceiling for model-requested budgets
         max_output_tokens = 16000, -- scout Anthropic/raw-API output ceiling
-        effort = "medium",        -- per call may override or use "inherit"
+        effort = "medium",        -- preference; every call names its effort
         parallel = true,          -- supports fan-out; sequential calls remain valid
-        max_parallel = 4,         -- excess scouts queue
-        max_per_batch = 8,
+        max_parallel = 4,         -- safe default; deep modes support explicit width 8
         max_result_bytes = 64000,
+        tool_timeout_ms = 45000,  -- watchdog for each scout read-only tool
       },
       memory = { enabled = true, budget_tokens = 2000, skill_body_budget_tokens = 8000,
                  skills_index_budget_tokens = 1200 },
@@ -187,13 +204,30 @@ the active model and OpenAI transport:
   and uses an explicit disabled state for `off`; Fable 5 cannot be disabled.
 - Haiku 4.5 and older manual-thinking models use fixed budgets from 1k through
   32k. Thinking and visible output share `providers.anthropic.max_tokens`.
-- OpenAI uses `reasoning.effort`. GPT-5.6 Sol/Terra login profiles support
-  `low` through `ultra`, Luna through `max`; raw API profiles use their separate
+- OpenAI uses literal `reasoning.effort` values through `max`. Ultra is a
+  separate harness mode, not a wire-level effort. Raw API profiles use their separate
   `api_reasoning_efforts`. `off` means explicit `none` and is only available
-  where supported. Omitting reasoning selects the provider default, so it is
-  not treated as off. The default provider effort is `ultra`; when inherited it
-  clamps downward to the deepest supported level (Luna `max`, GPT-5.5 `xhigh`,
-  raw-API Sol `max`). Explicit unsupported model overrides remain errors.
+  where supported. Inherited values clamp to the deepest supported wire level;
+  explicit unsupported model overrides remain errors.
+
+HARNESS MODES                                         *advantage-harness-modes*
+
+`:Advantage harness [mode]`, `/harness [mode]`, and `<leader>ch` control how
+the parent agent orchestrates work. Selecting a preset initializes matching
+model effort; `/effort` may then override reasoning independently. `auto`
+derives the policy from the current effort.
+
+  low      direct parent work; sequential scouts
+  medium   selective delegation with modest concurrency
+  high     proactive splitting of clearly independent investigations
+  xhigh    deep parent reasoning with selective, task-sized fan-out
+  max      maximum parent depth; deliberate delegation
+  ultra    Max reasoning; proactive parallelism when work divides cleanly
+
+`subagents.parallel = false` is a hard global override and keeps every mode
+sequential. `max_parallel` controls scheduling width, never how many scouts may
+run. XHigh/Max/Ultra permit an explicitly configured width up to eight while the
+safe default remains four.
 
 OPENAI TRANSPORT                                    *advantage-openai-transport*
 
@@ -204,32 +238,70 @@ models budget 372k context tokens for login and 1.05M for the raw API (GPT-5.5:
 272k login / 1.05M API). GPT-5.6/5.5 login requests reserve their native 128k
 output maximum for context safety; raw API requests send and reserve the
 configured 64k cap. OpenAI requests
-reuse a stable per-chat prompt-cache key and, on ChatGPT login, a stable session
-id across tool-loop turns.
+route identical system/tool prefixes through a stable content-derived
+prompt-cache key across chats. On ChatGPT login, each chat separately keeps a
+unique stable session id across tool-loop turns. Scout prefixes use four
+round-robin cache buckets so concurrent fan-out retains reuse without one hot
+route.
 
 `providers.openai.reasoning_summary = "auto"` streams a provider-selected
 reasoning summary into the thinking UI. `"concise"` and `"detailed"` request a
 specific depth. Set it to false to omit summaries; scouts and compaction
 summarizers disable them automatically.
 
+Pre-payload OpenAI overload and truncated-stream events retry the exact request
+with bounded backoff and a visible notice. Once text, thinking, or a tool call
+has streamed, no retry is allowed, preventing duplicated work. Authentication,
+model, and deterministic request errors remain non-retryable.
+
 SUB-AGENT EXECUTION                                  *advantage-subagents*
 
 Sub-agents are read-only scouts. The model may delegate one task and wait, or
 emit a same-turn batch. With `subagents.parallel = true`, batch members run
 concurrently; this advertises parallel support but never forces the model to use
-it. Set it false for sequential execution. Fan-out is bounded by
-`max_parallel`, `max_per_batch`, the cumulative `max_per_turn`, and the shared
-`max_result_bytes` result budget. `max_output_tokens` caps scout requests on
+it. Scouts cannot run shell commands, create fixtures, or execute a CLI; runtime
+testing remains parent work. Set it false for sequential execution. There is no per-batch or cumulative
+spawn quota: every valid scout the parent requests runs. `max_parallel` is only
+the concurrency width; excess scouts wait in a local queue. Independent scouts
+within a mixed tool response run as one concurrent contiguous group while result
+ordering remains unchanged. The default policy uses one task-sized investigation
+wave, then returns to parent synthesis and implementation. Later waves remain
+available for a concrete new blocker; generic surveys and post-implementation
+review waves are discouraged, not rejected. Sequential batches only serialize
+self-contained prompts; data-dependent scouts belong in separate parent turns.
+Results share the
+`max_result_bytes` context budget. `max_output_tokens` caps scout requests on
 Anthropic/raw-API transports. ChatGPT-login scouts retain the model's native
-output reserve and are bounded by the turn, delegation, result, and report caps.
-Scouts default to `subagents.effort` (`"medium"`); each call can override it or
-use `"inherit"` to retain the parent level.
+output reserve and are bounded by the individual turn, result, and report caps.
+Scouts are steered under roughly 900 words and each returned report is hard-capped
+at 6,000 bytes. The ordinary budget is six provider requests, including the
+final report-only request, with a configurable hard ceiling of twelve for one
+deep blocker. A request-four sufficiency checkpoint asks a scout to report early
+when its evidence is already decisive. Child rows show the provider, route,
+effort, and live request n/N progress. Reports separate root cause/evidence, a minimal compatible touch set,
+contracts to preserve, focused regression cases, and optional hardening. Parent
+phase guidance treats reports as evidence, protects previously passing test
+contracts, requires hermetic new tests, and allows one batched source-confirmation
+pass before explicitly steering the parent to implement. It tracks successful verification per
+edit generation. A later edit re-arms one bounded final diff audit; repeating a
+test without edits does not repeat the reminder.
+Every call explicitly names a stable short alias and effort level. By default,
+Codex/OpenAI parents expose only sol/terra/luna and Claude/Anthropic parents
+expose only opus/sonnet/haiku. Set `subagents.allow_cross_provider = true` for a
+deliberate mixed-provider wave. `subagents.model_aliases` maps
+those choices to current configured provider IDs, keeping fragile version
+strings out of model output. Blank/raw first-party IDs are rejected locally.
+Provider-auth and unsupported-model failures temporarily remove affected aliases
+from later schemas so the parent cannot retry sibling IDs blindly.
+`subagents.model` and `subagents.effort` are preferences shown to the parent, not runtime defaults.
+The parent may explicitly choose `"inherit"` when intentional.
 
 ==============================================================================
 7. TOOLS & SECURITY                                          *advantage-tools*
 
 Tools: `read_file`, `edit_file`, `write_file`, `multi_edit`, `bash`, `grep`,
-`find_files`, `list_dir`, `diagnostics`, `sub_agent`, `web_search`, plus memory tools.
+`find_files`, `list_dir`, `diagnostics`, `sub_agent`, `sub_agent_batch`,
+`web_search`, `web_fetch`, plus memory tools.
 
 File tools are confined to the project root: absolute paths, `..` traversal,
 and symlinks that resolve outside the repo are rejected (set
@@ -246,11 +318,15 @@ won't miss it if you stepped away. Configure via `tools.diagnostics` (`enabled`,
 `wait_ms`, `attach_grace_ms`, `notify_missing`); the model also has an explicit
 `diagnostics` tool.
 
-`web_search` hits the Brave Search API (one GET request, no page-scraping) and
-returns compact title/url/snippet results. It needs an API key — `$BRAVE_API_KEY`
-or `tools.web_search.api_key` — and is entirely hidden from the schema without
-one, so the model never calls a search tool that can't work. It's `safe` (no
-approval prompt) and available to read-only sub-agents.
+`web_search` uses the Brave Search API when keyed and a best-effort public
+Brave/Bing HTML fallback otherwise. `web_fetch` independently retrieves a known
+public HTTP(S) page for verification. Fetch is GET-only and DNS-pinned, checks
+every redirect, rejects private/metadata hosts, credentials, non-default ports,
+binary/oversized responses and HTTPS downgrades, and caps time and returned
+lines. Search snippets and fetched pages are wrapped as untrusted web data;
+instructions inside a page never become agent instructions. Both tools are safe
+(no approval prompt) and available to read-only sub-agents; only stable Brave
+API search requires `$BRAVE_API_KEY` or `tools.web_search.api_key`.
 
 ==============================================================================
 8. MEMORY & SKILLS                                          *advantage-memory*

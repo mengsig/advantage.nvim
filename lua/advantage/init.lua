@@ -4,6 +4,7 @@
 local M = {}
 
 local config = require("advantage.config")
+local harness = require("advantage.harness")
 
 local initialized = false
 local agent_mod, ui, current
@@ -11,6 +12,10 @@ local agent_mod, ui, current
 local function sync_model_ui(model)
   ui.set_model_label(model.label)
   ui.set_effort_label(require("advantage.effort").describe(model))
+end
+
+local function sync_harness_ui(agent)
+  ui.set_harness_label(harness.describe(agent.harness_mode, agent.model))
 end
 
 local function ensure_init()
@@ -30,7 +35,11 @@ local function ensure_agent()
   if not current then
     local model = assert(config.resolve_model(config.options.default_model), "unknown default_model")
     current = agent_mod.new({ model = model })
+    if current.harness_mode ~= "auto" and (config.options.harness or {}).sync_effort ~= false then
+      harness.sync_effort(model, current.harness_mode)
+    end
     sync_model_ui(model)
+    sync_harness_ui(current)
   end
   return current
 end
@@ -69,6 +78,7 @@ function M.setup(opts)
   map("n", maps.review, M.review, "review agent changes")
   map("n", maps.yolo, M.toggle_yolo, "toggle yolo mode")
   map("n", maps.effort, M.pick_effort, "tune model effort")
+  map("n", maps.harness, M.pick_harness, "tune harness mode")
   map("n", maps.help, M.help, "help")
   map("x", maps.add_selection, function()
     M.add_selection()
@@ -111,9 +121,11 @@ function M.new_session()
   if current and current:busy() then current:cancel() end
   local model = current and current.model
     or assert(config.resolve_model(config.options.default_model), "unknown default_model")
-  current = agent_mod.new({ model = model })
+  local harness_mode = current and current.harness_mode
+  current = agent_mod.new({ model = model, harness_mode = harness_mode })
   ui.clear()
   sync_model_ui(model)
+  sync_harness_ui(current)
   ui.open()
 end
 
@@ -141,6 +153,9 @@ function M.pick_model()
       end
       current.model = model
       current.ctx.model = model
+      if current.harness_mode ~= "auto" and (config.options.harness or {}).sync_effort ~= false then
+        harness.sync_effort(model, current.harness_mode)
+      end
       if model_changed then
         -- Threshold hysteresis and static-prefix estimates are model/transport
         -- specific. Reusing them after a switch can suppress a mandatory compact
@@ -151,8 +166,13 @@ function M.pick_model()
     else
       ensure_agent()
       current.model = model
+      current.ctx.model = model
+      if current.harness_mode ~= "auto" and (config.options.harness or {}).sync_effort ~= false then
+        harness.sync_effort(model, current.harness_mode)
+      end
     end
     sync_model_ui(model)
+    sync_harness_ui(current)
     ui.notify("model → " .. model.label .. (detached > 0 and " · private reasoning replay reset" or ""))
   end)
 end
@@ -185,10 +205,12 @@ function M.resume()
       messages = data.messages,
       usage = data.usage,
       cwd = data.cwd or cwd,
+      harness_mode = data.harness_mode,
     })
     ui.open(false)
     ui.render_transcript(data.messages, model.label)
     ui.set_effort_label(require("advantage.effort").describe(model))
+    sync_harness_ui(current)
     ui.set_usage(current.usage)
     ui.open()
     if prefill and prefill ~= "" then ui.set_prompt(prefill) end
@@ -415,6 +437,12 @@ end
 
 local effort = require("advantage.effort")
 
+local function autosave_agent_settings(agent)
+  if not config.options.sessions.autosave then return end
+  local ok, err = require("advantage.session").save(agent)
+  if not ok then ui.notify("could not autosave session settings: " .. tostring(err), vim.log.levels.WARN) end
+end
+
 ---Set reasoning/thinking effort directly.
 ---Values are validated against the selected model's declared capabilities.
 function M.set_effort(mode)
@@ -437,7 +465,10 @@ function M.set_effort(mode)
       return false
     end
     ui.notify("effort → " .. label)
+    agent:refresh_prompt_policy()
     ui.set_effort_label(effort.describe(agent.model))
+    sync_harness_ui(agent)
+    autosave_agent_settings(agent)
     return true
   end
 
@@ -448,12 +479,69 @@ function M.set_effort(mode)
       return false
     end
     ui.notify("thinking/effort → " .. label)
+    agent:refresh_prompt_policy()
     ui.set_effort_label(effort.describe(agent.model))
+    sync_harness_ui(agent)
+    autosave_agent_settings(agent)
     return true
   end
 
   ui.notify("effort controls are not available for " .. tostring(agent.model.provider), vim.log.levels.WARN)
   return false
+end
+
+---Set the session's orchestration policy. Selecting an explicit preset
+---initializes matching model effort; later `/effort` changes remain independent.
+function M.set_harness(mode)
+  local agent = ensure_agent()
+  if agent:busy() then
+    ui.notify("finish or cancel the running turn before changing harness mode", vim.log.levels.WARN)
+    return false
+  end
+  mode = vim.trim(tostring(mode or "")):lower()
+  if mode == "" then
+    M.pick_harness()
+    return true
+  end
+  if not harness.valid(mode) then
+    ui.notify(
+      "unknown harness mode: " .. mode .. " (expected auto/low/medium/high/xhigh/max/ultra)",
+      vim.log.levels.WARN
+    )
+    return false
+  end
+
+  local effort_label, effort_err
+  if mode ~= "auto" and (config.options.harness or {}).sync_effort ~= false then
+    effort_label, effort_err = harness.sync_effort(agent.model, mode)
+  end
+  agent.harness_mode = mode
+  agent:refresh_prompt_policy()
+  ui.set_effort_label(effort.describe(agent.model))
+  sync_harness_ui(agent)
+  local effective = harness.policy(mode, agent.model).mode
+  local suffix = effort_label and (" · effort → " .. effort_label) or ""
+  if effort_err then suffix = suffix .. " · " .. effort_err end
+  ui.notify("harness → " .. effective .. suffix, effort_err and vim.log.levels.WARN or nil)
+  autosave_agent_settings(agent)
+  return true
+end
+
+function M.pick_harness()
+  local agent = ensure_agent()
+  if agent:busy() then
+    ui.notify("finish or cancel the running turn before changing harness mode", vim.log.levels.WARN)
+    return
+  end
+  require("advantage.ui.picker").select(harness.items(), {
+    prompt = "advantage · harness mode",
+    format_item = function(item)
+      local active = agent.harness_mode == item.value
+      return ("%s %-24s %s"):format(active and "●" or " ", item.label, item.description)
+    end,
+  }, function(choice)
+    if choice then M.set_harness(choice.value) end
+  end)
 end
 
 ---Tune reasoning effort / thinking for the current model.
@@ -735,6 +823,12 @@ function M._command(opts)
     else
       M.pick_effort()
     end
+  elseif sub == "harness" or sub == "mode" then
+    if args[2] then
+      M.set_harness(args[2])
+    else
+      M.pick_harness()
+    end
   elseif sub == "add" then
     cmd_add(opts)
   elseif sub == "files" then
@@ -761,6 +855,8 @@ M._subcommands = {
   "review",
   "yolo",
   "effort",
+  "harness",
+  "mode",
   "add",
   "files",
   "attach",
@@ -772,6 +868,7 @@ M._subcommands = {
 M._effort_modes = {
   "default",
   "off",
+  "none",
   "minimal",
   "low",
   "medium",
@@ -790,7 +887,10 @@ M._effort_modes = {
   "think-hard",
   "think-harder",
   "ultrathink",
+  "xhigh",
 }
+
+M._harness_modes = { "auto", "low", "medium", "high", "xhigh", "max", "ultra" }
 
 function M._complete(arglead, cmdline)
   local body = cmdline:match("^%S+%s*(.*)$") or ""
@@ -799,6 +899,8 @@ function M._complete(arglead, cmdline)
   if #args > 1 or (#args == 1 and body:match("%s$")) then
     if args[1] == "effort" then
       pool = M._effort_modes
+    elseif args[1] == "harness" or args[1] == "mode" then
+      pool = M._harness_modes
     elseif args[1] == "yolo" then
       pool = { "on", "off" }
     elseif args[1] == "context" or args[1] == "memory" then
