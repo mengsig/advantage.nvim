@@ -3580,11 +3580,21 @@ do
     end,
   })
 
+  local chat = require("advantage.ui.chat")
+  local original_tool_update = chat.tool_update
+  local direct_progress_detail = nil
+  chat.tool_update = function(id, patch)
+    if id == "s1" and patch and tostring(patch.detail):find("request 1/6", 1, true) then
+      direct_progress_detail = patch.detail
+    end
+    return original_tool_update(id, patch)
+  end
   local ag = agent_mod.new({ model = { provider = "fakepar", id = "m", label = "par" } })
   ag:send("fan out")
   vim.wait(6000, function()
     return pturn >= 2 and final_results ~= nil
   end, 10)
+  chat.tool_update = original_tool_update
 
   check(sub_started == fanout_size, "every requested sub-agent runs without batch or cumulative rejection")
   check(requested_parallel == true, "main-agent provider request permits parallel tool calls")
@@ -3603,6 +3613,10 @@ do
     all_ids = all_ids and ids["s" .. i]
   end
   check(all_ids, "each queued sub_agent call got its matching tool_result")
+  check(
+    direct_progress_detail and direct_progress_detail:find("Fakesubpar · fakesubpar/m/medium · request 1/6", 1, true),
+    "direct same-response scout rows show provider, route/effort, and live request progress"
+  )
 
   -- Exact initialization policy: a model may include `model = ""` on every
   -- scout. Reject all four before provider startup so the parent must make an

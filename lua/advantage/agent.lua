@@ -507,6 +507,29 @@ local function tool_detail(tool, input)
   return ok and detail or "invalid tool input"
 end
 
+local function scout_detail(input, progress)
+  local ok, subagent = pcall(require, "advantage.subagent")
+  if not ok or type(subagent.ui_detail) ~= "function" then return nil end
+  local rendered, detail = pcall(subagent.ui_detail, input, progress)
+  return rendered and detail or nil
+end
+
+---Give a direct scout call its own progress sink. The base context is shared by
+---all tools, so mutating it would make concurrent scouts overwrite each other's
+---row callbacks; a shallow per-call copy keeps progress isolated.
+local function tool_runtime_ctx(base_ctx, call, ui)
+  if not (call and call.name == "sub_agent") then return base_ctx end
+  return vim.tbl_extend("force", {}, base_ctx, {
+    subagent_progress = function(progress)
+      ui.tool_update(call.id, {
+        name = "sub_agent",
+        detail = scout_detail(call.input, progress),
+        status = "running",
+      })
+    end,
+  })
+end
+
 local function concise_tool_error(output)
   local text = tostring(output or "tool failed"):gsub("[%c%s]+", " ")
   local provider_detail = text:match('detail%s*=%s*"([^"]+)"') or text:match('"detail"%s*:%s*"([^"]+)"')
@@ -1199,11 +1222,11 @@ function Agent:_parallel_launch(st, idx, call)
   assert(type(st) == "table" and type(idx) == "number", "_parallel_launch: state and index required")
   local ui = st.ui
   local tool = tools.get(call.name)
-  local detail = tool_detail(tool, call.input)
+  local detail = call.name == "sub_agent" and scout_detail(call.input) or tool_detail(tool, call.input)
   ui.tool_update(call.id, { name = call.name, detail = detail, status = "running" })
   ui.set_status("tool", call.name)
 
-  local function settle(output, is_error)
+  local function settle(output, is_error, meta)
     if self.cancelled or self.epoch ~= st.epoch then return end
     output = tostring(output or "")
     output =
@@ -1211,6 +1234,7 @@ function Agent:_parallel_launch(st, idx, call)
     st.results[idx] = { type = "tool_result", tool_use_id = call.id, content = output, is_error = is_error or nil }
     ui.tool_update(call.id, {
       status = is_error and "error" or "ok",
+      detail = call.name == "sub_agent" and scout_detail(call.input, meta) or detail,
       error = is_error and concise_tool_error(output) or nil,
     })
     st.pending = st.pending - 1
@@ -1234,7 +1258,7 @@ function Agent:_parallel_launch(st, idx, call)
   local ok, handle = pcall(
     tool.run,
     call.input,
-    self.ctx,
+    tool_runtime_ctx(self.ctx, call, ui),
     vim.schedule_wrap(function(output, is_error, meta)
       if self.cancelled or self.epoch ~= st.epoch then return end
       if meta and meta.stream then
@@ -1244,7 +1268,7 @@ function Agent:_parallel_launch(st, idx, call)
       if done then return end
       done = true
       self.active_tools[call.id] = nil
-      settle(output, is_error)
+      settle(output, is_error, meta)
     end)
   )
   if ok and type(handle) == "table" and (handle.stop or handle.kill) then
@@ -1346,13 +1370,14 @@ function Agent:_tools_execute(st, call, tool)
   assert(type(tool) == "table" and type(tool.run) == "function", "_tools_execute: runnable tool required")
   local ui = st.ui
   ui.set_status("tool", call.name)
-  ui.tool_update(call.id, { status = "running" })
+  local detail = call.name == "sub_agent" and scout_detail(call.input) or nil
+  ui.tool_update(call.id, { status = "running", detail = detail })
   local touched = self:_snapshot(call)
   local settled = false
   local ok, handle_or_err = pcall(
     tool.run,
     call.input,
-    self.ctx,
+    tool_runtime_ctx(self.ctx, call, ui),
     vim.schedule_wrap(function(output, is_error, meta)
       if self.cancelled or self.epoch ~= st.epoch then return end
       if meta and meta.stream then
@@ -1366,6 +1391,7 @@ function Agent:_tools_execute(st, call, tool)
       self:_tools_record(st, call, output, is_error)
       ui.tool_update(call.id, {
         status = is_error and "error" or "ok",
+        detail = call.name == "sub_agent" and scout_detail(call.input, meta) or detail,
         error = is_error and concise_tool_error(output) or nil,
       })
       if touched and not is_error then self.turn_changed[touched] = true end

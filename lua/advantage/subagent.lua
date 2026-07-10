@@ -522,6 +522,37 @@ function M.preflight(input, ctx)
   return err or "sub_agent has no model"
 end
 
+local function effective_turn_budget(input)
+  local cfg = config.options.subagents or {}
+  local default = math.max(2, tonumber(cfg.max_turns) or 6)
+  local cap = math.max(2, math.min(tonumber(cfg.max_turns_cap) or 12, 30))
+  return math.max(2, math.min(tonumber((input or {}).max_turns or default) or default, cap))
+end
+
+---Stable detail used by both direct scout rows and explicit-batch child rows.
+---@param input table
+---@param progress? table
+---@return string
+function M.ui_detail(input, progress)
+  input = type(input) == "table" and input or {}
+  local progress_turn = progress and (progress.turn or progress.turns)
+  local request = progress_turn and ("request %d/%d"):format(progress_turn, progress.max_turns)
+    or ("≤%d requests"):format(effective_turn_budget(input))
+  local provider_name = nil
+  for _, item in ipairs(configured_aliases()) do
+    if item.alias == input.model then provider_name = item.ref:match("^([^/]+)/") end
+  end
+  provider_name = provider_name or tostring(input.model):match("^([^/]+)/") or "provider"
+  provider_name = provider_name:sub(1, 1):upper() .. provider_name:sub(2)
+  return ("%s · %s/%s · %s · %s"):format(
+    provider_name,
+    tostring(input.model),
+    tostring(input.effort),
+    request,
+    util.utf8_safe_sub(input.prompt or "", 80)
+  )
+end
+
 ---Deliver the scout's final report to the parent: capped and usage-annotated.
 local function finish_report(s, text, is_error)
   assert(type(s) == "table" and type(s.cb) == "function", "finish_report: session with cb required")
@@ -915,10 +946,7 @@ function M.run(input, ctx, cb)
   -- Floor at 2, not 1: the final turn is report-only (tools withheld), so a budget
   -- of 1 would leave the scout zero turns to actually investigate — it would report
   -- having read nothing. 2 guarantees at least one investigation turn plus the report.
-  local configured_default = math.max(2, tonumber(cfg.max_turns) or 6)
-  local configured_cap = math.max(2, math.min(tonumber(cfg.max_turns_cap) or 12, 30))
-  local max_turns =
-    math.max(2, math.min(tonumber(input.max_turns or configured_default) or configured_default, configured_cap))
+  local max_turns = effective_turn_budget(input)
   local cache_bucket = route_registry.cache_bucket_counter % 4
   route_registry.cache_bucket_counter = (route_registry.cache_bucket_counter + 1) % 4
   local digest = vim.fn.sha256(
@@ -1007,36 +1035,13 @@ function M.run_batch(input, ctx, cb)
   local ui = agent and type(agent.ui) == "function" and agent:ui() or nil
   local batch_id = "subagent-batch:" .. vim.fn.sha256(tostring((vim.uv or vim.loop).hrtime())):sub(1, 12)
   local child_ids = {}
-  local function turn_budget(task)
-    local default = math.max(2, tonumber(cfg.max_turns) or 6)
-    local cap = math.max(2, math.min(tonumber(cfg.max_turns_cap) or 12, 30))
-    return math.max(2, math.min(tonumber(task.max_turns or default) or default, cap))
-  end
-  local function task_detail(task, progress)
-    local progress_turn = progress and (progress.turn or progress.turns)
-    local request = progress_turn and ("request %d/%d"):format(progress_turn, progress.max_turns)
-      or ("≤%d requests"):format(turn_budget(task))
-    local provider_name = nil
-    for _, item in ipairs(configured_aliases()) do
-      if item.alias == task.model then provider_name = item.ref:match("^([^/]+)/") end
-    end
-    provider_name = provider_name or tostring(task.model):match("^([^/]+)/") or "provider"
-    provider_name = provider_name:sub(1, 1):upper() .. provider_name:sub(2)
-    return ("%s · %s/%s · %s · %s"):format(
-      provider_name,
-      tostring(task.model),
-      tostring(task.effort),
-      request,
-      util.utf8_safe_sub(task.prompt or "", 80)
-    )
-  end
   if ui then
     for index, task in ipairs(tasks) do
       child_ids[index] = batch_id .. ":" .. tostring(index)
       pcall(ui.tool_begin, child_ids[index], "sub_agent")
       pcall(ui.tool_update, child_ids[index], {
         name = "sub_agent",
-        detail = task_detail(task),
+        detail = M.ui_detail(task),
         status = "pending",
       })
     end
@@ -1062,7 +1067,7 @@ function M.run_batch(input, ctx, cb)
     if ui then
       pcall(ui.tool_update, child_ids[index], {
         status = is_error and "error" or "ok",
-        detail = task_detail(tasks[index], meta),
+        detail = M.ui_detail(tasks[index], meta),
         error = is_error and util.utf8_safe_sub(tostring(output or "scout failed"), 240) or nil,
       })
     end
@@ -1081,7 +1086,7 @@ function M.run_batch(input, ctx, cb)
       if ui then
         pcall(ui.tool_update, child_ids[index], {
           name = "sub_agent",
-          detail = task_detail(task),
+          detail = M.ui_detail(task),
           status = "running",
         })
       end
@@ -1090,7 +1095,7 @@ function M.run_batch(input, ctx, cb)
           if ui and not stopped and not finished then
             pcall(ui.tool_update, child_ids[index], {
               name = "sub_agent",
-              detail = task_detail(task, progress),
+              detail = M.ui_detail(task, progress),
               status = "running",
             })
           end
