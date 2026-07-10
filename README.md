@@ -7,8 +7,8 @@ feeds on the fallout, and keeps swinging until the task is dead.
 - **Runs on your subscription.** Uses your **Claude Code login** (Pro/Max) or your
   **Codex / ChatGPT login** — no API key needed. Env API keys work as a fallback.
 - **Model agnostic.** Anthropic (Opus 4.8, Sonnet 5, Fable 5, Haiku 4.5) and
-  OpenAI GPT/Codex (gpt-5.5 and gpt-5.1-codex family) out of the box; the
-  provider interface is ~100 lines if you want to add more.
+  OpenAI GPT/Codex (GPT-5.6 Sol, Terra, Luna, gpt-5.5, and the gpt-5.1-codex
+  family) out of the box; the provider interface is ~100 lines if you want to add more.
 - **Editor-native tools.** `read_file`, `edit_file`, `write_file`, `bash`, `grep`,
   `find_files`, `list_dir`, `diagnostics`, `sub_agent`, `web_search` — executed
   inside Neovim, so edited buffers reload live, edits get an **LSP/linter feedback
@@ -183,7 +183,7 @@ runs in one of two modes:
   dense, structured summary — primary intent, files touched, decisions, pending
   work — from the *untruncated* older transcript. By default the summarizer is a
   cheap model **in your active model's provider family** (Haiku for Claude,
-  codex-mini for OpenAI/Codex), so a Codex-only user never triggers a Claude
+  GPT-5.6 Luna for OpenAI/Codex), so a Codex-only user never triggers a Claude
   request they have no credentials for; pin one with `context.summarizer_model`.
   The **original task prompt is preserved verbatim** through every compaction
   (both modes), so long sessions never drift off what you asked for. If the
@@ -456,6 +456,9 @@ require("advantage").setup({
     { ref = "anthropic/claude-sonnet-5", label = "sonnet 5", context_window = 1000000 },
     { ref = "anthropic/claude-fable-5", label = "fable 5", context_window = 200000 },
     { ref = "anthropic/claude-haiku-4-5", label = "haiku 4.5", thinking = false, context_window = 200000 },
+    { ref = "openai/gpt-5.6-sol", label = "gpt-5.6 sol", context_window = 1050000 },
+    { ref = "openai/gpt-5.6-terra", label = "gpt-5.6 terra", context_window = 1050000 },
+    { ref = "openai/gpt-5.6-luna", label = "gpt-5.6 luna", context_window = 1050000 },
     { ref = "openai/gpt-5.5", label = "gpt-5.5", context_window = 1000000 },
     { ref = "openai/gpt-5.1-codex", label = "codex 5.1", context_window = 400000 },
     { ref = "openai/gpt-5.1-codex-mini", label = "codex mini", context_window = 400000 },
@@ -518,14 +521,15 @@ require("advantage").setup({
                                  -- to /compact). Set "provider/model-id" to pin one.
     summarizer_models = {        -- the per-provider cheap summarizer picked when nil
       anthropic = "anthropic/claude-haiku-4-5",
-      openai = "openai/gpt-5.1-codex-mini",
+      openai = "openai/gpt-5.6-luna",
     },
   },
   subagents = {
     enabled = true,              -- exposes the read-only `sub_agent` tool
     model = nil,                 -- nil = parent's model; set a fast model
                                  -- (e.g. "anthropic/claude-haiku-4-5") for cheaper fan-out
-    max_turns = 6,
+    max_turns = 12,              -- per-sub-agent turn budget (last turn is report-only,
+                                 -- so a scout always returns findings, not an empty error)
     parallel = true,             -- run a fan-out batch of sub_agents concurrently
     bash = false,                -- give sub-agents a read-only bash (see below); or
                                  -- { allow = { "cmd", ... } } to extend the allow-list

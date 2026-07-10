@@ -131,9 +131,13 @@ Full defaults live in `lua/advantage/config.lua`. Key options: >lua
         keep_recent_fraction = 0.4, -- recent window kept, as a % of the threshold
         auto_compact_mode = "heuristic", -- silent auto-compact: "heuristic" | "llm"
         compact_mode = "llm",    -- manual /compact: "llm" | "heuristic"
-        summarizer_model = "anthropic/claude-haiku-4-5",
+        summarizer_model = nil,    -- auto: Haiku for Claude, Luna for OpenAI/Codex
+        summarizer_models = {
+          anthropic = "anthropic/claude-haiku-4-5",
+          openai = "openai/gpt-5.6-luna",
+        },
       },
-      subagents = { enabled = true, max_turns = 6, parallel = true },
+      subagents = { enabled = true, max_turns = 12, parallel = true },
       memory = { enabled = true, budget_tokens = 2000, skills_index_budget_tokens = 1200 },
       sessions = { autosave = true },
     })

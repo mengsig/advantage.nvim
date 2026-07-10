@@ -1240,6 +1240,163 @@ do
   check(err == false and assert(result):find("subagent evidence", 1, true), "sub-agent returns final report")
 end
 
+-- 4b-limit. sub-agent turn-limit guarantees a real report ----------------------
+-- Regression: a scout that spends every turn calling tools (a reasoning model
+-- bug-hunting a subsystem emits thinking + tool_use and no assistant text until
+-- the end) used to hit the turn limit having produced no text, so the parent got
+-- "hit its N-turn limit" flagged as an error with zero findings. The final turn is
+-- now report-only — tools withheld via tool_choice "none" — so the budget always
+-- ends in a real report.
+do
+  local providers = require("advantage.providers")
+  local tools = require("advantage.tools")
+  local tmp = vim.fn.tempname()
+  vim.fn.mkdir(tmp, "p")
+  vim.fn.writefile({ "latent bug here" }, tmp .. "/note.txt")
+
+  local turns, final_choice, budget_in_prompt, final_had_tools = 0, nil, false, nil
+  providers.register("fakesublimit", {
+    stream = function(req)
+      turns = turns + 1
+      if req.system and req.system:find("budget of about 3 turns", 1, true) then budget_in_prompt = true end
+      vim.defer_fn(function()
+        if req.tool_choice == "none" then
+          -- final report-only turn: a compliant model writes its findings
+          final_choice = req.tool_choice
+          final_had_tools = type(req.tools) == "table" and #req.tools > 0
+          local txt = "FINAL REPORT: read note.txt (note.txt:1) — latent bug confirmed."
+          req.on.text(txt)
+          req.on.complete({ { type = "text", text = txt } }, "end_turn")
+        else
+          -- always call a tool, never volunteer text (models the failing case)
+          req.on.tool_start("r" .. turns, "read_file")
+          req.on.complete(
+            { { type = "tool_use", id = "r" .. turns, name = "read_file", input = { path = "note.txt" } } },
+            "tool_use"
+          )
+        end
+      end, 5)
+      return { stop = function() end }
+    end,
+  })
+
+  local done, result, err = false, nil, nil
+  tools.get("sub_agent").run({ prompt = "bug-hunt note.txt", model = "fakesublimit/model", max_turns = 3 }, {
+    cwd = tmp,
+    model = { provider = "fakesublimit", id = "model", label = "fake" },
+  }, function(out, is_err)
+    result, err, done = out, is_err, true
+  end)
+  vim.wait(5000, function()
+    return done
+  end, 10)
+
+  check(turns == 3, "sub-agent uses its full turn budget (2 investigation turns + 1 report)")
+  check(budget_in_prompt, "sub-agent system prompt tells the model its turn budget")
+  check(final_choice == "none", "the final turn withholds tools with tool_choice 'none'")
+  check(final_had_tools == true, "the final turn still DECLARES the tools (so prior tool_use blocks validate)")
+  check(err == false, "a turn-limit stop is NOT flagged as an error")
+  check(
+    result ~= nil and result:find("FINAL REPORT", 1, true) and result:find("note.txt:1", 1, true),
+    "the turn budget ends in a real report with findings, not an empty limit error"
+  )
+
+  -- Defensive: a NON-compliant model that keeps emitting tool_use even on the
+  -- report-only turn (ignoring tool_choice) must still finish gracefully — never
+  -- loop past the budget, never crash — falling back to a plain finished message.
+  local turns2 = 0
+  providers.register("fakesubdefiant", {
+    stream = function(req)
+      turns2 = turns2 + 1
+      vim.defer_fn(function()
+        req.on.tool_start("d" .. turns2, "read_file")
+        req.on.complete(
+          { { type = "tool_use", id = "d" .. turns2, name = "read_file", input = { path = "note.txt" } } },
+          "tool_use"
+        )
+      end, 5)
+      return { stop = function() end }
+    end,
+  })
+  local done2, result2, err2 = false, nil, nil
+  tools.get("sub_agent").run({ prompt = "x", model = "fakesubdefiant/model", max_turns = 3 }, {
+    cwd = tmp,
+    model = { provider = "fakesubdefiant", id = "model", label = "fake" },
+  }, function(out, is_err)
+    result2, err2, done2 = out, is_err, true
+  end)
+  vim.wait(5000, function()
+    return done2
+  end, 10)
+  check(turns2 == 3, "a defiant model still stops at the turn budget (no runaway loop)")
+  check(done2 and err2 == false and result2 ~= nil, "a defiant model still yields a (non-error) final result")
+
+  -- max_turns is floored at 2 so the report-only final turn never leaves the scout
+  -- with zero investigation turns (a budget of 1 would report having read nothing).
+  local turns3 = 0
+  providers.register("fakesubfloor", {
+    stream = function(req)
+      turns3 = turns3 + 1
+      vim.defer_fn(function()
+        if req.tool_choice == "none" then
+          req.on.complete({ { type = "text", text = "floor report" } }, "end_turn")
+        else
+          req.on.tool_start("f" .. turns3, "list_dir")
+          req.on.complete(
+            { { type = "tool_use", id = "f" .. turns3, name = "list_dir", input = { path = "." } } },
+            "tool_use"
+          )
+        end
+      end, 5)
+      return { stop = function() end }
+    end,
+  })
+  local done3 = false
+  tools.get("sub_agent").run({ prompt = "x", model = "fakesubfloor/model", max_turns = 1 }, {
+    cwd = tmp,
+    model = { provider = "fakesubfloor", id = "model", label = "fake" },
+  }, function()
+    done3 = true
+  end)
+  vim.wait(5000, function()
+    return done3
+  end, 10)
+  check(turns3 == 2, "max_turns=1 is floored to 2 (one investigation turn + one report turn)")
+end
+
+-- 4b-tc. providers forward tool_choice to the request body ---------------------
+do
+  local anthropic = require("advantage.providers.anthropic")
+  local openai = require("advantage.providers.openai")
+  local config = require("advantage.config")
+
+  local a_none = anthropic._build_body(
+    config.options.providers.anthropic,
+    { model = { id = "m", thinking = false }, system = "s", messages = {}, tools = {}, tool_choice = "none" },
+    { { type = "text", text = "s" } }
+  )
+  check(
+    type(a_none.tool_choice) == "table" and a_none.tool_choice.type == "none",
+    "anthropic maps tool_choice 'none' to { type = 'none' }"
+  )
+  local a_auto = anthropic._build_body(
+    config.options.providers.anthropic,
+    { model = { id = "m", thinking = false }, system = "s", messages = {}, tools = {} },
+    { { type = "text", text = "s" } }
+  )
+  check(a_auto.tool_choice == nil, "anthropic omits tool_choice when the request sets none")
+
+  local tool = { { name = "read_file", description = "d", input_schema = { type = "object" } } }
+  local o_none = openai._build_body(
+    config.options.providers.openai,
+    { model = { id = "m" }, messages = {}, tools = tool, tool_choice = "none" }
+  )
+  check(o_none.tool_choice == "none", "openai forwards tool_choice 'none' even with tools present")
+  local o_auto =
+    openai._build_body(config.options.providers.openai, { model = { id = "m" }, messages = {}, tools = tool })
+  check(o_auto.tool_choice == "auto", "openai defaults to 'auto' when tools exist and no tool_choice given")
+end
+
 -- 4b. sub-agent read-only bash validator ---------------------------------------
 
 section("sub-agent read-only bash")
@@ -1323,7 +1480,7 @@ do
   local compact = require("advantage.compact")
 
   config.options.context.keep_recent_messages = 4
-  config.options.context.summarizer_model = "openai/gpt-5.1-codex-mini"
+  config.options.context.summarizer_model = "openai/gpt-5.6-luna"
 
   local captured_body
   local orig_request_sse = util.request_sse
@@ -1373,8 +1530,8 @@ do
   check(done, "codex summarizer request completed")
   check(err == nil, "no error routing summarization through the openai/codex provider")
   check(
-    captured_body ~= nil and captured_body.model == "gpt-5.1-codex-mini",
-    "request targets the configured codex model"
+    captured_body ~= nil and captured_body.model == "gpt-5.6-luna",
+    "request targets the configured OpenAI/Codex summarizer model"
   )
   check(
     captured_body and captured_body.reasoning and captured_body.reasoning.effort == "minimal",
@@ -1394,21 +1551,19 @@ do
 
   -- Provider independence: with no explicit summarizer_model, an OpenAI/Codex
   -- active model must NOT reach for a Claude (anthropic) summarizer.
-  local auto = compact._resolve_summarizer(
-    { summarizer_models = { anthropic = "anthropic/claude-haiku-4-5", openai = "openai/gpt-5.1-codex-mini" } },
-    { provider = "openai", id = "gpt-5.1-codex", label = "codex" }
-  )
+  local auto =
+    compact._resolve_summarizer(config.defaults.context, { provider = "openai", id = "gpt-5.1-codex", label = "codex" })
   check(
-    auto and auto.provider == "openai",
-    "auto summarizer matches the active provider (openai -> openai, not claude)"
+    auto and auto.provider == "openai" and auto.id == "gpt-5.6-luna",
+    "auto summarizer uses GPT-5.6 Luna for an OpenAI/Codex model"
   )
   local auto_anthropic = compact._resolve_summarizer(
-    { summarizer_models = { anthropic = "anthropic/claude-haiku-4-5", openai = "openai/gpt-5.1-codex-mini" } },
+    config.defaults.context,
     { provider = "anthropic", id = "claude-opus-4-8", label = "opus" }
   )
   check(
-    auto_anthropic and auto_anthropic.provider == "anthropic",
-    "auto summarizer for an anthropic model stays anthropic"
+    auto_anthropic and auto_anthropic.provider == "anthropic" and auto_anthropic.id == "claude-haiku-4-5",
+    "auto summarizer uses Haiku for an Anthropic model"
   )
 end
 
@@ -2743,6 +2898,23 @@ do
   local config = require("advantage.config")
   local saved = vim.deepcopy(config.options)
 
+  local gpt56 = {}
+  for _, model in ipairs(config.defaults.models) do
+    if model.ref:match("^openai/gpt%-5%.6%-") then gpt56[model.ref] = model end
+  end
+  check(
+    gpt56["openai/gpt-5.6-sol"]
+      and gpt56["openai/gpt-5.6-sol"].label == "gpt-5.6 sol"
+      and gpt56["openai/gpt-5.6-sol"].context_window == 1050000
+      and gpt56["openai/gpt-5.6-terra"]
+      and gpt56["openai/gpt-5.6-terra"].label == "gpt-5.6 terra"
+      and gpt56["openai/gpt-5.6-terra"].context_window == 1050000
+      and gpt56["openai/gpt-5.6-luna"]
+      and gpt56["openai/gpt-5.6-luna"].label == "gpt-5.6 luna"
+      and gpt56["openai/gpt-5.6-luna"].context_window == 1050000,
+    "default model picker includes the complete GPT-5.6 family with documented context windows"
+  )
+
   config.setup({ models = { { ref = "openai/gpt-5.5", label = "only one" } } })
   check(
     #config.options.models == 1 and config.options.models[1].label == "only one",
@@ -2947,7 +3119,9 @@ do
     vim.env.CLAUDE_CONFIG_DIR, vim.env.ANTHROPIC_API_KEY = saved_dir, saved_key
   end
 
-  -- a sub-agent that never finishes returns its best partial findings at the cap.
+  -- A sub-agent that keeps investigating until its budget runs out delivers its
+  -- interim findings as a real report at the cap (the final turn is report-only),
+  -- rather than the old empty "hit the turn limit" error.
   do
     local providers = require("advantage.providers")
     local tools = require("advantage.tools")
@@ -2967,23 +3141,23 @@ do
     })
     local tmp = vim.fn.tempname()
     vim.fn.mkdir(tmp, "p")
-    local done, result = false, nil
+    local done, result, err = false, nil, nil
     tools.get("sub_agent").run({ prompt = "loop", model = "fakeloop/m", max_turns = 2 }, {
       cwd = tmp,
       model = { provider = "fakeloop", id = "m", label = "loop" },
-    }, function(out)
-      result, done = out, true
+    }, function(out, is_err)
+      result, err, done = out, is_err, true
     end)
     vim.wait(3000, function()
       return done
     end, 10)
     check(
       done and result and result:find("INTERIM_FINDING", 1, true) ~= nil,
-      "sub-agent returns best partial findings at its turn cap"
+      "sub-agent returns its interim findings as the report at its turn cap"
     )
     check(
-      done and result and result:find("turn limit", 1, true) ~= nil,
-      "the partial report is flagged as hitting the turn limit"
+      done and err == false and result and result:find("turn limit", 1, true) == nil,
+      "the turn-cap report is a real report, not an error flagged as hitting the limit"
     )
   end
 end

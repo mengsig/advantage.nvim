@@ -15,6 +15,9 @@ M.defaults = {
     { ref = "anthropic/claude-sonnet-5", label = "sonnet 5", context_window = 1000000 }, -- confirmed 1M
     { ref = "anthropic/claude-fable-5", label = "fable 5", context_window = 200000 }, -- unconfirmed, floor
     { ref = "anthropic/claude-haiku-4-5", label = "haiku 4.5", thinking = false, context_window = 200000 }, -- confirmed 200k
+    { ref = "openai/gpt-5.6-sol", label = "gpt-5.6 sol", context_window = 1050000 }, -- confirmed 1.05M
+    { ref = "openai/gpt-5.6-terra", label = "gpt-5.6 terra", context_window = 1050000 }, -- confirmed 1.05M
+    { ref = "openai/gpt-5.6-luna", label = "gpt-5.6 luna", context_window = 1050000 }, -- confirmed 1.05M
     { ref = "openai/gpt-5.5", label = "gpt-5.5", context_window = 1000000 }, -- confirmed 1M (raw API)
     { ref = "openai/gpt-5.1-codex", label = "codex 5.1", context_window = 400000 }, -- Codex tier, adjust
     { ref = "openai/gpt-5.1-codex-mini", label = "codex mini", context_window = 400000 }, -- Codex tier, adjust
@@ -179,7 +182,7 @@ M.defaults = {
     ---to the active chat model itself if the provider isn't listed here.
     summarizer_models = {
       anthropic = "anthropic/claude-haiku-4-5",
-      openai = "openai/gpt-5.1-codex-mini",
+      openai = "openai/gpt-5.6-luna",
     },
   },
 
@@ -191,8 +194,12 @@ M.defaults = {
     ---"openai/gpt-5.1-codex-mini") to make read-only fan-out cheaper and faster;
     ---the sub_agent tool's `model` arg overrides this per call.
     model = nil,
-    ---Maximum provider turns a sub-agent may take, including tool loops.
-    max_turns = 6,
+    ---Maximum provider turns a sub-agent may take, including tool loops (the
+    ---sub_agent tool's `max_turns` arg overrides this per call, hard-capped at 30).
+    ---The last turn is always report-only (tools withheld), so a fan-out scout
+    ---investigating a whole subsystem always returns a real report instead of an
+    ---empty "hit the turn limit" error; budget for the investigation accordingly.
+    max_turns = 12,
     ---Run a fan-out batch of `sub_agent` calls concurrently (overlapping their
     ---network latency) instead of one-at-a-time. Only pure read-only sub_agent
     ---batches are parallelised; mutating/permissioned tools always run in order.

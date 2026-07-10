@@ -482,7 +482,7 @@ end
 
 local DEFAULT_SUMMARIZERS = {
   anthropic = "anthropic/claude-haiku-4-5",
-  openai = "openai/gpt-5.1-codex-mini",
+  openai = "openai/gpt-5.6-luna",
 }
 
 ---Choose the model that writes the summary. An explicit `summarizer_model` wins;

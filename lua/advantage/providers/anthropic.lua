@@ -258,9 +258,14 @@ local function build_body(pcfg, req, system)
     messages = messages,
     tools = req.tools,
   }
+  -- Optional tool-use control (the sub-agent sets "none" on its report-only turn
+  -- to force a text reply). Anthropic expects an object; "none" is compatible with
+  -- interleaved thinking, unlike "any"/"tool".
+  if req.tool_choice then body.tool_choice = { type = req.tool_choice } end
   apply_thinking(body, req)
   return body
 end
+M._build_body = build_body
 
 function M.stream(req)
   assert(type(req) == "table" and type(req.on) == "table", "anthropic.stream: req with on handlers required")

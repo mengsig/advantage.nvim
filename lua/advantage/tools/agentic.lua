@@ -22,7 +22,7 @@ return function(tool, s)
         model = { type = "string", description = "Optional model ref provider/model-id; defaults to the current model" },
         max_turns = {
           type = "integer",
-          description = "Maximum sub-agent turns including tool loops (default from config, capped at 12)",
+          description = "Maximum sub-agent turns including tool loops (default from config, capped at 30). The final turn is always report-only, so give a package-wide investigation ample budget (e.g. 15-25).",
         },
       },
       required = { "prompt" },

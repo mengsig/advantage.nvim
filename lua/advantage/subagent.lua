@@ -201,7 +201,8 @@ end
 ---every worker (and 5× on a parallel fan-out, each cold-cached) is the exact
 ---token leak the sub-agent design is meant to avoid. The parent already digested
 ---memory and wrote a specific task prompt; that carries the context the scout needs.
-local function system_prompt()
+---@param max_turns integer the sub-agent's total turn budget (constant for the run)
+local function system_prompt(max_turns)
   local agent = require("advantage.agent")
   local lines = { agent.base_system_prompt() }
   -- The scout gets the same semantic-navigation steer as the parent (it has the
@@ -217,6 +218,13 @@ local function system_prompt()
     "You are a read-only sub-agent. Investigate independently and return a concise report to the parent agent.",
     "You may use only read-only tools. Do not edit files or run mutating commands. Include file paths and line numbers when useful.",
     "Keep the report tight: the parent pays tokens for every word of it, so return findings and the evidence for them, not a play-by-play.",
+    -- The budget is a constant for the run, so this line stays byte-identical
+    -- turn to turn and does not defeat the sub-agent's prompt cache. Telling the
+    -- model its budget makes it self-pace — batch look-ups, report early — instead
+    -- of investigating leisurely until it is cut off mid-stream with nothing to show.
+    ("You have a budget of about %d turns. Batch independent look-ups into one turn to go wide fast, and finish with your report before you run out — on your final turn the tools are withdrawn and you are asked to write up whatever you have found so far, so never leave the report to the last moment."):format(
+      max_turns
+    ),
   })
   return table.concat(lines, "\n")
 end
@@ -318,51 +326,76 @@ local function finish_report(s, text, is_error)
   s.cb(text .. suffix, is_error or false)
 end
 
+-- Appended as a user turn on the sub-agent's final step, where the tools are
+-- withheld (tool_choice = "none"). Without this, a scout that spends every turn
+-- calling tools — as a reasoning model bug-hunting a subsystem does: it emits
+-- thinking + tool_use and NO assistant text until the very end — reaches the turn
+-- limit having produced no text at all, and the parent gets "hit its N-turn limit"
+-- with zero findings. Forcing a text-only report turn converts that dead end into
+-- an actual report built from everything gathered so far.
+local FINAL_DIRECTIVE = "You have reached your final turn and the investigation tools are now withheld. "
+  .. "Do not attempt to gather more — write your complete report to the parent agent NOW: the findings, "
+  .. "with file paths and line numbers, and the evidence for each. If part of the investigation is unfinished, "
+  .. "report what you did find and clearly flag what remains uncertain. Do not return an empty or apologetic reply."
+
+---Messages for the final, report-only turn: the running transcript plus a user
+---directive to stop and report. A shallow copy keeps the directive out of the
+---persisted transcript (the run finishes right after this turn).
+local function final_report_messages(s)
+  local msgs = {}
+  for i = 1, #s.messages do
+    msgs[i] = s.messages[i]
+  end
+  msgs[#msgs + 1] = { role = "user", content = { { type = "text", text = FINAL_DIRECTIVE } } }
+  return msgs
+end
+
 -- Mutually recursive with on_step_complete (each tool round re-enters step).
 local step
 
 ---Handle a completed model response: record blocks, then either report the final
----text or run the requested tools and take another step.
-local function on_step_complete(s, blocks, stop_reason)
+---text or run the requested tools and take another step. `final` marks the
+---report-only turn: no tools were offered, so whatever came back is the report
+---(falling back to the newest interim findings if it somehow came back empty),
+---and we never loop again.
+local function on_step_complete(s, blocks, stop_reason, final)
   s.job = nil
   if s.cancelled then return end
   if #blocks > 0 then s.messages[#s.messages + 1] = { role = "assistant", content = blocks } end
   local interim = text_from_blocks(blocks)
   if interim ~= "" then s.last_text = interim end
+  if final then return finish_report(s, interim ~= "" and interim or s.last_text, false) end
   local calls = {}
   if stop_reason == "tool_use" then
     for _, b in ipairs(blocks) do
       if b.type == "tool_use" then calls[#calls + 1] = b end
     end
   end
-  if #calls == 0 then return finish_report(s, text_from_blocks(blocks), false) end
+  if #calls == 0 then return finish_report(s, interim, false) end
   run_calls(calls, s.ctx, function(results)
     s.messages[#s.messages + 1] = { role = "user", content = results }
     step(s)
   end)
 end
 
----Run one sub-agent turn against the provider stream.
+---Run one sub-agent turn against the provider stream. The last permitted turn is
+---report-only: the tools are withheld (tool_choice = "none") and a directive is
+---appended so the model must write its findings, guaranteeing the turn budget
+---always ends in a real report rather than an empty limit error.
 function step(s)
   assert(type(s) == "table" and type(s.provider) == "table", "step: session with provider required")
   if s.cancelled then return end
   s.turn = s.turn + 1
-  if s.turn > s.max_turns then
-    -- Don't throw away the investigation: return the newest interim findings the
-    -- sub-agent produced, flagged incomplete, instead of nothing.
-    local partial = s.last_text ~= "" and ("\n\nBest partial findings so far:\n" .. s.last_text) or ""
-    return finish_report(
-      s,
-      ("Sub-agent hit its %d-turn limit before a final report.%s"):format(s.max_turns, partial),
-      true
-    )
-  end
+  local final = s.turn >= s.max_turns
 
   s.job = s.provider.stream({
     model = s.model,
-    system = system_prompt(),
-    messages = s.messages,
+    system = system_prompt(s.max_turns),
+    messages = final and final_report_messages(s) or s.messages,
+    -- Keep the tools declared (so the transcript's prior tool_use/tool_result
+    -- blocks still validate) but forbid their use on the final turn, forcing text.
     tools = readonly_tools(),
+    tool_choice = final and "none" or nil,
     on = {
       text = function() end,
       thinking = function() end,
@@ -374,7 +407,7 @@ function step(s)
         require("advantage.usage").record(s.model, i or 0, o or 0, cached)
       end,
       complete = function(blocks, stop_reason)
-        on_step_complete(s, blocks, stop_reason)
+        on_step_complete(s, blocks, stop_reason, final)
       end,
       error = function(msg)
         s.job = nil
@@ -398,7 +431,10 @@ function M.run(input, ctx, cb)
   local model, provider, err = resolve_subagent_model(input, ctx, cfg)
   if not model then return cb(err or "sub_agent has no model", true) end
 
-  local max_turns = math.max(1, math.min(tonumber(input.max_turns or cfg.max_turns or 6) or 6, 12))
+  -- Floor at 2, not 1: the final turn is report-only (tools withheld), so a budget
+  -- of 1 would leave the scout zero turns to actually investigate — it would report
+  -- having read nothing. 2 guarantees at least one investigation turn plus the report.
+  local max_turns = math.max(2, math.min(tonumber(input.max_turns or cfg.max_turns or 12) or 12, 30))
   local s = {
     ctx = ctx,
     cb = cb,

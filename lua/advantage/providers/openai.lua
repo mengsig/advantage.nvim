@@ -222,7 +222,9 @@ local function build_body(pcfg, req)
     -- omit when empty: Lua can't distinguish {} array from {} object, so an
     -- empty table would serialize as a JSON object and the Responses API 400s.
     tools = #otools > 0 and otools or nil,
-    tool_choice = #otools > 0 and "auto" or nil,
+    -- An explicit tool_choice (the sub-agent sets "none" on its report-only turn
+    -- to force a text reply) wins; otherwise default to "auto" when tools exist.
+    tool_choice = req.tool_choice or (#otools > 0 and "auto" or nil),
     stream = true,
     store = false,
     include = effort ~= false and { "reasoning.encrypted_content" } or nil,
@@ -232,6 +234,7 @@ local function build_body(pcfg, req)
     } or nil,
   }
 end
+M._build_body = build_body
 
 ---Pick endpoint + headers for the credential mode. Mutates `body` for the
 ---API-key path (which caps output tokens). Returns url, headers.
