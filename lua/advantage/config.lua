@@ -209,6 +209,22 @@ M.defaults = {
       max_results = 60, -- cap on symbols / references / matches returned per call
     },
 
+    ---Optional external NavGraph semantic-navigation tool. Disabled by default
+    ---so it does not change the baseline prompt/schema. When enabled and the
+    ---configured executable exists, a conservative read-only command set is
+    ---available to the parent and scouts. Calls use argv (never a shell), pin
+    ---the index root to the project, force --no-cache, and reject external reads.
+    ---Enabling the safe tool trusts and auto-runs this configured executable.
+    navgraph = {
+      enabled = false,
+      ---A PATH command or an absolute executable path. Absolute paths make
+      ---benchmarks and managed installations deterministic.
+      executable = "navgraph",
+      timeout_ms = 30000, -- hard per-call ceiling (allowed range: 100..300000)
+      max_results = 80, -- hard cap; discovery commands use smaller compact defaults
+      max_output_bytes = 12000, -- final byte ceiling after result shaping (max: 1 MiB)
+    },
+
     ---Web search. `auto` prefers the stable Brave JSON API when keyed, otherwise
     ---uses Brave's public HTML results as a best-effort fallback. Page retrieval
     ---is a separate hardened `web_fetch` tool below.
@@ -669,6 +685,50 @@ local function validate(o)
     end
   end
   if type(o.tools) == "table" then
+    local navgraph = o.tools.navgraph
+    if navgraph ~= nil and type(navgraph) ~= "table" then
+      errs[#errs + 1] = "tools.navgraph must be a table"
+    elseif type(navgraph) == "table" then
+      if navgraph.enabled ~= nil and type(navgraph.enabled) ~= "boolean" then
+        errs[#errs + 1] = "tools.navgraph.enabled must be boolean"
+      end
+      if
+        navgraph.executable ~= nil
+        and (
+          type(navgraph.executable) ~= "string"
+          or vim.trim(navgraph.executable) == ""
+          or vim.trim(navgraph.executable) ~= navgraph.executable
+          or (
+            navgraph.executable:find("[/\\]")
+            and not navgraph.executable:match("^/")
+            and not navgraph.executable:match("^%a:[/\\]")
+          )
+        )
+      then
+        errs[#errs + 1] = "tools.navgraph.executable must be a PATH command or absolute executable path"
+      end
+      local timeout = navgraph.timeout_ms
+      if
+        timeout ~= nil
+        and (type(timeout) ~= "number" or timeout ~= math.floor(timeout) or timeout < 100 or timeout > 300000)
+      then
+        errs[#errs + 1] = "tools.navgraph.timeout_ms must be an integer from 100 to 300000"
+      end
+      local results = navgraph.max_results
+      if
+        results ~= nil
+        and (type(results) ~= "number" or results ~= math.floor(results) or results < 1 or results > 200)
+      then
+        errs[#errs + 1] = "tools.navgraph.max_results must be an integer from 1 to 200"
+      end
+      local output = navgraph.max_output_bytes
+      if
+        output ~= nil
+        and (type(output) ~= "number" or output ~= math.floor(output) or output < 256 or output > 1048576)
+      then
+        errs[#errs + 1] = "tools.navgraph.max_output_bytes must be an integer from 256 to 1048576"
+      end
+    end
     local search = o.tools.web_search
     if search ~= nil and type(search) ~= "table" then
       errs[#errs + 1] = "tools.web_search must be a table"
@@ -755,6 +815,9 @@ function M.setup(opts)
     if type(M.options.providers[name]) ~= "table" then
       M.options.providers[name] = vim.deepcopy(M.defaults.providers[name])
     end
+  end
+  if type(M.options.tools.navgraph) ~= "table" then
+    M.options.tools.navgraph = vim.deepcopy(M.defaults.tools.navgraph)
   end
   if type(M.options.context.summarizer_models) ~= "table" then
     M.options.context.summarizer_models = vim.deepcopy(M.defaults.context.summarizer_models)

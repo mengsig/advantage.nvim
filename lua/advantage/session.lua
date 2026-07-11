@@ -102,6 +102,11 @@ function M.save(agent)
     model = agent.model,
     harness_mode = agent.harness_mode,
     messages = agent.messages,
+    -- Normally finish/save has already aged semantic payloads to receipts. If
+    -- an interrupted Claude tool continuation must remain byte-identical, keep
+    -- the small out-of-band retention ledger too so aging resumes after reload
+    -- instead of replaying that full result forever.
+    context_results = require("advantage.tools").snapshot_context_results(agent.messages),
     usage = agent.usage,
     cwd = cwd,
     updated_at = os.time(),

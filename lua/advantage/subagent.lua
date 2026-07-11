@@ -18,7 +18,7 @@ local function readonly_tools()
       out[#out + 1] = {
         name = def.name,
         description = def.description,
-        input_schema = def.input_schema,
+        input_schema = tools.input_schema(def.name),
       }
     end
   end
@@ -67,6 +67,8 @@ local function system_prompt(max_turns, cwd)
     "You may use only read-only tools. Do not edit files or run mutating commands. Include file paths and line numbers when useful.",
     "Keep the report under about 900 words unless the task explicitly requires more. The parent pays tokens and latency for every word: prioritize decisive findings and evidence. Avoid exhaustive edge-case catalogs and avoid play-by-play narration.",
     "Structure the report around: root cause and decisive evidence; the minimal compatible file/touch set; existing contracts and tests to preserve; a few focused regression cases; and optional hardening clearly separated from the required fix.",
+    "When a semantic tool returns exact source or a precise span, include the decisive snippet/span and say whether it was unambiguous, complete, or truncated. Give the parent enough exact evidence to avoid re-reading the same region, without dumping whole files.",
+    "Prefer reusing existing representations, sentinels, and invariants. Complete behavioral coverage does not justify a comprehensive data-model redesign; recommend one only when decisive evidence shows the current representation cannot satisfy the contract.",
     "The turn budget is a ceiling, never a target. Most scoped investigations should finish in 2-4 provider turns: once the requested evidence is sufficient, stop using tools and report immediately. Do not broaden into a repository/test survey or duplicate the parent's task.",
     -- The budget is a constant for the run, so this line stays byte-identical
     -- turn to turn and does not defeat the sub-agent's prompt cache. Telling the
@@ -110,12 +112,14 @@ local function run_tool_call(call, ctx, s, cb)
     done = true
     stop_timer()
     s.active_tools[call.id] = nil
-    cb({
+    local block = {
       type = "tool_result",
       tool_use_id = call.id,
       content = output or "",
       is_error = is_error or nil,
-    })
+    }
+    tools.mark_context_result(block, def, call.input, is_error)
+    cb(block)
   end
   local ok, result = pcall(def.run, call.input or {}, ctx, settle)
   handle = result
@@ -823,6 +827,7 @@ end
 function step(s)
   assert(type(s) == "table" and type(s.provider) == "table", "step: session with provider required")
   if s.cancelled then return end
+  s.messages = tools.age_context_results(s.messages)
   s.turn = s.turn + 1
   local window = config.effective_context_window and config.effective_context_window(s.model) or s.model.context_window
   local reserve = s.output_reserve or s.model.max_output_tokens or 64000
@@ -970,7 +975,7 @@ function M.run(input, ctx, cb)
     .. "-"
     .. digest:sub(21, 32)
   local s = {
-    ctx = ctx,
+    ctx = vim.tbl_extend("force", {}, ctx, { agent_role = "scout" }),
     cb = cb,
     model = model,
     provider = provider,

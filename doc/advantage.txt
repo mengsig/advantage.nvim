@@ -150,6 +150,13 @@ Full defaults live in `lua/advantage/config.lua`. Key options: >lua
         allow_outside_root = false,
         yolo = false,
         bash_timeout_ms = 120000,
+        navgraph = {              -- optional external semantic navigator
+          enabled = false,        -- schema stays unchanged unless opted in
+          executable = "navgraph", -- or a pinned absolute executable path
+          timeout_ms = 30000,
+          max_results = 80,
+          max_output_bytes = 12000,
+        },
       },
       context = {
         auto_compact = true,
@@ -301,7 +308,7 @@ The parent may explicitly choose `"inherit"` when intentional.
 
 Tools: `read_file`, `edit_file`, `write_file`, `multi_edit`, `bash`, `grep`,
 `find_files`, `list_dir`, `diagnostics`, `sub_agent`, `sub_agent_batch`,
-`web_search`, `web_fetch`, plus memory tools.
+`web_search`, `web_fetch`, optional `navgraph`, plus memory tools.
 
 File tools are confined to the project root: absolute paths, `..` traversal,
 and symlinks that resolve outside the repo are rejected (set
@@ -327,6 +334,49 @@ lines. Search snippets and fetched pages are wrapped as untrusted web data;
 instructions inside a page never become agent instructions. Both tools are safe
 (no approval prompt) and available to read-only sub-agents; only stable Brave
 API search requires `$BRAVE_API_KEY` or `tools.web_search.api_key`.
+
+NavGraph integration is deliberately opt-in. Set
+`tools.navgraph.enabled = true`; the tool appears only when its configured
+`executable` is executable. This safe tool is auto-approved, so enabling it
+trusts that external executable; prefer a pinned absolute path for reproducible
+environments and to prevent PATH shadowing. The parent and read-only scouts
+receive the same conservative query-only command set. Each invocation is a
+direct argv call (never a shell),
+uses the active project as its fixed `-C` root, forces `--no-cache` so a query
+cannot write `.navgraph/cache`, rejects `rename`, `serve`/MCP, caller-supplied
+root flags, and external/symlink-escaping `read` paths, and stops at the configured
+time/output bounds. Git-backed history/diff commands are excluded because local
+Git configuration can invoke repository programs. NavGraph's grep-style exit
+code 1 is a successful no-match; parse-health warnings remain visible, while
+other exit-1 diagnostics are reported as operational errors. Forcing
+`--no-cache` means every call reindexes; this deliberately trades latency on
+very large repositories for no workspace writes, so avoid redundant parallel
+queries.
+
+The tool interface is typed: `target` is one symbol/name pattern/path/filter,
+`destination` is the second symbol for `path`, and `limit`, `depth`, `kind`,
+`refs`, `strict`, `sort`, `exclude_public`, and `follow_imports` are validated
+command options. Raw argv is not accepted. Search is lexical symbol-name search,
+not a prose/semantic question. Broad outline/import/route/event requests require
+a target/filter, and `read` requires closed `file:A-B[,C-D]` ranges. Overlapping
+ranges are merged and their unique source-line total must fit the explicit/live
+result limit; open-ended and oversized reads are rejected before spawn.
+Discovery returns compact names; `def` automatically returns the indexed symbol
+span and full source. The live `max_results` cap is advertised in the schema and
+excess requests are rejected instead of silently clamped. An unambiguous, untruncated
+definition without a parse-health warning replaces a broad `read_file`; use one
+narrow file read only when it is ambiguous, unhealthy, truncated, or needs
+surrounding lines. Do not map the same area concurrently in the parent and
+scouts, and treat an impact list as evidence rather than an edit list.
+Successful results of at least 512 bytes are context-aged: discovery remains
+full for one provider request and exact `def`/`read` source for two, after which
+the paired tool result becomes a short receipt and provider-private replay state
+is detached. Smaller results are already cheap and remain verbatim. Retention
+metadata follows copied compacted/session messages, so an unconsumed result is
+never hidden before its first reasoning request. Claude extended-thinking tool
+continuations are a protocol boundary: their latest signed thinking blocks and
+preceding context remain byte-identical until the continuous tool turn closes;
+receipt aging and compaction resume afterward.
 
 ==============================================================================
 8. MEMORY & SKILLS                                          *advantage-memory*

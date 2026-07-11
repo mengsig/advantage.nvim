@@ -36,6 +36,8 @@ local function default_system_prompt(cwd)
     "- Use the tools to read, search, edit and run things. Paths are relative to the project root.",
     "- Gather context before acting: explore the code rather than guessing. Batch independent look-ups in one step. Follow the harness policy below when deciding whether to delegate to the read-only `sub_agent` tool.",
     "- Treat scout reports and other tool output as evidence to verify and reconcile, not implementation authority. Make the narrowest compatible change that satisfies the user contract; preserve existing behavior contracts and regression tests outside that scope.",
+    "- Delegate for the narrowest compatible reuse of existing representations and invariants. Ask scouts for complete behavioral coverage, not a comprehensive redesign; do not prescribe a new data model unless evidence proves the current one cannot satisfy the contract.",
+    "- Give each discovery area one owner. When scouts are mapping an area, do not launch a broad parent find/list/grep/NavGraph survey of that same area in the same response. Let their reports arrive, consume any unambiguous exact source/span they provide, and confirm only a concrete ambiguity with one narrow parent lookup—never re-read the reported ranges ceremonially.",
     "- A previously passing test that fails after an edit is regression evidence. Fix the implementation first; do not weaken a passing assertion merely to make the suite green unless the requested contract deliberately supersedes it, and then retain equivalent coverage. New or changed tests must be hermetic: create their required VCS, working-directory, cache, and environment state inside the fixture.",
     "- When the user explicitly asks for agents/scouts in parallel, treat that as an execution requirement: partition the work into independent roles and emit those `sub_agent` calls together in the same response. Do not spend a planning-only turn before the fan-out; keep only genuinely dependent work sequential.",
     "- Read a file before editing it. Prefer edit_file for surgical changes; write_file only for new or fully rewritten files.",
@@ -147,14 +149,14 @@ function M.system_prompt(memory_block, cwd, frozen_base, model, harness_mode, pa
   return table.concat(texts, "\n\n")
 end
 
----@param opts {model: table, messages?: table, id?: string, title?: string, usage?: table, cwd?: string, harness_mode?: string}
+---@param opts {model: table, messages?: table, context_results?: table, id?: string, title?: string, usage?: table, cwd?: string, harness_mode?: string}
 function M.new(opts)
   local self = setmetatable({}, Agent)
   self.id = opts.id or require("advantage.session").new_id()
   self.model = opts.model
   local harness_mode = opts.harness_mode or ((config.options.harness or {}).mode or "auto")
   self.harness_mode = require("advantage.harness").valid(harness_mode) and harness_mode or "auto"
-  self.messages = opts.messages or {}
+  self.messages = tools.restore_context_results(opts.messages or {}, opts.context_results)
   self.title = opts.title
   self.usage = opts.usage or { input = 0, output = 0, cached = 0 }
   self.usage.reasoning = self.usage.reasoning or 0
@@ -501,6 +503,65 @@ local function is_verification_call(call)
   return false
 end
 
+local FINAL_AUDIT_MUTATIONS = {
+  "git checkout ",
+  "git restore ",
+  "git apply ",
+  "git reset ",
+  "sed -i",
+  "perl -pi",
+  "patch ",
+  " --fix",
+}
+
+local FINAL_AUDIT_FORMATTERS = {
+  "zig fmt",
+  "stylua",
+  "prettier --write",
+  "black ",
+  "gofmt -w",
+  "rustfmt",
+  "cargo fmt",
+  "clang-format -i",
+  "npm run format",
+}
+
+local function normalized_shell_command(call)
+  if not (call and call.name == "bash" and type(call.input) == "table") then return nil end
+  return tostring(call.input.command or ""):lower():gsub("%s+", " ")
+end
+
+local function shell_mutation_marker(command)
+  for _, marker in ipairs(FINAL_AUDIT_MUTATIONS) do
+    if command:find(marker, 1, true) then return marker end
+  end
+  if not command:find("--check", 1, true) then
+    for _, marker in ipairs(FINAL_AUDIT_FORMATTERS) do
+      if command:find(marker, 1, true) then return marker end
+    end
+  end
+  return nil
+end
+
+local function is_shell_mutation_call(call)
+  local command = normalized_shell_command(call)
+  return command ~= nil and shell_mutation_marker(command) ~= nil
+end
+
+local function final_audit_tool_error(agent, call)
+  local command = normalized_shell_command(call)
+  if not command then return nil end
+  local mutation_marker = shell_mutation_marker(command)
+  if mutation_marker and is_verification_call(call) then
+    return "Do not combine verification with a shell mutation in one command. Run the read-only check alone, then make one concrete edit and verify the new generation."
+  end
+  local generation = agent._mutation_generation or 0
+  local verified =
+    math.max(agent._verification_guided_generation or 0, agent._verification_guidance_pending_generation or 0)
+  if generation == 0 or verified < generation or not mutation_marker then return nil end
+  return "Final audit is read-only after a passing verification; do not restore/reapply/rewrite/reformat the patch. Inspect the diff, then use edit_file or multi_edit only for one concrete violating hunk."
+end
+
 local function tool_detail(tool, input)
   if not (tool and tool.summary) then return nil end
   local ok, detail = pcall(tool.summary, input)
@@ -554,7 +615,7 @@ function Agent:_note_tool_phase(call, is_error)
     end
     return
   end
-  if MUTATING[call.name] then
+  if MUTATING[call.name] or is_shell_mutation_call(call) then
     self._mutation_generation = (self._mutation_generation or 0) + 1
     -- A verification that preceded this mutation is stale. Do not claim the
     -- newer generation is verified until a later successful suite completes.
@@ -621,6 +682,8 @@ function Agent:_append_post_tool_guidance(calls)
       lines[#lines + 1] =
         "Treat every scout report as evidence, not implementation authority. Spot-check only the decisive claims in one batched source-confirmation pass, then reconcile the reports into the smallest compatible touch set and focused regression matrix. Do not re-audit the repository or implement adjacent/optional hardening."
       lines[#lines + 1] =
+        "If a scout already supplied unambiguous exact semantic source or a precise span/snippet, consume it directly. Confirm only a named ambiguity, truncation, or missing surrounding line; do not repeat the same ranges with read_file or restart a broad find/list/grep survey."
+      lines[#lines + 1] =
         "Do not launch another wave for generic architecture/test surveys or review. A later scout remains available only for a new concrete blocker whose prompt depends on this evidence."
     end
   end
@@ -653,7 +716,7 @@ function Agent:_append_post_tool_guidance(calls)
     local generation = self._verification_guidance_pending_generation
     self._verification_guidance_pending_generation = nil
     self._verification_guided_generation = math.max(self._verification_guided_generation or 0, generation)
-    lines[#lines + 1] = ("Verification completed for edit generation %d. Inspect its status and output. If it passed, perform one bounded final diff audit: every hunk is required by the user contract, no existing assertion was weakened without explicit justification and equivalent coverage, and all tests are hermetic. If clean, stop now, finish the plan, and report. If one concrete issue remains, fix it and rerun the affected suite once; do not start generic review scouts."):format(
+    lines[#lines + 1] = ("Verification completed for edit generation %d. Inspect its status and output. If it passed, perform one bounded, read-only final diff audit: every hunk is required by the user contract, no existing assertion was weakened without explicit justification and equivalent coverage, and all tests are hermetic. Do not mechanically restore/reapply/reformat a passing patch; mutate only for one concrete violating hunk. If clean, stop now, finish the plan, and report. If one concrete issue remains, fix it and rerun the affected suite once; do not start generic review scouts."):format(
       generation
     )
   end
@@ -708,10 +771,10 @@ end
 
 ---Adopt a freshly compacted transcript and refresh the compaction bookkeeping.
 ---Called from both the heuristic and llm completion paths.
-function Agent:_adopt_compaction(next_messages, info)
+function Agent:_adopt_compaction(next_messages, info, context_snapshot)
   assert(type(next_messages) == "table" and #next_messages > 0, "_adopt_compaction: non-empty messages required")
   assert(type(info) == "table", "_adopt_compaction: info table required")
-  self.messages = next_messages
+  self.messages = tools.restore_context_results(next_messages, context_snapshot)
   self._auto_compact_floor = info.after_tokens
   -- Compaction boundary: re-render the memory block from disk next turn so any
   -- fact that just aged out of the transcript re-enters the (now legitimately
@@ -722,7 +785,7 @@ end
 
 ---Completion callback for the async LLM summarizer. Splices the summary in on
 ---success, records its token usage, and falls back to the heuristic on failure.
-function Agent:_on_llm_compaction(next_messages, info, err, finish_heuristic, callback, epoch)
+function Agent:_on_llm_compaction(next_messages, info, err, finish_heuristic, callback, epoch, context_snapshot)
   assert(
     type(finish_heuristic) == "function" and type(callback) == "function",
     "_on_llm_compaction: callbacks required"
@@ -742,7 +805,7 @@ function Agent:_on_llm_compaction(next_messages, info, err, finish_heuristic, ca
     return finish_heuristic()
   end
   info = info or {}
-  self:_adopt_compaction(next_messages, info)
+  self:_adopt_compaction(next_messages, info, context_snapshot)
   if info.usage and ((info.usage.input or 0) > 0 or (info.usage.output or 0) > 0) then
     local u = info.usage
     self.usage.input = self.usage.input + u.input
@@ -773,7 +836,7 @@ end
 
 ---Run the offline heuristic compaction, adopt the result, and settle _compacting.
 ---Also serves as the fallback path when LLM compaction fails.
-function Agent:_finish_heuristic_compaction(force, eff, callback)
+function Agent:_finish_heuristic_compaction(force, eff, callback, context_snapshot)
   assert(type(eff) == "table" and type(callback) == "function", "_finish_heuristic_compaction: eff/callback required")
   local compact = require("advantage.compact")
   local util = require("advantage.util")
@@ -784,7 +847,7 @@ function Agent:_finish_heuristic_compaction(force, eff, callback)
     next_messages, info = compact.compact(self.messages, eff)
   end
   if info then
-    self:_adopt_compaction(next_messages, info)
+    self:_adopt_compaction(next_messages, info, context_snapshot)
     self:ui().notice(
       ("compacted %d old messages (~%s → ~%s tokens)"):format(
         info.compacted_messages,
@@ -808,6 +871,18 @@ function Agent:_maybe_compact(force, opts, callback)
   local epoch = self.epoch
   if not force and cfg.auto_compact == false then return callback(nil) end
   local compact = require("advantage.compact")
+
+  -- A Claude tool-result continuation must replay the latest signed thinking
+  -- turn and all preceding context unchanged. Receipt elision or compaction at
+  -- this point is a protocol violation, so wait until the assistant completes
+  -- the continuous tool-use turn. Normal auto-compaction resumes immediately
+  -- afterward. A manual compact can be retried after the pending continuation.
+  if tools.has_pending_signed_tool_loop(self.messages) then
+    if force then
+      self:ui().notify("compaction deferred until the pending Claude tool continuation completes", vim.log.levels.WARN)
+    end
+    return callback(nil)
+  end
 
   -- Model-relative bounds, resolved once. The auto-compact threshold and the
   -- retained recent-window token budget both scale to the active model's
@@ -848,6 +923,11 @@ function Agent:_maybe_compact(force, opts, callback)
 
   if not force and self:_auto_compact_blocked(compact, threshold) then return callback(nil) end
 
+  -- Compaction replaces message tables, while result-retention metadata lives
+  -- out of band. Snapshot and rebind policies for full results that survive in
+  -- the recent window. Expiring them here would hide a just-created tool result
+  -- before its first reasoning request.
+  local context_snapshot = tools.snapshot_context_results(self.messages)
   self._compacting = true
   -- Resolved config for the model-agnostic compaction functions: the
   -- window-scaled threshold and the recent-window token budget (#3), layered
@@ -858,7 +938,7 @@ function Agent:_maybe_compact(force, opts, callback)
     keep_recent_tokens = compact.resolve_keep_recent_tokens(cfg, threshold),
   })
   local function finish_heuristic()
-    self:_finish_heuristic_compaction(force, eff, callback)
+    self:_finish_heuristic_compaction(force, eff, callback, context_snapshot)
   end
 
   -- Manual /compact uses context.compact_mode (or a one-off override). Silent
@@ -869,7 +949,7 @@ function Agent:_maybe_compact(force, opts, callback)
   if mode ~= "llm" then return finish_heuristic() end
 
   local job = compact.summarize_with_llm(self.messages, eff, function(next_messages, info, err)
-    self:_on_llm_compaction(next_messages, info, err, finish_heuristic, callback, epoch)
+    self:_on_llm_compaction(next_messages, info, err, finish_heuristic, callback, epoch, context_snapshot)
   end, self.model)
   -- A provider may reject synchronously. Its callback can already have cleared
   -- `_compacting` and started the main request before summarize_with_llm returns;
@@ -895,6 +975,7 @@ function Agent:_turn_impl()
   -- of slipping through as a second top-level turn while status is still "idle".
   self.status = "streaming"
   local epoch = self.epoch
+  self.messages = tools.age_context_results(self.messages)
 
   local function continue_turn()
     if self.epoch ~= epoch then return end
@@ -1231,7 +1312,9 @@ function Agent:_parallel_launch(st, idx, call)
     output = tostring(output or "")
     output =
       require("advantage.util").truncate_to_bytes(output, st.result_limits[idx], "\n… [fan-out result truncated]")
-    st.results[idx] = { type = "tool_result", tool_use_id = call.id, content = output, is_error = is_error or nil }
+    local result = { type = "tool_result", tool_use_id = call.id, content = output, is_error = is_error or nil }
+    tools.mark_context_result(result, tool, call.input, is_error)
+    st.results[idx] = result
     ui.tool_update(call.id, {
       status = is_error and "error" or "ok",
       detail = call.name == "sub_agent" and scout_detail(call.input, meta) or detail,
@@ -1245,6 +1328,8 @@ function Agent:_parallel_launch(st, idx, call)
   local verr = tool and tools.validate_input(call.name, call.input)
   if not tool then
     return settle("Unknown tool: " .. tostring(call.name), true)
+  elseif not tools.enabled(tool) then
+    return settle(("Tool is currently disabled or unavailable: %s"):format(call.name), true)
   elseif verr then
     return settle(verr, true)
   end
@@ -1309,12 +1394,14 @@ end
 
 ---Append a tool result to the sequential batch's accumulator.
 function Agent:_tools_record(st, call, output, is_error)
-  st.results[#st.results + 1] = {
+  local result = {
     type = "tool_result",
     tool_use_id = call.id,
     content = output,
     is_error = is_error or nil,
   }
+  tools.mark_context_result(result, tools.get(call.name), call.input, is_error)
+  st.results[#st.results + 1] = result
 end
 
 ---Finish a sequential batch: splice results into the transcript and continue.
@@ -1369,6 +1456,12 @@ end
 function Agent:_tools_execute(st, call, tool)
   assert(type(tool) == "table" and type(tool.run) == "function", "_tools_execute: runnable tool required")
   local ui = st.ui
+  if not tools.enabled(tool) then
+    local err = ("Tool is currently disabled or unavailable: %s"):format(call.name)
+    self:_tools_record(st, call, err, true)
+    ui.tool_update(call.id, { status = "error", detail = "disabled", error = concise_tool_error(err) })
+    return self:_tools_run_next(st)
+  end
   ui.set_status("tool", call.name)
   local detail = call.name == "sub_agent" and scout_detail(call.input) or nil
   ui.tool_update(call.id, { status = "running", detail = detail })
@@ -1473,6 +1566,16 @@ function Agent:_tools_run_next(st)
     return self:_tools_run_next(st)
   end
 
+  local phase_err = final_audit_tool_error(self, call)
+  if phase_err then
+    self:_tools_record(st, call, phase_err, true)
+    ui.tool_update(
+      call.id,
+      { status = "error", detail = "read-only final audit", error = concise_tool_error(phase_err) }
+    )
+    return self:_tools_run_next(st)
+  end
+
   local detail = tool_detail(tool, call.input)
   ui.tool_update(call.id, { name = call.name, detail = detail })
 
@@ -1508,6 +1611,7 @@ function Agent:_finish(errored)
   -- Persist even on a cancelled/errored turn: the cancel path already trimmed the
   -- transcript to a consistent last message, and the errored path never appended a
   -- partial assistant turn, so the just-sent user message survives a later exit.
+  self.messages = tools.expire_context_results(self.messages)
   if config.options.sessions.autosave then require("advantage.session").save(self) end
   local changed = vim.tbl_count(self.turn_changed or {})
   if changed > 0 then

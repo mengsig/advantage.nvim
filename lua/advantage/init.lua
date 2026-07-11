@@ -203,6 +203,7 @@ function M.resume()
       title = data.title,
       model = model,
       messages = data.messages,
+      context_results = data.context_results,
       usage = data.usage,
       cwd = data.cwd or cwd,
       harness_mode = data.harness_mode,

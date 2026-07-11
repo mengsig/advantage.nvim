@@ -572,6 +572,616 @@ do
   check(is_err == true and assert(result):find("cancelled", 1, true), "bash cancellation stops the command")
 end
 
+-- 4-navgraph. optional read-only semantic navigator ----------------------------
+
+section("navgraph tool")
+do
+  local config = require("advantage.config")
+  local tools = require("advantage.tools")
+  local uv = vim.uv or vim.loop
+  local saved = vim.deepcopy(config.options.tools.navgraph)
+  local old_log = vim.env.ADV_NAVGRAPH_TEST_LOG
+  local tmp = vim.fn.tempname()
+  local repo = tmp .. "/repo root"
+  local executable = tmp .. "/pinned navgraph"
+  local log = tmp .. "/argv.log"
+  local injected_file = tmp .. "/shell-injection-ran"
+  vim.fn.mkdir(repo .. "/src", "p")
+  vim.fn.writefile({ "return 1" }, repo .. "/src/a.lua")
+  vim.fn.writefile({
+    "#!/bin/sh",
+    'printf \'%s\\n\' "$@" > "$ADV_NAVGRAPH_TEST_LOG"',
+    'if [ "$2" = "slow" ]; then exec sleep 5; fi',
+    'if [ "$2" = "flood" ]; then',
+    "  i=0",
+    '  while [ "$i" -lt 2000 ]; do printf x; i=$((i + 1)); done',
+    "  exit 0",
+    "fi",
+    'if [ "$2" = "missing" ]; then printf \'(no symbol matching missing)\\n\'; exit 1; fi',
+    "if [ \"$2\" = \"missingwarn\" ]; then printf '(no symbol matching missingwarn)\\n'; printf 'navgraph: parse-health: bad.js: tokenizer lost sync\\n' >&2; exit 1; fi",
+    'if [ "$2" = "broken" ]; then printf \'fatal: bad revision\\n\' >&2; exit 1; fi',
+    'if [ "$2" = "bad" ]; then printf \'bad invocation\\n\' >&2; exit 2; fi',
+    "if [ \"$2\" = \"warn\" ]; then printf 'one row\\n'; printf 'parse warning\\n' >&2; exit 0; fi",
+    "printf 'query ok\\n'",
+  }, executable)
+  vim.fn.system({ "chmod", "+x", executable })
+  vim.env.ADV_NAVGRAPH_TEST_LOG = log
+
+  local function has_schema(name)
+    for _, schema in ipairs(tools.schemas()) do
+      if schema.name == name then return schema end
+    end
+  end
+
+  local function run(input, wait_ms)
+    local output, is_error, meta, done
+    local handle = tools.get("navgraph").run(input, { cwd = repo }, function(text, err, details)
+      output, is_error, meta, done = text, err, details, true
+    end)
+    vim.wait(wait_ms or 3000, function()
+      return done == true
+    end, 10)
+    return output, is_error, handle, done, meta
+  end
+
+  config.options.tools.navgraph = {
+    enabled = false,
+    executable = executable,
+    timeout_ms = 1000,
+    max_results = 80,
+    max_output_bytes = 30000,
+  }
+  check(not has_schema("navgraph"), "navgraph is opt-in and absent from the baseline schema")
+  config.options.tools.navgraph.enabled = true
+  config.options.tools.navgraph.executable = tmp .. "/missing"
+  check(not has_schema("navgraph"), "navgraph schema is withheld when the configured executable is unavailable")
+
+  config.options.tools.navgraph.executable = executable
+  local schema = has_schema("navgraph")
+  check(schema ~= nil, "an enabled, executable NavGraph pin exposes the tool")
+  local enum = schema and schema.input_schema.properties.command.enum or {}
+  local properties = schema and schema.input_schema.properties or {}
+  check(
+    vim.tbl_contains(enum, "outline")
+      and vim.tbl_contains(enum, "read")
+      and not vim.tbl_contains(enum, "diff")
+      and not vim.tbl_contains(enum, "rename")
+      and not vim.tbl_contains(enum, "serve")
+      and not vim.tbl_contains(enum, "mcp"),
+    "navgraph schema advertises only the conservative read-only command set"
+  )
+  check(
+    properties.target
+      and properties.destination
+      and properties.limit
+      and properties.depth
+      and properties.kind
+      and properties.refs
+      and properties.strict
+      and properties.sort
+      and properties.exclude_public
+      and properties.follow_imports
+      and properties.limit.maximum == 80
+      and not properties.flags
+      and not properties.detail
+      and not properties.args,
+    "navgraph exposes live-bounded typed targeting instead of raw argv"
+  )
+  check(
+    tools.validate_input("navgraph", { command = "search", target = "resolve", destination = "" }) == nil,
+    "normal tool validation treats an empty optional NavGraph field as omitted"
+  )
+  local live_cap_err = tools.validate_input("navgraph", { command = "files", limit = 81 })
+  check(
+    live_cap_err and live_cap_err:find("at most 80", 1, true),
+    "normal tool validation exposes the live NavGraph result maximum"
+  )
+  local raw_field_err = tools.validate_input("navgraph", { command = "files", flags = {} })
+  check(
+    raw_field_err and raw_field_err:find("not supported", 1, true),
+    "normal tool validation rejects unadvertised NavGraph argv fields"
+  )
+  local scout_has_navgraph, scout_navgraph_schema = false, nil
+  for _, readonly in ipairs(require("advantage.subagent")._readonly_tools()) do
+    if readonly.name == "navgraph" then
+      scout_has_navgraph = true
+      scout_navgraph_schema = readonly.input_schema
+    end
+  end
+  check(
+    tools.get("navgraph").safe == true and scout_has_navgraph and scout_navgraph_schema.properties.limit.maximum == 80,
+    "the read-only NavGraph adapter and its live cap are identical for parent and scouts"
+  )
+
+  local discovery = { type = "tool_result", tool_use_id = "nav_discovery", content = string.rep("map", 300) }
+  tools.mark_context_result(discovery, tools.get("navgraph"), { command = "outline", target = "src" }, false)
+  local discovery_messages = { { role = "user", content = { discovery } } }
+  discovery_messages = tools.age_context_results(discovery_messages)
+  local first_discovery = discovery_messages[1].content[1].content
+  discovery_messages = tools.age_context_results(discovery_messages)
+  discovery = discovery_messages[1].content[1]
+  check(
+    #first_discovery == 900 and #discovery.content < 160 and discovery.content:find("NavGraph outline", 1, true),
+    "large discovery output is full for one reasoning turn, then becomes a short reopenable receipt"
+  )
+
+  local exact_source = { type = "tool_result", tool_use_id = "nav_source", content = string.rep("source", 120) }
+  tools.mark_context_result(exact_source, tools.get("navgraph"), { command = "def", target = "Thing@src/a.lua" }, false)
+  local source_messages = { { role = "user", content = { exact_source } } }
+  source_messages = tools.age_context_results(source_messages)
+  source_messages = tools.age_context_results(source_messages)
+  local second_source = source_messages[1].content[1].content
+  source_messages = tools.age_context_results(source_messages)
+  exact_source = source_messages[1].content[1]
+  check(
+    #second_source == 720 and #exact_source.content < 180 and exact_source.content:find("Thing@src/a.lua", 1, true),
+    "exact NavGraph source survives two reasoning turns before bounded receipt elision"
+  )
+
+  local replay_result = { type = "tool_result", tool_use_id = "nav_replay", content = string.rep("graph", 180) }
+  local replay_messages = {
+    {
+      role = "assistant",
+      content = {
+        { type = "openai_reasoning", item = { type = "reasoning", id = "rs_stale", encrypted_content = "opaque" } },
+        {
+          type = "tool_use",
+          id = "nav_replay",
+          openai_item_id = "fc_stale",
+          name = "navgraph",
+          input = { command = "outline", target = "src" },
+        },
+      },
+    },
+    { role = "user", content = { replay_result } },
+  }
+  tools.mark_context_result(replay_result, tools.get("navgraph"), { command = "outline", target = "src" }, false)
+  replay_messages = tools.age_context_results(replay_messages)
+  local detached
+  replay_messages, detached = tools.age_context_results(replay_messages)
+  local openai_items = require("advantage.providers.openai")._to_input_items(replay_messages)
+  local replay_has_private, replay_has_server_id, replay_has_receipt = false, false, false
+  for _, item in ipairs(openai_items) do
+    if item.type == "reasoning" then replay_has_private = true end
+    if item.type == "function_call" and item.id then replay_has_server_id = true end
+    if item.type == "function_call_output" and tostring(item.output):find("consumed", 1, true) then
+      replay_has_receipt = true
+    end
+  end
+  check(
+    detached >= 2 and not replay_has_private and not replay_has_server_id and replay_has_receipt,
+    "context receipt elision atomically detaches stale OpenAI replay artifacts"
+  )
+
+  -- Claude's latest signed thinking + tool-use message is a continuous turn:
+  -- Anthropic rejects *any* preceding-context mutation while its tool results
+  -- are being submitted. An older result that is otherwise ready to expire
+  -- therefore waits until a non-tool assistant message closes that turn.
+  local old_result = { type = "tool_result", tool_use_id = "nav_old", content = string.rep("old-map", 100) }
+  local claude_loop = {
+    {
+      role = "assistant",
+      content = {
+        { type = "thinking", thinking = "old reasoning", signature = "sig-old" },
+        { type = "tool_use", id = "nav_old", name = "navgraph", input = { command = "outline", target = "src" } },
+      },
+    },
+    { role = "user", content = { old_result } },
+  }
+  tools.mark_context_result(old_result, tools.get("navgraph"), { command = "outline", target = "src" }, false)
+  claude_loop = tools.age_context_results(claude_loop)
+  local fresh_result = { type = "tool_result", tool_use_id = "fresh_tool", content = "fresh result" }
+  claude_loop[#claude_loop + 1] = {
+    role = "assistant",
+    content = {
+      { type = "thinking", thinking = "fresh reasoning", signature = "sig-fresh" },
+      { type = "redacted_thinking", data = "redacted-fresh" },
+      { type = "tool_use", id = "fresh_tool", name = "read_file", input = { path = "src/a.lua" } },
+    },
+  }
+  claude_loop[#claude_loop + 1] = { role = "user", content = { fresh_result } }
+  check(tools.has_pending_signed_tool_loop(claude_loop), "signed Claude tool continuations are detected")
+  local deferred, deferred_detached = tools.expire_context_results(claude_loop)
+  local sanitized_pending = require("advantage.providers.anthropic")._sanitize_messages(deferred)
+  local latest_pending = sanitized_pending[#sanitized_pending - 1]
+  check(
+    deferred == claude_loop
+      and deferred_detached == 0
+      and old_result.content == string.rep("old-map", 100)
+      and latest_pending.role == "assistant"
+      and latest_pending.content[1].signature == "sig-fresh"
+      and latest_pending.content[2].data == "redacted-fresh"
+      and latest_pending.content[3].id == "fresh_tool",
+    "receipt aging preserves the complete latest Claude thinking/tool-use turn and preceding context"
+  )
+  claude_loop[#claude_loop + 1] = { role = "assistant", content = { { type = "text", text = "done" } } }
+  check(
+    not tools.has_pending_signed_tool_loop(claude_loop),
+    "a completed assistant response closes the signed tool loop"
+  )
+  claude_loop, detached = tools.expire_context_results(claude_loop)
+  local sanitized_complete = require("advantage.providers.anthropic")._sanitize_messages(claude_loop)
+  local complete_has_thinking, complete_has_receipt = false, false
+  for _, message in ipairs(sanitized_complete) do
+    for _, block in ipairs(message.content) do
+      if block.type == "thinking" or block.type == "redacted_thinking" then complete_has_thinking = true end
+      if block.type == "tool_result" and tostring(block.content):find("consumed", 1, true) then
+        complete_has_receipt = true
+      end
+    end
+  end
+  check(
+    detached >= 3 and complete_has_receipt and not complete_has_thinking,
+    "receipt aging resumes and detaches stale Claude replay state after the continuous tool turn closes"
+  )
+
+  local copied_result = { type = "tool_result", tool_use_id = "nav_copy", content = string.rep("copy", 180) }
+  local copied_messages = { { role = "user", content = { copied_result } } }
+  tools.mark_context_result(copied_result, tools.get("navgraph"), { command = "outline", target = "src" }, false)
+  copied_messages = tools.age_context_results(copied_messages)
+  local policy_snapshot = tools.snapshot_context_results(copied_messages)
+  copied_messages = tools.restore_context_results(vim.deepcopy(copied_messages), policy_snapshot)
+  copied_messages = tools.age_context_results(copied_messages)
+  check(
+    copied_messages[1].content[1].content:find("consumed", 1, true) ~= nil,
+    "compaction copies retain semantic-result aging policy by tool-use id"
+  )
+
+  local persisted_result = { type = "tool_result", tool_use_id = "nav_persist", content = string.rep("persist", 100) }
+  local persisted_messages = { { role = "user", content = { persisted_result } } }
+  tools.mark_context_result(persisted_result, tools.get("navgraph"), { command = "outline", target = "src" }, false)
+  persisted_messages = tools.age_context_results(persisted_messages)
+  local session = require("advantage.session")
+  local saved_session_dir = session._dir_override
+  session._dir_override = tmp .. "/sessions"
+  local persisted_ok = session.save({
+    id = "navgraph-retention",
+    title = "retention",
+    model = { provider = "fake", id = "fake" },
+    harness_mode = "auto",
+    messages = persisted_messages,
+    usage = {},
+    ctx = { cwd = repo },
+  })
+  local persisted_data = session.list(repo)[1]
+  local resumed = require("advantage.agent").new({
+    model = { provider = "fake", id = "fake" },
+    messages = persisted_data and persisted_data.messages or {},
+    context_results = persisted_data and persisted_data.context_results or {},
+    cwd = repo,
+  })
+  resumed.messages = tools.age_context_results(resumed.messages)
+  check(
+    persisted_ok == true and resumed.messages[1].content[1].content:find("consumed", 1, true) ~= nil,
+    "session reload restores deferred semantic-result aging instead of retaining full payloads forever"
+  )
+  session._dir_override = saved_session_dir
+
+  local pending_result = { type = "tool_result", tool_use_id = "nav_pending", content = string.rep("source", 120) }
+  local pending_messages = {
+    {
+      role = "assistant",
+      content = {
+        { type = "tool_use", id = "nav_pending", name = "navgraph", input = { command = "def", target = "Thing" } },
+      },
+    },
+    { role = "user", content = { pending_result } },
+  }
+  tools.mark_context_result(pending_result, tools.get("navgraph"), { command = "def", target = "Thing" }, false)
+  pending_messages = tools.expire_context_results(pending_messages)
+  check(
+    #pending_messages[2].content[1].content < 160 and pending_messages[2].content[1].content:find("Thing", 1, true),
+    "pending semantic results become durable receipts at save/compaction boundaries"
+  )
+
+  vim.fn.delete(log)
+  config.options.tools.navgraph.enabled = false
+  local disabled_output, disabled_error = run({ command = "files" })
+  check(
+    disabled_error == true and disabled_output == "NavGraph is disabled" and vim.fn.filereadable(log) == 0,
+    "navgraph rechecks its feature gate immediately before execution"
+  )
+  config.options.tools.navgraph.enabled = true
+
+  local output, is_error, first_handle, first_done, execution_meta = run({ command = "files" })
+  local argv = vim.fn.readfile(log)
+  local real_repo = uv.fs_realpath(repo) or vim.fs.normalize(repo)
+  check(output and output:find("query ok", 1, true) and is_error == false, "navgraph executes a successful query")
+  check(
+    execution_meta
+      and execution_meta.phase == "execution"
+      and execution_meta.spawned == true
+      and execution_meta.outcome == "success",
+    "navgraph reports execution lifecycle metadata independently of process-wrapper completion"
+  )
+  check(
+    vim.deep_equal(argv, { "files", "--limit", "80", "-C", real_repo, "--no-cache" }),
+    "navgraph pins the cwd/root and injects a deterministic compact result bound"
+  )
+
+  output, is_error = run({
+    command = "strings",
+    target = "$(touch " .. injected_file .. ")",
+    destination = "",
+  })
+  argv = vim.fn.readfile(log)
+  check(
+    is_error == false and vim.fn.filereadable(injected_file) == 0 and argv[2] == "$(touch " .. injected_file .. ")",
+    "navgraph omits model-materialized empty optional fields and passes literal argv without shell expansion"
+  )
+
+  output, is_error = run({ command = "outline", target = "src/a.lua", limit = 7, kind = "fn,struct" })
+  argv = vim.fn.readfile(log)
+  check(is_error == false and vim.deep_equal(argv, {
+    "outline",
+    "src/a.lua",
+    "--kind",
+    "fn,struct",
+    "--limit",
+    "7",
+    "--verbosity",
+    "names",
+    "-C",
+    real_repo,
+    "--no-cache",
+  }), "navgraph typed options build one compact deterministic argv")
+
+  for _, command in ipairs({ "diff", "rename", "serve", "mcp", "help" }) do
+    local rejected, rejected_err = run({ command = command })
+    check(
+      rejected_err == true and rejected and rejected:find("read%-only allowlist"),
+      "navgraph rejects non-read-only/unbounded command " .. command
+    )
+  end
+  rejected, rejected_err = run({ command = "files", flags = { "--root=/tmp" } })
+  check(
+    rejected_err == true and rejected and rejected:find("no longer accepts raw", 1, true),
+    "navgraph rejects arbitrary argv in favor of typed command options"
+  )
+  output, is_error = run({ command = "calls", target = "Thing", depth = 2, refs = true, strict = true })
+  argv = vim.fn.readfile(log)
+  check(is_error == false and vim.deep_equal(argv, {
+    "calls",
+    "Thing",
+    "--depth",
+    "2",
+    "--refs",
+    "--strict",
+    "--limit",
+    "40",
+    "--verbosity",
+    "names",
+    "-C",
+    real_repo,
+    "--no-cache",
+  }), "navgraph maps typed graph options without ambiguous or command-inapplicable flags")
+  output, is_error = run({ command = "path", target = "Start", destination = "Finish", strict = true })
+  argv = vim.fn.readfile(log)
+  check(is_error == false and vim.deep_equal(argv, {
+    "path",
+    "Start",
+    "Finish",
+    "--strict",
+    "--limit",
+    "40",
+    "--verbosity",
+    "names",
+    "-C",
+    real_repo,
+    "--no-cache",
+  }), "navgraph maps the typed two-symbol path query exactly")
+  output, is_error = run({
+    command = "files",
+    target = "",
+    destination = "",
+    limit = 80,
+    depth = 2,
+    kind = "",
+    refs = false,
+    strict = true,
+    sort = "symbols",
+    exclude_public = false,
+    follow_imports = false,
+  })
+  argv = vim.fn.readfile(log)
+  check(
+    is_error == false
+      and vim.deep_equal(argv, { "files", "--sort", "symbols", "--limit", "80", "-C", real_repo, "--no-cache" }),
+    "navgraph normalizes model-materialized inapplicable defaults while preserving applicable file ordering"
+  )
+  output, is_error = run({ command = "unused", target = "src", exclude_public = true, follow_imports = true })
+  argv = vim.fn.readfile(log)
+  check(is_error == false and vim.deep_equal(argv, {
+    "unused",
+    "src",
+    "--no-public",
+    "--follow-imports",
+    "--limit",
+    "40",
+    "--verbosity",
+    "names",
+    "-C",
+    real_repo,
+    "--no-cache",
+  }), "navgraph maps cross-version typed unused-query options exactly")
+  rejected, rejected_err = run({ command = "files", limit = 81 })
+  check(
+    rejected_err == true and rejected:find("configured maximum 80", 1, true),
+    "navgraph rejects a requested limit above the live cap instead of silently clamping"
+  )
+  local validation_handle, validation_done, validation_meta
+  rejected, rejected_err, validation_handle, validation_done, validation_meta = run({ command = "search" })
+  check(
+    rejected_err == true
+      and rejected
+      and rejected:find("target is required", 1, true)
+      and validation_meta.phase == "validation"
+      and validation_meta.spawned == false,
+    "navgraph validates command-specific target requirements before spawning"
+  )
+  rejected, rejected_err = run({ command = "search", target = "natural language symbol search" })
+  check(
+    rejected_err == true and rejected:find("not prose", 1, true),
+    "navgraph rejects prose passed to lexical symbol search with a concise correction"
+  )
+  rejected, rejected_err = run({ command = "imports" })
+  check(
+    rejected_err == true and rejected:find("target is required", 1, true),
+    "navgraph requires a filter for otherwise unbounded import output"
+  )
+  rejected, rejected_err = run({ command = "search", args = { "legacy" } })
+  check(
+    rejected_err == true and rejected and rejected:find("no longer accepts raw", 1, true),
+    "navgraph gives stale raw-argv calls one concise migration correction"
+  )
+
+  output, is_error = run({ command = "read", target = "src/a.lua:1-1" })
+  check(is_error == false and output and output:find("query ok", 1, true), "navgraph read accepts a contained range")
+  output, is_error = run({ command = "read", target = "src/a.lua:1-10,50-60", limit = 21 })
+  check(
+    is_error == false and output and output:find("query ok", 1, true),
+    "navgraph read accepts disjoint closed ranges at the exact unique-line budget"
+  )
+  output, is_error = run({ command = "read", target = "src/a.lua:1-10,5-15", limit = 15 })
+  check(
+    is_error == false and output and output:find("query ok", 1, true),
+    "navgraph read merges overlapping ranges before enforcing its line budget"
+  )
+  local log_before_range_rejection = table.concat(vim.fn.readfile(log), "\n")
+  local range_meta
+  rejected, rejected_err, _, _, range_meta = run({ command = "read", target = "src/a.lua:1-10,5-15", limit = 14 })
+  check(
+    rejected_err == true
+      and rejected:find("15 unique lines", 1, true)
+      and range_meta.phase == "validation"
+      and range_meta.spawned == false
+      and table.concat(vim.fn.readfile(log), "\n") == log_before_range_rejection,
+    "navgraph rejects an over-budget merged read before spawning"
+  )
+  rejected, rejected_err, _, _, range_meta = run({ command = "read", target = "src/a.lua:1-81" })
+  check(
+    rejected_err == true and rejected:find("at most 80", 1, true) and range_meta.outcome == "read_range_exceeded",
+    "navgraph read enforces the live default line cap independently of its byte guard"
+  )
+  rejected, rejected_err = run({ command = "read", target = "src/a.lua:1-21", limit = 20 })
+  check(
+    rejected_err == true and rejected:find("at most 20", 1, true),
+    "an explicit lower NavGraph limit also bounds requested source lines"
+  )
+  rejected, rejected_err = run({ command = "read", target = "src/a.lua" })
+  check(
+    rejected_err == true and rejected:find("explicit bounded range", 1, true),
+    "navgraph read requires an exact range rather than returning an arbitrary file prefix"
+  )
+  for _, target in ipairs({
+    "src/a.lua:0",
+    "src/a.lua:9-4",
+    "src/a.lua:4-",
+    "src/a.lua:1,,2",
+  }) do
+    rejected, rejected_err = run({ command = "read", target = target })
+    check(
+      rejected_err == true and rejected:find("range", 1, true),
+      "navgraph read rejects malformed or unbounded range " .. target
+    )
+  end
+  local too_many_ranges = {}
+  for i = 1, 17 do
+    too_many_ranges[#too_many_ranges + 1] = tostring(i)
+  end
+  rejected, rejected_err = run({ command = "read", target = "src/a.lua:" .. table.concat(too_many_ranges, ",") })
+  check(
+    rejected_err == true and rejected:find("at most 16 ranges", 1, true),
+    "navgraph read caps raw range segments for cross-version parser parity"
+  )
+  for _, path in ipairs({ "/etc/passwd:1-1", "../../etc/passwd:1-1" }) do
+    local rejected, rejected_err = run({ command = "read", target = path })
+    check(
+      rejected_err == true and rejected and rejected:find("project root"),
+      "navgraph read rejects external path " .. path
+    )
+  end
+  local symlink_ok = uv.fs_symlink("/etc/passwd", repo .. "/escape")
+  local rejected, rejected_err = run({ command = "read", target = "escape:1-1" })
+  check(
+    not symlink_ok or (rejected_err == true and rejected and rejected:find("project root")),
+    "navgraph read rejects a symlink that resolves outside the project"
+  )
+
+  local no_match_handle, no_match_done, no_match_meta
+  output, is_error, no_match_handle, no_match_done, no_match_meta = run({ command = "search", target = "missing" })
+  check(
+    is_error == false
+      and output
+      and output:find("no symbol matching", 1, true)
+      and no_match_meta.outcome == "no_match"
+      and no_match_meta.spawned == true,
+    "navgraph exit 1 is a successful empty query"
+  )
+  output, is_error = run({ command = "search", target = "missingwarn" })
+  check(
+    is_error == false
+      and output
+      and output:find("no symbol matching missingwarn", 1, true)
+      and output:find("navgraph: parse-health:", 1, true),
+    "navgraph preserves benign parse-health stderr on a successful empty query"
+  )
+  output, is_error = run({ command = "search", target = "broken" })
+  check(
+    is_error == true and output and output:find("fatal: bad revision", 1, true) and output:find("exit code 1", 1, true),
+    "navgraph exit 1 with operational diagnostics is a tool error"
+  )
+  output, is_error = run({ command = "search", target = "bad" })
+  check(
+    is_error == true and output and output:find("bad invocation", 1, true) and output:find("exit code 2", 1, true),
+    "navgraph exit 2+ preserves diagnostics and reports a tool error"
+  )
+  output, is_error = run({ command = "search", target = "warn" })
+  check(
+    is_error == false and output and output:find("one row", 1, true) and output:find("parse warning", 1, true),
+    "navgraph preserves non-fatal stderr alongside query results"
+  )
+
+  config.options.tools.navgraph.timeout_ms = 100
+  output, is_error = run({ command = "search", target = "slow" })
+  check(
+    is_error == true and output and output:find("timed out after 100 ms", 1, true),
+    "navgraph enforces its configured process timeout"
+  )
+
+  config.options.tools.navgraph.timeout_ms = 5000
+  local cancelled_output, cancelled_error, handle, cancelled_done
+  handle = tools.get("navgraph").run({ command = "search", target = "slow" }, { cwd = repo }, function(text, err)
+    cancelled_output, cancelled_error, cancelled_done = text, err, true
+  end)
+  check(type(handle) == "table" and type(handle.stop) == "function", "navgraph returns a cancellable process handle")
+  handle.stop()
+  vim.wait(3000, function()
+    return cancelled_done == true
+  end, 10)
+  check(
+    cancelled_error == true and cancelled_output and cancelled_output:find("cancelled", 1, true),
+    "navgraph cancellation kills the process and settles once"
+  )
+
+  config.options.tools.navgraph.max_output_bytes = 256
+  output, is_error = run({ command = "search", target = "flood" })
+  check(
+    is_error == false and output and #output <= 256 and output:find("useful 256%-byte partial result"),
+    "navgraph stops a runaway producer but returns useful bounded partial context"
+  )
+
+  rejected, rejected_err = run({ command = "calls", target = "Thing", depth = 9 })
+  check(
+    rejected_err == true and rejected and rejected:find("depth must be an integer from 1 to 8", 1, true),
+    "navgraph enforces typed traversal bounds before spawning"
+  )
+
+  config.options.tools.navgraph = saved
+  vim.env.ADV_NAVGRAPH_TEST_LOG = old_log
+  vim.fn.delete(tmp, "rf")
+end
+
 -- 4-diag. diagnostics feedback loop ----------------------------------------------
 
 section("diagnostics")
@@ -4101,6 +4711,25 @@ do
     }),
     "base instructions forbid weakening passing assertions and require hermetic tests"
   )
+  check(
+    has_all_concepts(base_discipline, {
+      { "reuse" },
+      { "existing representation", "existing invariant" },
+      { "behavioral coverage", "complete behavior" },
+      { "not a comprehensive redesign", "do not prescribe a new data model" },
+    }),
+    "delegation guidance separates complete behavior from architectural breadth"
+  )
+  check(
+    has_all_concepts(base_discipline, {
+      { "one owner" },
+      { "same response" },
+      { "broad parent" },
+      { "exact source", "precise span" },
+      { "never re-read", "do not re-read" },
+    }),
+    "delegation guidance prevents additive parent discovery and ceremonial re-reads"
+  )
 
   require("advantage.subagent")._reset_route_health()
   local saved_models = vim.deepcopy(config.options.models)
@@ -4207,6 +4836,25 @@ do
       { "not a play-by-play", "no play-by-play", "avoid play-by-play" },
     }),
     "scout report contract is bounded near 900 words and prioritizes decisive evidence over exhaustive catalogs or play-by-play"
+  )
+  check(
+    has_all_concepts(budget_prompts[1], {
+      { "reuse" },
+      { "existing representation", "existing invariant", "sentinel" },
+      { "does not justify", "only when decisive evidence" },
+      { "data-model redesign", "data model redesign" },
+    }),
+    "scouts prefer narrow reuse and require evidence before proposing a data-model redesign"
+  )
+  check(
+    has_all_concepts(budget_prompts[1], {
+      { "exact source", "precise span" },
+      { "snippet", "span" },
+      { "unambiguous" },
+      { "truncated" },
+      { "avoid re-reading", "avoid rereading" },
+    }),
+    "scouts return decisive semantic source so the parent need not retrieve it again"
   )
 
   local function guidance_texts(messages)
@@ -4446,6 +5094,13 @@ do
     { "evidence" },
     { "validat", "reconcil", "synth" },
   }), "scout-wave reminder treats reports as evidence to reconcile rather than implementation authority")
+  check(phase_seen[2] and has_all_concepts(table.concat(phase_seen[2], "\n"), {
+    { "exact semantic source", "precise span" },
+    { "consume it directly" },
+    { "ambiguity", "truncation" },
+    { "do not repeat" },
+    { "broad find", "broad survey" },
+  }), "post-scout guidance consumes exact evidence without duplicating broad parent retrieval")
   check(
     phase_seen[3]
       and #phase_seen[3] == 2
@@ -4512,9 +5167,158 @@ do
       { "diff" },
       { "audit", "review" },
       { "bounded", "single", "one" },
+      { "read-only", "read only" },
+      { "do not mechanically restore", "do not restore", "do not reapply" },
       { "stop", "finish" },
     }),
     "successful-generation reminder directs one bounded diff audit and then stops"
+  )
+
+  local guard_turn = 0
+  providers.register("fakefinalguard", {
+    stream = function(req)
+      guard_turn = guard_turn + 1
+      local turn = guard_turn
+      vim.defer_fn(function()
+        if turn == 1 then
+          req.on.complete({
+            {
+              type = "tool_use",
+              id = "final-guard-write",
+              name = "write_file",
+              input = { path = "guard.txt", content = "guard\n" },
+            },
+          }, "tool_use")
+        elseif turn == 2 then
+          req.on.complete({
+            {
+              type = "tool_use",
+              id = "final-guard-test",
+              name = "bash",
+              input = { command = "npm test" },
+            },
+            {
+              type = "tool_use",
+              id = "final-guard-danger",
+              name = "bash",
+              input = { command = "git checkout -- guard.txt" },
+            },
+            {
+              type = "tool_use",
+              id = "final-guard-combined",
+              name = "bash",
+              input = { command = "npm test && git apply /tmp/rewrite.patch" },
+            },
+            {
+              type = "tool_use",
+              id = "final-guard-format-check",
+              name = "bash",
+              input = { command = "npm run format:check -- --check >/dev/null 2>&1 || true" },
+            },
+          }, "tool_use")
+        else
+          req.on.complete({ { type = "text", text = "guard complete" } }, "end_turn")
+        end
+      end, 5)
+      return { stop = function() end }
+    end,
+  })
+  local guard_agent = agent_mod.new({
+    id = "final-audit-guard-parent",
+    model = { provider = "fakefinalguard", id = "parent", label = "final guard" },
+    cwd = tmp,
+  })
+  guard_agent:send("Make one change, verify it, then audit the final diff")
+  vim.wait(5000, function()
+    return guard_turn >= 3 and guard_agent.status == "idle"
+  end, 10)
+  local guarded_result, combined_result, format_check_result
+  for _, message in ipairs(guard_agent.messages) do
+    for _, block in ipairs(type(message.content) == "table" and message.content or {}) do
+      if block.type == "tool_result" and block.tool_use_id == "final-guard-danger" then guarded_result = block end
+      if block.type == "tool_result" and block.tool_use_id == "final-guard-combined" then combined_result = block end
+      if block.type == "tool_result" and block.tool_use_id == "final-guard-format-check" then
+        format_check_result = block
+      end
+    end
+  end
+  check(
+    guarded_result
+      and guarded_result.is_error == true
+      and guarded_result.content:find("Final audit is read-only", 1, true)
+      and combined_result
+      and combined_result.is_error == true
+      and combined_result.content:find("Do not combine verification", 1, true)
+      and format_check_result
+      and format_check_result.is_error ~= true
+      and vim.fn.readfile(tmp .. "/guard.txt")[1] == "guard",
+    "final audit rejects same-batch mutations while allowing explicit formatter check mode"
+  )
+
+  vim.fn.writefile({ "before" }, tmp .. "/shell-only.txt")
+  local shell_guard_turn = 0
+  providers.register("fakeshellguard", {
+    stream = function(req)
+      shell_guard_turn = shell_guard_turn + 1
+      local turn = shell_guard_turn
+      vim.defer_fn(function()
+        if turn == 1 then
+          req.on.complete({
+            {
+              type = "tool_use",
+              id = "shell-guard-edit",
+              name = "bash",
+              input = { command = "sed -i 's/before/after/' shell-only.txt" },
+            },
+          }, "tool_use")
+        elseif turn == 2 then
+          req.on.complete({
+            {
+              type = "tool_use",
+              id = "shell-guard-test",
+              name = "bash",
+              input = { command = "npm test" },
+            },
+          }, "tool_use")
+        elseif turn == 3 then
+          req.on.complete({
+            {
+              type = "tool_use",
+              id = "shell-guard-restore",
+              name = "bash",
+              input = { command = "git checkout -- shell-only.txt" },
+            },
+          }, "tool_use")
+        else
+          req.on.complete({ { type = "text", text = "shell guard complete" } }, "end_turn")
+        end
+      end, 5)
+      return { stop = function() end }
+    end,
+  })
+  local shell_guard_agent = agent_mod.new({
+    id = "shell-only-final-audit-guard",
+    model = { provider = "fakeshellguard", id = "parent", label = "shell guard" },
+    cwd = tmp,
+  })
+  shell_guard_agent:send("Make a shell edit, verify it, and audit the result")
+  vim.wait(5000, function()
+    return shell_guard_turn >= 4 and shell_guard_agent.status == "idle"
+  end, 10)
+  local shell_restore_result
+  for _, message in ipairs(shell_guard_agent.messages) do
+    for _, block in ipairs(type(message.content) == "table" and message.content or {}) do
+      if block.type == "tool_result" and block.tool_use_id == "shell-guard-restore" then
+        shell_restore_result = block
+      end
+    end
+  end
+  check(
+    shell_restore_result
+      and shell_restore_result.is_error == true
+      and shell_restore_result.content:find("Final audit is read-only", 1, true)
+      and vim.fn.readfile(tmp .. "/shell-only.txt")[1] == "after",
+    "recognized shell-only mutations create and preserve a verified edit generation"
   )
 
   -- A red suite carries different evidence from a green one. The harness must
@@ -5485,6 +6289,36 @@ do
     vim.tbl_contains(errs, "harness.mode is not recognized")
       and vim.tbl_contains(errs, "harness.sync_effort must be boolean"),
     "validation rejects malformed harness policy"
+  )
+  local malformed_navgraph = vim.deepcopy(config.defaults)
+  malformed_navgraph.tools.navgraph = {
+    enabled = "sometimes",
+    executable = "relative/bin/navgraph",
+    timeout_ms = 99,
+    max_results = 201,
+    max_output_bytes = 1048577,
+  }
+  errs = config._validate(malformed_navgraph)
+  check(
+    vim.tbl_contains(errs, "tools.navgraph.enabled must be boolean")
+      and vim.tbl_contains(errs, "tools.navgraph.executable must be a PATH command or absolute executable path")
+      and vim.tbl_contains(errs, "tools.navgraph.timeout_ms must be an integer from 100 to 300000")
+      and vim.tbl_contains(errs, "tools.navgraph.max_results must be an integer from 1 to 200")
+      and vim.tbl_contains(errs, "tools.navgraph.max_output_bytes must be an integer from 256 to 1048576"),
+    "validation rejects malformed NavGraph availability and resource bounds"
+  )
+  local valid_navgraph = vim.deepcopy(config.defaults)
+  valid_navgraph.tools.navgraph.executable = "/opt/bench tools/pinned-navgraph"
+  errs = config._validate(valid_navgraph)
+  local navgraph_validation_error = false
+  for _, validation_error in ipairs(errs) do
+    if validation_error:find("tools.navgraph", 1, true) then navgraph_validation_error = true end
+  end
+  check(not navgraph_validation_error, "validation accepts a pinned absolute NavGraph executable path")
+  config.setup({ tools = { navgraph = false } })
+  check(
+    type(config.options.tools.navgraph) == "table" and config.options.tools.navgraph.enabled == false,
+    "a malformed scalar NavGraph override is reported and recovered to safe disabled defaults"
   )
   local malformed = vim.deepcopy(config.defaults)
   malformed.providers.openai = false
