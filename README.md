@@ -249,6 +249,45 @@ without changing the harness. `auto` follows the active effort.
 `subagents.parallel = false` keeps every harness mode sequential, while
 `max_parallel` remains a concurrency width rather than a spawn quota.
 
+## Advantage vs default Codex benchmark
+
+On 10 July 2026, Advantage and the default Codex CLI harness were run against
+the same four difficult, deterministic hidden-graded tasks. Both used
+`openai/gpt-5.6-sol` at `xhigh` effort through the same ChatGPT/Codex login.
+
+| Harness | Hidden score | Completed | Gross input | Cached input | Uncached input | Output | Reasoning¹ | Elapsed |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|
+| **Advantage** | **400/400** | **4/4** | **3,765,986** | 2,899,712 | 866,274 | 102,279 | 47,181 | 42.67m |
+| **Default Codex** | **400/400** | **4/4** | 9,163,342 | 8,740,864 | **422,478** | **97,772** | **45,588** | **36.92m** |
+
+Advantage matched Codex on hidden accuracy and normal completion while using
+**58.9% less gross replayed input**. Codex remained **15.6% faster overall** and
+used less uncached input: Advantage consumed 2.05× Codex's uncached input. The
+different cache-hit rates—77.0% for Advantage and 95.4% for Codex—mean gross and
+uncached input should be considered together.
+
+| Task | Advantage score | Codex score | Advantage time | Codex time | Advantage gross input | Codex gross input |
+|---|---:|---:|---:|---:|---:|---:|
+| NG-SCOPE | 100/100 | 100/100 | **13.77m** | 16.37m | **1,294,049** | 5,030,328 |
+| NG-CLI | 100/100 | 100/100 | 7.10m | **4.62m** | **1,033,485** | 1,474,123 |
+| NG-POLYGLOT | 100/100 | 100/100 | 10.25m | **7.18m** | **1,160,770** | 2,175,972 |
+| PIECE-TABLE | 100/100 | 100/100 | 11.54m | **8.75m** | **277,682** | 482,919 |
+
+The protocol used fresh isolated Git seeds, hidden post-run graders, alternating
+execution order, a 20-minute cap per run, and no LLM judge. Default Codex had its
+native multi-agent feature enabled but chose no child agents on these four scored
+tasks. Gross input includes the provider-reported cached subset; reasoning is a
+subset of output, not an additional token category.¹
+
+This is an engineering comparison with one selected successful Advantage sample
+per task, not a confidence-bounded statistical study. The selected NG-CLI sample
+is the successful recovery run after a retained first-attempt provider-overload
+failure. Shared-subscription latency and prompt-cache warmth can affect timing.
+The later provider-affinity and shorter-scout hardening has not yet been rerun as
+a complete four-task matrix.
+
+¹ Reasoning tokens are already included in output tokens.
+
 **Usage dashboard.** `/usage` (or `:Advantage usage`, `<leader>cu`) shows
 session/today/7-day token totals, cache savings (cached input bills at ~10%, and
 the dashboard shows how much that saved you), a sparkline, your current pace, a
