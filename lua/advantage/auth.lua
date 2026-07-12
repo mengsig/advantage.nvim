@@ -147,7 +147,7 @@ end
 ---already rotated Anthropic's single-use refresh token and written a fresh
 ---credential to disk. Re-read the file and report how to recover, if at all.
 ---@param tried_refresh_token string|nil the refresh token whose refresh just failed
----@return {reuse:boolean, oauth:table}|nil recovery, or nil when the on-disk state is no better
+---@return {reuse:boolean, oauth:table}|nil recovery details when the on-disk state is better
 local function reload_after_failed_refresh(tried_refresh_token)
   assert(tried_refresh_token == nil or type(tried_refresh_token) == "string", "tried refresh token must be a string")
   local file = read_json(claude_creds_path())
