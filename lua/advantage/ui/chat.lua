@@ -162,7 +162,6 @@ function M.add_mention(path)
   if util.win_valid(S.input_win) then
     api.nvim_set_current_win(S.input_win)
     api.nvim_win_set_cursor(S.input_win, { #lines, math.max(#lines[#lines] - 1, 0) })
-    vim.cmd.startinsert({ bang = true })
   end
 end
 
@@ -179,7 +178,6 @@ function M.set_prompt(text)
     api.nvim_set_current_win(S.input_win)
     local last = lines[#lines] or ""
     api.nvim_win_set_cursor(S.input_win, { #lines, #last })
-    vim.cmd.startinsert({ bang = true })
   end
 end
 
@@ -575,7 +573,7 @@ end
 function M.open(focus)
   ensure_bufs()
   if M.is_open() then
-    if focus ~= false then focus_input(true) end
+    if focus ~= false then focus_input(false) end
     return
   end
   local cfg = config.options.ui
@@ -633,7 +631,7 @@ function M.open(focus)
   resize_input()
   -- Reopening while the agent is still working: restart the spinner we stopped on close.
   if S.status ~= "idle" then ensure_timer() end
-  if focus ~= false then focus_input(true) end
+  if focus ~= false then focus_input(false) end
 end
 
 function M.close()
