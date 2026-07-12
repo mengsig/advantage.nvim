@@ -143,34 +143,68 @@ local function refresh_anthropic(oauth, cb)
   end)
 end
 
+---After a failed refresh, another client (Claude Code or a second nvim) may have
+---already rotated Anthropic's single-use refresh token and written a fresh
+---credential to disk. Re-read the file and report how to recover, if at all.
+---@param tried_refresh_token string|nil the refresh token whose refresh just failed
+---@return {reuse:boolean, oauth:table}|nil recovery details when the on-disk state is better
+local function reload_after_failed_refresh(tried_refresh_token)
+  assert(tried_refresh_token == nil or type(tried_refresh_token) == "string", "tried refresh token must be a string")
+  local file = read_json(claude_creds_path())
+  local oauth = file and file.claudeAiOauth
+  if not (oauth and oauth.accessToken) then return nil end
+  local expires = (oauth.expiresAt or 0) / 1000
+  if expires > os.time() + 60 then
+    -- Someone else already refreshed and wrote a still-valid token: use it as-is.
+    return { reuse = true, oauth = oauth }
+  end
+  if oauth.refreshToken and oauth.refreshToken ~= tried_refresh_token then
+    -- The on-disk refresh token was rotated by another client: retry with it.
+    return { reuse = false, oauth = oauth }
+  end
+  return nil
+end
+M._reload_after_failed_refresh = reload_after_failed_refresh
+
 ---@param cb fun(cred: {mode:string, token?:string, key?:string, badge:string}|nil, err?:string)
 ---@param force boolean|nil force a token refresh even if the cached token looks valid (e.g. after a 401)
 function M.anthropic(cb, force)
+  assert(type(cb) == "function", "auth.anthropic: callback required")
   local file = read_json(claude_creds_path())
   local oauth = file and file.claudeAiOauth
+  local function fallback(err)
+    local key = require("advantage.config").api_key("anthropic")
+    if key then return cb({ mode = "api_key", key = key, badge = "api" }) end
+    cb(nil, err or "No Claude credentials. Log in with the `claude` CLI (subscription) or export $ANTHROPIC_API_KEY.")
+  end
+  local function emit(o)
+    cb({ mode = "oauth", token = o.accessToken, badge = o.subscriptionType or "pro" })
+  end
   if oauth and oauth.accessToken then
     local expires = (oauth.expiresAt or 0) / 1000
     if not force and expires > os.time() + 60 then
-      return cb({ mode = "oauth", token = oauth.accessToken, badge = oauth.subscriptionType or "pro" })
+      return emit(oauth)
     end
     if oauth.refreshToken then
-      return refresh_anthropic(oauth, function(updated, err)
-        if updated then
-          cb({ mode = "oauth", token = updated.accessToken, badge = updated.subscriptionType or "pro" })
-        else
-          local key = require("advantage.config").api_key("anthropic")
-          if key then
-            cb({ mode = "api_key", key = key, badge = "api" })
-          else
-            cb(nil, err)
-          end
-        end
-      end)
+      local retried = false
+      local function try_refresh(current)
+        refresh_anthropic(current, function(updated, err)
+          if updated then return emit(updated) end
+          -- Refresh failed. With single-use refresh tokens, a lost rotation race
+          -- (against Claude Code or another nvim at first boot) is expected — try
+          -- to recover the winner's freshly-written token before forcing a login.
+          local recovered = reload_after_failed_refresh(current.refreshToken)
+          if not recovered then return fallback(err) end
+          if recovered.reuse then return emit(recovered.oauth) end
+          if retried then return fallback(err) end
+          retried = true
+          try_refresh(recovered.oauth)
+        end)
+      end
+      return try_refresh(oauth)
     end
   end
-  local key = require("advantage.config").api_key("anthropic")
-  if key then return cb({ mode = "api_key", key = key, badge = "api" }) end
-  cb(nil, "No Claude credentials. Log in with the `claude` CLI (subscription) or export $ANTHROPIC_API_KEY.")
+  fallback()
 end
 
 -- openai / codex ----------------------------------------------------------
