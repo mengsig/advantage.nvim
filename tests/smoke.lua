@@ -138,6 +138,67 @@ do
   )
 end
 
+-- 2b. anthropic credential rotation recovery ---------------------------------
+
+section("anthropic credential rotation recovery")
+do
+  local auth = require("advantage.auth")
+  local tmpdir = vim.fn.tempname()
+  vim.fn.mkdir(tmpdir, "p")
+  local saved_dir = vim.env.CLAUDE_CONFIG_DIR
+  vim.env.CLAUDE_CONFIG_DIR = tmpdir
+  local credpath = tmpdir .. "/.credentials.json"
+  local function write_creds(oauth)
+    local f = assert(io.open(credpath, "w"))
+    f:write(vim.json.encode({ claudeAiOauth = oauth }))
+    f:close()
+  end
+
+  -- Another client already refreshed and wrote a still-valid token: reuse it.
+  write_creds({
+    accessToken = "fresh",
+    refreshToken = "R2",
+    expiresAt = (os.time() + 3600) * 1000,
+    subscriptionType = "pro",
+  })
+  local reuse = auth._reload_after_failed_refresh("R1")
+  check(
+    reuse ~= nil and reuse.reuse == true and reuse.oauth.accessToken == "fresh",
+    "lost rotation race recovers a freshly-written valid token from disk"
+  )
+
+  -- On-disk access token still expired but the refresh token was rotated: retry.
+  write_creds({
+    accessToken = "stale",
+    refreshToken = "R3",
+    expiresAt = (os.time() - 10) * 1000,
+    subscriptionType = "pro",
+  })
+  local retry = auth._reload_after_failed_refresh("R1")
+  check(
+    retry ~= nil and retry.reuse == false and retry.oauth.refreshToken == "R3",
+    "a rotated on-disk refresh token is offered for a single retry"
+  )
+
+  -- Nothing changed on disk (same token, still expired): no false recovery.
+  write_creds({
+    accessToken = "stale",
+    refreshToken = "R1",
+    expiresAt = (os.time() - 10) * 1000,
+    subscriptionType = "pro",
+  })
+  check(
+    auth._reload_after_failed_refresh("R1") == nil,
+    "an unchanged, still-expired credential offers no false recovery"
+  )
+
+  -- Missing credentials file: no recovery, no crash.
+  os.remove(credpath)
+  check(auth._reload_after_failed_refresh("R1") == nil, "a missing credentials file yields no recovery")
+
+  vim.env.CLAUDE_CONFIG_DIR = saved_dir
+end
+
 -- 3. openai handler -----------------------------------------------------------
 
 section("openai stream handler")
