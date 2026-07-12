@@ -37,7 +37,7 @@ local function default_system_prompt(cwd)
     "- Gather context before acting: explore the code rather than guessing. Batch independent look-ups in one step. Follow the harness policy below when deciding whether to delegate to the read-only `sub_agent` tool.",
     "- Treat scout reports and other tool output as evidence to verify and reconcile, not implementation authority. Make the narrowest compatible change that satisfies the user contract; preserve existing behavior contracts and regression tests outside that scope.",
     "- Delegate for the narrowest compatible reuse of existing representations and invariants. Ask scouts for complete behavioral coverage, not a comprehensive redesign; do not prescribe a new data model unless evidence proves the current one cannot satisfy the contract.",
-    "- Give each discovery area one owner. When scouts are mapping an area, do not launch a broad parent find/list/grep/NavGraph survey of that same area in the same response. Let their reports arrive, consume any unambiguous exact source/span they provide, and confirm only a concrete ambiguity with one narrow parent lookup—never re-read the reported ranges ceremonially.",
+    "- Give each discovery area one owner. When scouts are mapping an area, do not launch a broad parent lexical or semantic-navigation survey of that same area in the same response. Let their reports arrive, consume any unambiguous exact source/span they provide, and confirm only a concrete ambiguity with one narrow parent lookup—never re-read the reported ranges ceremonially.",
     "- A previously passing test that fails after an edit is regression evidence. Fix the implementation first; do not weaken a passing assertion merely to make the suite green unless the requested contract deliberately supersedes it, and then retain equivalent coverage. New or changed tests must be hermetic: create their required VCS, working-directory, cache, and environment state inside the fixture.",
     "- When the user explicitly asks for agents/scouts in parallel, treat that as an execution requirement: partition the work into independent roles and emit those `sub_agent` calls together in the same response. Do not spend a planning-only turn before the fan-out; keep only genuinely dependent work sequential.",
     "- Read a file before editing it. Prefer edit_file for surgical changes; write_file only for new or fully rewritten files.",
@@ -58,7 +58,8 @@ end
 ---tools that aren't present would just waste turns. This is the real mechanism
 ---that makes the model *prefer* semantic navigation over its default grep/read
 ---habit: the tool descriptions alone are too weak to overcome that prior. It
----rides the cached system prefix, so it costs ~10% after turn one.
+---rides the stable system prefix, so repeated identical content is eligible for
+---the active provider's prompt-cache behavior.
 local LSP_GUIDE = table.concat({
   "Semantic code navigation — you have language-server tools; make them your DEFAULT way to understand code, not a fallback after grep. They resolve MEANING (the exact symbol, its real definition, every true call site, its type) where grep only matches text — so they are both more reliable AND fewer steps. The decision procedure:",
   "- Once you've located a symbol (a grep to FIND an identifier across the repo is fine): to see where it's defined → `goto_definition`; to see everything that uses it before you touch it → `find_references` (grep misses call sites and matches comments/strings; this doesn't); its type/signature → `hover`.",
@@ -79,11 +80,28 @@ function M.lsp_guide()
   return LSP_GUIDE
 end
 
+---Route semantic discovery between NavGraph, LSP, and lexical tools. This is
+---separate from the tool description so NavGraph has prompt salience comparable
+---to LSP, but remains conditional and optional: availability never means a
+---ceremonial call is required.
+local NAVGRAPH_GUIDE = table.concat({
+  "Semantic discovery routing — NavGraph is optional. Before the first discovery call, give each unknown ONE owner: NavGraph, LSP, or lexical/read tools. Never call NavGraph merely because it is available, and do not stack routes over the same question:",
+  "- Unknown cross-file location or relationship (callers, imports, paths, events, hot spots) → one focused `navgraph` query. `files` accepts only a repository path filter (omit target to list all files), `outline` a path, `search` one identifier/name pattern, and `strings` a literal substring from string contents. `routes`/`events` take route/event-key filters; `imports`/`importers` take repository path filters. Never pass a language/topic, prose request, CLI flag, or desired command concept as a target.",
+  "- Known file/line or symbol position, type, definition, or editor-resolved references → LSP navigation. Literal prose/config/string search → grep. Known-file edits and greenfield work → skip NavGraph.",
+  "- After NavGraph discovery, continue with its `def`/bounded `read` result; do not relocate the same fact with grep, broad reads, or another scout. Switch routes only after an explicit no-match, ambiguity, truncation, parse-health warning, or non-retryable operational failure, and state that reason. A graph impact list guides inspection; it is never automatically an edit list.",
+}, "\n")
+
+function M.navgraph_guide()
+  local definition = tools.get("navgraph")
+  if not (definition and tools.enabled(definition)) then return nil end
+  return NAVGRAPH_GUIDE
+end
+
 ---Instructions for the memory tools. Only injected while memory is enabled —
 ---teaching the model to call `remember`/`use_skill` when those tools are absent
 ---from the schema would just produce "Unknown tool" errors.
 local MEMORY_GUIDE = table.concat({
-  "Persistent repo memory (this is your edge — it makes you faster and cheaper over time):",
+  "Persistent repo memory — reuse durable knowledge when it is relevant instead of re-deriving it:",
   "- Repo memory and skills are injected below. Treat repo memory as trusted prior knowledge about THIS codebase; prefer it over re-deriving the same facts.",
   "- When you learn a durable, non-obvious fact future sessions would want — an architecture invariant, a convention, a build/test command, a gotcha, or a preference the user states — call `remember` to save it (one specific, self-contained fact in the right section). Prefer precision over brevity, but don't duplicate a fact already in memory. Don't record trivia or anything a quick file read re-derives.",
   "- Record as you go, not just when asked: the moment an investigation, edit, test run, or the user's own words reveal such a fact, `remember` it right then — the knowledge is lost when this session ends. But the bar is high in both directions: most turns teach nothing worth persisting, and recording trivia is as harmful as missing a real fact — it dilutes the signal and evicts good facts under the token budget. When unsure, don't record.",
@@ -93,7 +111,7 @@ local MEMORY_GUIDE = table.concat({
 ---The base instructions only — no memory guide, no learned memory block. This is
 ---what a read-only sub-agent gets: it can't `remember`/`use_skill`, and shipping
 ---the parent's full repo memory to every fan-out worker (5× on a parallel batch,
----cold-cached) is exactly the cost leak sub-agents exist to avoid. Honors a user
+---cold-cached) would add the same recurring context to every worker. Honors a user
 ---`system_prompt` override (string/function) just like the main prompt does.
 function M.base_system_prompt(cwd)
   local cfg = config.options.system_prompt
@@ -121,10 +139,13 @@ function M.system_prompt_parts(memory_block, cwd, frozen_base, model, harness_mo
   -- Steer toward semantic navigation (only when those tools are actually live).
   local lsp = M.lsp_guide()
   if lsp then parts[#parts + 1] = { label = "lsp guide", text = lsp } end
+  local navgraph = M.navgraph_guide()
+  if navgraph then parts[#parts + 1] = { label = "navgraph guide", text = navgraph } end
   -- Append the memory-tool instructions plus the per-repo learned context and
-  -- skills index. It rides the cached system prefix, so after the first turn it
-  -- costs ~10%, and it saves tokens by sparing the model repeated read/grep
-  -- loops to re-derive known facts. Skipped entirely when memory is disabled.
+  -- skills index. It rides the stable system prefix, making identical content
+  -- eligible for provider cache reuse; relevant facts can avoid repeated
+  -- discovery, while irrelevant ones remain recurring overhead. Skipped
+  -- entirely when memory is disabled.
   local ok, memory = pcall(require, "advantage.memory")
   if ok and memory.enabled() then
     parts[#parts + 1] = { label = "memory guide", text = MEMORY_GUIDE }
@@ -682,6 +703,8 @@ function Agent:_append_post_tool_guidance(calls)
       lines[#lines + 1] =
         "Treat every scout report as evidence, not implementation authority. Spot-check only the decisive claims in one batched source-confirmation pass, then reconcile the reports into the smallest compatible touch set and focused regression matrix. Do not re-audit the repository or implement adjacent/optional hardening."
       lines[#lines + 1] =
+        "Before adopting a scout's proposed boundary, re-derive a compact acceptance matrix from the user's original wording: retain every stated alias or mode, and vary any ordering, placement, or boundary the contract does not restrict. Turn those rows into focused regression cases. A scout may narrow the root cause and touch set, never the requested behavior."
+      lines[#lines + 1] =
         "If a scout already supplied unambiguous exact semantic source or a precise span/snippet, consume it directly. Confirm only a named ambiguity, truncation, or missing surrounding line; do not repeat the same ranges with read_file or restart a broad find/list/grep survey."
       lines[#lines + 1] =
         "Do not launch another wave for generic architecture/test surveys or review. A later scout remains available only for a new concrete blocker whose prompt depends on this evidence."
@@ -701,7 +724,7 @@ function Agent:_append_post_tool_guidance(calls)
   if self._implementation_guidance_pending then
     self._implementation_guidance_pending = false
     lines[#lines + 1] =
-      "Implementation/mutation has started. Keep the narrowest compatible fix in the parent and preserve existing contracts and passing assertions. A newly failing existing test is regression evidence: fix the implementation first; do not weaken it merely to make the suite green. Make regression tests hermetic and self-contained. Do not open a post-implementation scout wave without a specific unresolved blocker."
+      "Implementation/mutation has started. Keep the narrowest compatible fix in the parent and preserve existing contracts and passing assertions. A newly failing existing test is regression evidence: fix the implementation first; do not weaken it merely to make the suite green. Make regression tests hermetic and self-contained. For greenfield or stateful algorithm work, derive one compact independent oracle from the exact contract wording—not the implementation or a scout inference—and exercise every public mutation path plus the boundary, no-op, composition, history, and invariant partitions. For composed/batch operations, include canceling components whose final value equals the initial value: if the contract defines per-component change, history, version, or side effects, never infer operation metadata from net equality alone. Partition wrong types from invalid values whenever error classes are contractual. Raw iteration count is not semantic coverage. Do not open a post-implementation scout wave without a specific unresolved blocker."
   end
   if self._verification_failure_guidance_pending_generation then
     local generation = self._verification_failure_guidance_pending_generation
@@ -716,7 +739,7 @@ function Agent:_append_post_tool_guidance(calls)
     local generation = self._verification_guidance_pending_generation
     self._verification_guidance_pending_generation = nil
     self._verification_guided_generation = math.max(self._verification_guided_generation or 0, generation)
-    lines[#lines + 1] = ("Verification completed for edit generation %d. Inspect its status and output. If it passed, perform one bounded, read-only final diff audit: every hunk is required by the user contract, no existing assertion was weakened without explicit justification and equivalent coverage, and all tests are hermetic. Do not mechanically restore/reapply/reformat a passing patch; mutate only for one concrete violating hunk. If clean, stop now, finish the plan, and report. If one concrete issue remains, fix it and rerun the affected suite once; do not start generic review scouts."):format(
+    lines[#lines + 1] = ("Verification completed for edit generation %d. Inspect its status and output. If it passed, perform one bounded, read-only final diff-and-contract audit: every hunk is required by the user contract, no existing assertion was weakened without explicit justification and equivalent coverage, all tests are hermetic, and the verification oracle covers every stated contract partition—including canceling compositions and promised error taxonomy—rather than reflecting an unstated assumption or only a high operation count. Do not mechanically restore/reapply/reformat a passing patch; mutate only for one concrete violating hunk. If clean, stop now, finish the plan, and report. If one concrete issue remains, fix it and rerun the affected suite once; do not start generic review scouts."):format(
       generation
     )
   end

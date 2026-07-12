@@ -15,10 +15,28 @@ feeds on the fallout, and keeps swinging until the task is dead.
   loop**, and every mutation is gated behind a permission card with a real diff.
 - **Semantic code navigation (LSP).** `document_symbols`, `goto_definition`,
   `find_references`, `hover`, `workspace_symbol` — the model traverses your code
-  through the **language servers your editor already runs**, finding a definition,
-  every call site, a file's outline or a type signature in a handful of tokens
-  instead of grepping and reading whole files. This is the single biggest token
-  saver here and something a CLI harness structurally can't do.
+  through the **language servers your editor already runs**. When a server is
+  attached, exact definitions, references, outlines, and types can avoid broad
+  grep-and-read discovery loops.
+- **Optional NavGraph navigation.** Enable the first-class `navgraph` tool to
+  give both the parent and read-only scouts bounded symbol, call, reference,
+  import, route, path, and hot-spot queries. It executes argv directly
+  (never a shell), fixes the root to the project, disables cache writes, rejects
+  Git-backed history/diff, mutating/server commands, and external reads, and
+  stays out of the baseline schema when disabled or unavailable. Once enabled
+  and executable, both the parent and read-only scouts automatically receive
+  the typed tool plus a conditional routing guide. The model still decides
+  whether to call it and is instructed to abstain for known-file and greenfield
+  work; availability never forces a ceremonial query. `--no-cache`
+  means each call reindexes: a deliberate no-workspace-writes tradeoff on very
+  large repositories. A selected call runs the configured external executable,
+  so trust it and prefer an absolute pin to prevent PATH shadowing.
+  Compact name-only discovery and one-shot full-definition source are the
+  defaults. Typed command options, focused-query validation, merged line-range
+  caps, and replay-safe receipt aging keep graph evidence from accumulating
+  beside ordinary reads or being replayed for the rest of the conversation.
+  Claude's signed tool continuations remain byte-identical until their current
+  tool loop closes; aging then resumes without risking an Anthropic 400.
 - **A UI that respects your colorscheme.** No hardcoded palette: the panel is a
   quiet surface a few percent off your background, the prompt a slightly deeper
   field with a `❯` gutter caret, and the accent, washes and dim tones are all
@@ -40,49 +58,101 @@ I'll look at the current flag handling first.
 Added the flag and threaded it through the formatter…
 ```
 
-## Benchmark — harness quality vs. Claude Code
+## Benchmark — exact Advantage, NavGraph quality regression
 
-A recurring worry with an in-editor harness is that its own agent loop (its
-system prompt, tools, and context/compaction machinery) might be *worse* than a
-mature CLI harness. So we measured it: advantage's real agent loop, driven
-headlessly, against the **Claude Code agent loop** — **same model** (Opus 4.8,
-8k-token thinking budget), **same fixtures**, **same task prompt**, graded by
-identical hidden test suites. Each grader was validated first (a correct
-reference implementation scores 1.0; an empty stub scores 0.0).
+On 12 July 2026, the quality-hardened harness ran a fresh, balanced eight-cell
+matrix: four hidden-graded tasks under Advantage and the same four with NavGraph
+available. Every first attempt completed normally using `openai/gpt-5.6-sol` at
+`xhigh` through one ChatGPT login. Default Codex was intentionally **not
+rerun**; its validated 11 July artifacts remain an immutable cross-epoch
+reference, not a contemporaneous control.
 
-Three deliberately hard, objectively-scored fixtures:
+| Harness | Epoch | Hidden score | Exact | Completed | Gross input | Cached | Uncached | Output | Reasoning¹ | Requests | Elapsed |
+|---|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|
+| **Advantage** | 12 Jul · fresh | **400/400** | **4/4** | 4/4 | **2,905,539** | **2,284,032** | 621,507 | 74,951 | 27,177 | **128** | **23.88m** |
+| **Advantage + NavGraph** | 12 Jul · fresh | 370/400 | 3/4 | 4/4 | 5,693,505 | 5,061,632 | 631,873 | 97,762 | 31,787 | 156 | 31.38m |
+| **Default Codex reference** | 11 Jul · retained | **400/400** | **4/4** | 4/4 | 6,531,475 | 6,201,856 | **329,619** | **69,039** | **24,627** | — | 31.36m |
 
-| Fixture | What it stresses | advantage.nvim | Claude Code |
-| --- | --- | :---: | :---: |
-| **SQL engine** — 4 files, 6 planted bugs (49-case grader) | multi-file navigation + iterative debugging | **1.000** | **1.000** |
-| **Regex engine** — from scratch (562-case fuzz vs Python `re`) | algorithm design + self-testing loop | **0.998** | **0.998** |
-| **Piece-table buffer** — undo/redo (28,957-check fuzz) | index math + test-driven iteration | **1.000** | **1.000** |
+Standard Advantage now matches retained Codex's exact **400/400** while using
+**55.5% less gross input** and **23.8% less wall time**. Its uncached input was
+88.6% higher and output 8.6% higher. Those Codex ratios are descriptive only:
+the task inputs, model, effort, and timeout match, but date, account load/cache,
+plugin, and runner epochs do not.
 
-**The two harnesses were indistinguishable in quality.** Even the single regex
-miss (a `.`-vs-newline spec edge case) was identical on both. advantage matched
-Claude Code here *without a language server attached* in headless mode — i.e.
-without its biggest structural advantage.
+The NavGraph condition did not preserve quality and is not eligible for an
+efficiency claim. Relative to the contemporaneous Advantage control it scored
+30 points lower, used **96.0% more gross input**, 1.7% more uncached input, 21.9%
+more requests, and 31.4% more wall time.
 
-Output tokens generated per task — the model's actual generation cost, and the
-one token metric that's cleanly comparable across harnesses (input on both sides
-is dominated by prompt-cache reads, so it's left out):
+Each task cell is `hidden score · gross input · elapsed`.
 
-| Fixture | advantage.nvim | Claude Code |
-| --- | :---: | :---: |
-| SQL engine | **5.6k** | 16.4k |
-| Regex engine | **12.2k** | 28.8k |
-| Piece-table | **1.4k** | 7.0k |
+| Task | Advantage · fresh | Advantage + NavGraph · fresh | Default Codex · retained 11 Jul |
+|---|---:|---:|---:|
+| NG-SCOPE | **100/100** · **926,755** · **5.92m** | 70/100 · 2,072,324 · 10.18m | 100/100 · 2,821,288 · 10.22m |
+| NG-CLI | **100/100** · 817,304 · 5.07m | **100/100** · **613,240** · **4.34m** | 100/100 · 1,025,566 · 3.98m |
+| NG-POLYGLOT | **100/100** · **938,796** · **6.47m** | **100/100** · 2,828,588 · 11.63m | 100/100 · 2,427,190 · 7.42m |
+| PIECE-TABLE | **100/100** · 222,684 · 6.43m | **100/100** · **179,353** · **5.23m** | 100/100 · 257,431 · 9.74m |
 
-Same quality, and advantage reached it with **2–5× fewer generated tokens** on
-every task.
+### What changed—and what still failed
 
-**Compaction stress test.** The one place an in-editor harness could plausibly
-lose ground is context compaction (Claude Code has native long context;
-advantage summarizes old history). Forcing the LLM summarizer to fire
-aggressively mid-task (tiny recent-message window) triggered two real
-summarizations that discarded the early file reads — and advantage **still scored
-1.000** on the multi-file SQL task. The compaction machinery does not drop
-task-critical state.
+The contract-preservation fix reproduced: both NG-CLI arms passed all nine
+hidden cases, including `-h` after positional arguments. The stateful-oracle
+fix also reproduced: both PieceTable arms passed all **57/57** cases, including
+canceling batches and error taxonomy.
+
+NG-SCOPE exposed a different orchestration defect. NavGraph returned accurate
+structural evidence and its scouts used 44.7% less gross input than control
+scouts. The parent nevertheless created a parallel transient `JsLocal`
+representation instead of extending the existing canonical binding state. It
+tested absent references but not persisted untyped parameter/local bindings,
+then broadened into unrelated query work. The treatment therefore missed the
+two untyped-binding hidden cases. Direct graph process time was only 271ms;
+97.1% of the extra elapsed time accumulated after the scout wave.
+
+NG-POLYGLOT is the other dominant aggregate movement: the treatment correctly
+made no NavGraph call, yet its parent took 21 additional requests and 1.89M more
+gross tokens. That cell is ordinary stochastic orchestration/schema-condition
+variance, not semantic retrieval efficacy.
+
+### NavGraph lifecycle
+
+Use remained model-selected. NavGraph was adopted in NG-SCOPE and NG-CLI and
+correctly abstained in NG-POLYGLOT and greenfield PieceTable. Every selection
+came from a scout; parents made zero calls.
+
+| Task | Status | Selected | Spawned / successful | Validation rejects | Commands selected | Process time |
+|---|---|---:|---:|---:|---|---:|
+| NG-SCOPE | adopted | 12 | 6 / 6 | 6 | `files` ×2, `outline` ×4, `read` ×6 | 271ms |
+| NG-CLI | adopted | 9 | 5 / 5 | 4 | `outline` ×2, `read` ×4, `strings` ×3 | 281ms |
+| NG-POLYGLOT | abstained | 0 | 0 / 0 | 0 | — | 0ms |
+| PIECE-TABLE | abstained | 0 | 0 / 0 | 0 | — | 0ms |
+
+All **21/21** model selections reached the adapter. Eleven processes completed
+successfully with zero wrapper failures in 552ms and returned 14,227 stdout
+bytes. Ten calls were rejected before spawn—nine oversized `read` ranges and
+one other invalid input—so routing quality still needs work. Scout gross input
+fell 25.0%, but parent gross input rose 131.0%; non-NavGraph tool calls also
+increased by 12. NavGraph therefore did not produce aggregate substitution in
+this run.
+
+### Method and limits
+
+The matrix used a balanced order, one first attempt per task and arm, a
+1,200-second cap, an empty-home `bwrap` sandbox, and deterministic post-run
+graders with no LLM judge. Prompt, seed, task suite, plugin, runner, and pinned
+pre-reference-fix NavGraph binary identities were frozen. All **34/34** matrix
+integrity checks, the strict first-attempt/dynamic-guidance audit, and all
+**19/19** retained-Codex checks passed. No compactor request occurred.
+
+This is one stochastic repetition per task, not a confidence interval. Gross
+input includes cached input; reasoning is already included in output. The
+machine-readable source of truth and every prompt, patch, grade, request ledger,
+tool trace, and lifecycle record are in
+[`2026-07-12-quality-hardened-pair-xhigh`](.benchmarks/harness_compare/results/2026-07-12-quality-hardened-pair-xhigh).
+The earlier 12 July matrix and focused probes remain archived but are deprecated
+as headline evidence.
+
+¹ Reasoning tokens are already included in output tokens.
 
 ## Requirements
 
@@ -92,6 +162,8 @@ task-critical state.
   and/or [`codex`](https://github.com/openai/codex) CLI — or
   `$ANTHROPIC_API_KEY` / `$OPENAI_API_KEY`
 - `ripgrep` (optional, for fast `grep` / `find_files`)
+- [`NavGraph`](https://github.com/mengsig/NavGraph) (optional, for the opt-in
+  `navgraph` tool; pin an absolute executable path for reproducible environments)
 - a language server per language (optional but recommended — powers the semantic
   navigation tools and the edit diagnostics loop; see the suggested list below)
 
@@ -249,53 +321,14 @@ without changing the harness. `auto` follows the active effort.
 `subagents.parallel = false` keeps every harness mode sequential, while
 `max_parallel` remains a concurrency width rather than a spawn quota.
 
-## Advantage vs default Codex benchmark
-
-On 10 July 2026, Advantage and the default Codex CLI harness were run against
-the same four difficult, deterministic hidden-graded tasks. Both used
-`openai/gpt-5.6-sol` at `xhigh` effort through the same ChatGPT/Codex login.
-
-| Harness | Hidden score | Completed | Gross input | Cached input | Uncached input | Output | Reasoning¹ | Elapsed |
-|---|---:|---:|---:|---:|---:|---:|---:|---:|
-| **Advantage** | **400/400** | **4/4** | **3,765,986** | 2,899,712 | 866,274 | 102,279 | 47,181 | 42.67m |
-| **Default Codex** | **400/400** | **4/4** | 9,163,342 | 8,740,864 | **422,478** | **97,772** | **45,588** | **36.92m** |
-
-Advantage matched Codex on hidden accuracy and normal completion while using
-**58.9% less gross replayed input**. Codex remained **15.6% faster overall** and
-used less uncached input: Advantage consumed 2.05× Codex's uncached input. The
-different cache-hit rates—77.0% for Advantage and 95.4% for Codex—mean gross and
-uncached input should be considered together.
-
-| Task | Advantage score | Codex score | Advantage time | Codex time | Advantage gross input | Codex gross input |
-|---|---:|---:|---:|---:|---:|---:|
-| NG-SCOPE | 100/100 | 100/100 | **13.77m** | 16.37m | **1,294,049** | 5,030,328 |
-| NG-CLI | 100/100 | 100/100 | 7.10m | **4.62m** | **1,033,485** | 1,474,123 |
-| NG-POLYGLOT | 100/100 | 100/100 | 10.25m | **7.18m** | **1,160,770** | 2,175,972 |
-| PIECE-TABLE | 100/100 | 100/100 | 11.54m | **8.75m** | **277,682** | 482,919 |
-
-The protocol used fresh isolated Git seeds, hidden post-run graders, alternating
-execution order, a 20-minute cap per run, and no LLM judge. Default Codex had its
-native multi-agent feature enabled but chose no child agents on these four scored
-tasks. Gross input includes the provider-reported cached subset; reasoning is a
-subset of output, not an additional token category.¹
-
-This is an engineering comparison with one selected successful Advantage sample
-per task, not a confidence-bounded statistical study. The selected NG-CLI sample
-is the successful recovery run after a retained first-attempt provider-overload
-failure. Shared-subscription latency and prompt-cache warmth can affect timing.
-The later provider-affinity and shorter-scout hardening has not yet been rerun as
-a complete four-task matrix.
-
-¹ Reasoning tokens are already included in output tokens.
-
 **Usage dashboard.** `/usage` (or `:Advantage usage`, `<leader>cu`) shows
-session/today/7-day token totals, cache savings (cached input bills at ~10%, and
-the dashboard shows how much that saved you), a sparkline, your current pace, a
-projection to midnight, and — if you set `usage.daily_budget` — the time you'll
-run out at the current pace. A `harness` line reports what the repo memory
-injects per turn and how many tokens the on-demand skill design saved versus
-inlining every skill body into every request — so the harness's token thesis is
-measured, not asserted.
+session/today/7-day token totals, provider-reported cache reuse, a sparkline,
+your current pace, a projection to midnight, and — if you set
+`usage.daily_budget` — the time you'll run out at the current pace. A `harness`
+line reports what repo memory injects per turn and the counterfactual context
+avoided by loading skill bodies on demand instead of inlining every skill into
+every request. Actual billing and cache discounts depend on the active provider,
+transport, model, and account.
 
 **Context compaction.** Old transcript history is automatically compacted when
 its estimated size (roughly chars/4) crosses a threshold that **scales to the
@@ -304,8 +337,9 @@ context.compact_at_tokens, window − output allowance − system/tool schemas �
 context.request_safety_tokens)`. For OpenAI, `window` is selected from
 `context_window` (ChatGPT/Codex login) or `api_context_window` (raw API key).
 The fraction protects a small-window model (it
-compacts before it overflows) while `compact_at_tokens` is an absolute **cost
-ceiling** so a 1M-context model never carries ~750k raw tokens every turn. The
+compacts before it overflows) while `compact_at_tokens` is an absolute recurring
+**context ceiling** that helps prevent very large histories from being replayed
+on every turn. The
 newest messages stay verbatim — bounded by both `keep_recent_messages` and a
 token budget (`keep_recent_fraction` of the threshold) so a few huge tool
 outputs can't keep the retained window above the threshold; older user asks,
@@ -339,6 +373,9 @@ runs in one of two modes:
   `context.compact_mode = "heuristic"` to make that the default everywhere.
   Messages submitted while manual compaction is running enter the normal queue
   and dispatch automatically once the compacted transcript is safely adopted.
+  During an active Claude extended-thinking tool continuation, receipt mutation
+  and compaction wait until the assistant closes that continuous tool turn; the
+  latest signed thinking blocks and preceding context must remain unmodified.
 
 **Semantic navigation (LSP).** advantage exposes the language servers your editor
 already runs as read-only tools, so the agent navigates code *semantically*
@@ -354,9 +391,8 @@ instead of grepping and reading whole files:
 - `hover` — the type signature and doc for a symbol at a position.
 - `workspace_symbol` — find a symbol by name anywhere in the repo.
 
-Each hop costs a handful of tokens instead of a grep-plus-read-the-results loop —
-the biggest token lever in the harness, and one a CLI-only agent structurally
-can't pull. All are read-only (no permission card) and automatically available to
+When the target is resolvable, a semantic hop can replace a broader
+grep-plus-read-the-results loop. All are read-only (no permission card) and automatically available to
 sub-agents. Requests are async with a bounded timeout, so a slow server never
 freezes the editor — and because the *first* request to a freshly-opened file
 often times out while the server builds its initial index, a timed-out request
@@ -507,7 +543,7 @@ run on a **lean context**: they get the base instructions (and the read-only too
 including the LSP navigation tools) but **not** the repo-memory block or skills
 index — a scout can't `remember`/`use_skill` anyway, and re-shipping the full
 learned context to every worker (and to each worker of a parallel fan-out,
-cold-cached) is exactly the token leak fan-out exists to avoid. Their returned
+cold-cached) would add the same recurring context to every worker. Their returned
 report is size-capped before it's spliced into the parent transcript, so a chatty
 worker can't bloat the parent's context. Scouts are steered to stay under roughly
 900 words, and each returned report is hard-capped at 6,000 bytes. Ordinary
@@ -541,16 +577,18 @@ can never change the task or authorize tools. Both tools are read-only and
 available to sub-agents; no API key is required for `web_fetch`.
 
 **Repo memory & skills (self-learning harness).** advantage keeps a lightweight,
-per-repo memory so the agent gets *better and cheaper* at your codebase over time.
+per-repo memory so the agent can reuse durable knowledge instead of rediscovering
+it in every session.
 
 - As it works, the agent calls a `remember` tool to save durable, non-obvious
   facts — architecture invariants, conventions, build/test commands, gotchas, or
   a preference you state ("always run the linter before committing"). You can also
   just tell it to remember something. Facts are deduplicated and kept under a token
   budget so the file never bloats.
-- Memory is rendered into the **cached** system prefix, so after the first turn it
-  costs ~10% — and it *saves* tokens by sparing the model repeated read/grep loops
-  to re-derive what it already learned.
+- Memory is rendered into a stable system prefix that is eligible for provider
+  cache reuse. A concise, relevant fact can avoid repeated read/grep discovery;
+  an irrelevant fact is recurring context overhead, which is why the block is
+  strictly budgeted.
 - **Two tiers by cost.** `context.md` is the *always-loaded* tier — crisp one-line
   signposts and load-bearing invariants, held to `memory.budget_tokens`. **Depth**
   lives in **skills** (below): unbounded storage at ~one index line of always-loaded
@@ -735,6 +773,13 @@ require("advantage").setup({
                                  -- to attach (tsserver/vtsls/jdtls in a big project)
       max_results = 60,          -- cap on symbols / references / matches per call
     },
+    navgraph = {                 -- optional first-class semantic graph navigator
+      enabled = false,           -- schema stays absent unless enabled + executable
+      executable = "navgraph",   -- PATH command or pinned absolute executable
+      timeout_ms = 30000,
+      max_results = 80,          -- outline/search default lower; model cannot exceed this
+      max_output_bytes = 12000,  -- final guard after compact result shaping
+    },
     web_search = {               -- Brave API, then public Brave/Bing fallback
       enabled = true,
       backend = "auto",          -- "auto" | "brave_api" | "brave_html"
@@ -758,7 +803,7 @@ require("advantage").setup({
   context = {
     auto_compact = true,
     compact_fraction = 0.75,     -- compact at this % of the model's context_window
-    compact_at_tokens = 200000,  -- absolute cost ceiling on that trigger (chars/4)
+    compact_at_tokens = 200000,  -- absolute recurring-context ceiling (chars/4 estimate)
     request_safety_tokens = 8192, -- beyond output + system/tool reservations
     keep_recent_messages = 16,   -- newest kept verbatim, also bounded by:
     keep_recent_fraction = 0.4,  -- recent window kept, as a % of the threshold

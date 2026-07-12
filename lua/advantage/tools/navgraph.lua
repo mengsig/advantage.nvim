@@ -331,7 +331,7 @@ return function(tool)
         target
       )
     end,
-    description = "Use only when a code location or relationship is unknown; skip known-file and greenfield work. Replace broad discovery with one compact files/outline or single identifier-name search (never a prose query), then def for exact full source or read with explicit closed ranges whose combined unique lines fit limit. Do not duplicate it with broad reads or same-area scouts. Impact results are evidence, not an edit list. Fall back to one narrow read_file only for ambiguity, truncation, parse-health, or surrounding context.",
+    description = "Optional semantic discovery for an unknown code location or relationship; never call it merely because available. Choose it instead of parallel LSP/grep/read/scout discovery for that question. Use one compact files/outline or identifier-name search, then def for exact source or read with explicit closed ranges. Command targets are positional facts, never language/topics, prose requests, CLI flags, or command concepts. Switch routes only after explicit no-match, ambiguity, truncation, parse-health, or non-retryable operational failure. Skip known-file and greenfield work; impact results are evidence, not an edit list.",
     input_schema = {
       type = "object",
       properties = {
@@ -342,7 +342,7 @@ return function(tool)
         },
         target = {
           type = "string",
-          description = "One symbol/name pattern/path/filter or bounded read file:A-B[,C-D], never a prose question. Read ranges must be closed and their total unique lines must fit limit. Required for outline/def/calls/callers/search/routes/events/neighbors/imports/importers/path/read/strings; name@path disambiguates.",
+          description = "Command-specific positional: files=repository path filter only (omit target to list all; never a language/topic); outline=path; search=one identifier/name pattern; strings=literal substring from string contents; routes/events=route/event-key filter; imports/importers=repository path filter; def/calls/callers/neighbors=symbol or name@path; path=start symbol plus destination; read=path:A-B[,C-D]. Never pass prose requests, CLI flags/options, or desired command concepts. Read ranges must be closed and fit limit.",
         },
         destination = {
           type = "string",

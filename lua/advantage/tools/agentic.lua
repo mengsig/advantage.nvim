@@ -124,7 +124,7 @@ return function(tool, s)
     name = "todo_write",
     safe = true,
     parent_only = true, -- a read-only sub-agent has no business keeping the plan
-    description = "Maintain your task list for multi-step work. Replaces the whole list each call: plan the steps before starting, then keep statuses current as you work (exactly one item in_progress at a time). Skip it for trivial single-step tasks.",
+    description = "Maintain your task list for multi-step work. Replaces the whole list each call: plan before starting, then keep statuses current. Use exactly one in_progress item while work is underway; use none only for an all-pending initial plan or an all-completed final plan. Skip it for trivial single-step tasks.",
     input_schema = {
       type = "object",
       properties = {
@@ -155,6 +155,13 @@ return function(tool, s)
       local items = input.items
       if type(items) ~= "table" or #items == 0 then
         return cb("items must be a non-empty array of {content, status}", true)
+      end
+      local active = 0
+      for _, item in ipairs(items) do
+        if item.status == "in_progress" then active = active + 1 end
+      end
+      if active > 1 then
+        return cb("todo_write accepts at most one in_progress item; mark the remaining steps pending", true)
       end
       ctx.todos = items
       local lines, done = {}, 0

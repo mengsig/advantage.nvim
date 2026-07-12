@@ -639,6 +639,32 @@ do
   config.options.tools.navgraph.executable = executable
   local schema = has_schema("navgraph")
   check(schema ~= nil, "an enabled, executable NavGraph pin exposes the tool")
+  local agent_mod = require("advantage.agent")
+  local navgraph_guide = agent_mod.navgraph_guide()
+  check(
+    navgraph_guide
+      and navgraph_guide:find("Unknown cross%-file")
+      and navgraph_guide:find("Known file/line")
+      and navgraph_guide:find("Literal prose")
+      and navgraph_guide:find("greenfield")
+      and navgraph_guide:find("ONE owner", 1, true)
+      and navgraph_guide:find("Never call NavGraph merely", 1, true)
+      and navgraph_guide:find("repository path filter", 1, true)
+      and navgraph_guide:find("literal substring", 1, true)
+      and navgraph_guide:find("route/event-key filters", 1, true)
+      and navgraph_guide:find("language/topic", 1, true)
+      and navgraph_guide:find("CLI flag", 1, true)
+      and navgraph_guide:find("Switch routes only", 1, true),
+    "enabled NavGraph receives a conditional semantic-routing guide rather than a mandatory-use prompt"
+  )
+  local navgraph_part, scout_navgraph_prompt = false, require("advantage.subagent")._system_prompt(2, repo)
+  for _, part in ipairs(agent_mod.system_prompt_parts(nil)) do
+    if part.label == "navgraph guide" then navgraph_part = true end
+  end
+  check(
+    navgraph_part and scout_navgraph_prompt:find("Semantic discovery routing", 1, true),
+    "the same conditional NavGraph routing guide reaches parent and scout prompts"
+  )
   local enum = schema and schema.input_schema.properties.command.enum or {}
   local properties = schema and schema.input_schema.properties or {}
   check(
@@ -666,6 +692,17 @@ do
       and not properties.detail
       and not properties.args,
     "navgraph exposes live-bounded typed targeting instead of raw argv"
+  )
+  check(
+    schema.description:find("never call it merely", 1, true)
+      and schema.description:find("instead of parallel", 1, true)
+      and properties.target.description:find("files=repository path filter", 1, true)
+      and properties.target.description:find("search=one identifier/name", 1, true)
+      and properties.target.description:find("strings=literal substring", 1, true)
+      and properties.target.description:find("routes/events=route/event%-key")
+      and properties.target.description:find("imports/importers=repository path filter", 1, true)
+      and properties.target.description:find("CLI flags/options", 1, true),
+    "NavGraph schema teaches optional single-route use and command-specific positional contracts"
   )
   check(
     tools.validate_input("navgraph", { command = "search", target = "resolve", destination = "" }) == nil,
@@ -1178,6 +1215,12 @@ do
   )
 
   config.options.tools.navgraph = saved
+  check(require("advantage.agent").navgraph_guide() == nil, "NavGraph guide disappears when the tool is disabled")
+  check(
+    not require("advantage.agent").system_prompt(nil, repo):find("NavGraph", 1, true)
+      and not require("advantage.subagent")._system_prompt(2, repo):find("NavGraph", 1, true),
+    "disabled NavGraph leaves neither its tool guidance nor a dangling parent/scout prompt reference"
+  )
   vim.env.ADV_NAVGRAPH_TEST_LOG = old_log
   vim.fn.delete(tmp, "rf")
 end
@@ -5095,6 +5138,15 @@ do
     { "validat", "reconcil", "synth" },
   }), "scout-wave reminder treats reports as evidence to reconcile rather than implementation authority")
   check(phase_seen[2] and has_all_concepts(table.concat(phase_seen[2], "\n"), {
+    { "original wording", "user's original", "user contract" },
+    { "acceptance matrix", "behavior matrix", "regression matrix" },
+    { "alias", "mode" },
+    { "ordering", "placement", "boundary" },
+    { "does not restrict", "not restrict", "unrestricted" },
+    { "focused regression" },
+    { "never the requested behavior", "not the requested behavior" },
+  }), "post-scout synthesis preserves the full user contract across aliases and unrestricted input boundaries")
+  check(phase_seen[2] and has_all_concepts(table.concat(phase_seen[2], "\n"), {
     { "exact semantic source", "precise span" },
     { "consume it directly" },
     { "ambiguity", "truncation" },
@@ -5141,6 +5193,29 @@ do
     { "hermetic", "self-contained test", "isolated test" },
   }), "mutation reminder keeps the fix compatible, preserves assertions, and requests hermetic regression coverage")
   check(
+    phase_seen[4]
+      and has_all_concepts(phase_seen[4][3], {
+        { "greenfield", "stateful algorithm" },
+        { "independent oracle", "reference model" },
+        { "exact contract wording", "user contract" },
+        { "scout inference", "report assumption" },
+        { "every public mutation", "each public mutation" },
+        { "boundary" },
+        { "no-op", "noop" },
+        { "composition", "composed" },
+        { "canceling components", "cancelling components" },
+        { "final value equals", "net equality" },
+        { "operation metadata", "history", "version", "side effects" },
+        { "wrong types", "wrong value types" },
+        { "invalid values", "invalid value" },
+        { "error classes", "error taxonomy" },
+        { "history" },
+        { "invariant" },
+        { "iteration count is not", "operation count is not" },
+      }),
+    "mutation reminder makes algorithmic self-tests cover semantic partitions instead of merely increasing random iterations"
+  )
+  check(
     phase_seen[5] and #verification_reminders(phase_seen[5]) == 1,
     "first passing verification emits one reminder for the first edit generation"
   )
@@ -5168,10 +5243,16 @@ do
       { "audit", "review" },
       { "bounded", "single", "one" },
       { "read-only", "read only" },
+      { "oracle", "reference model" },
+      { "every stated contract partition", "all stated contract partitions" },
+      { "canceling compositions", "cancelling compositions" },
+      { "error taxonomy", "error classes" },
+      { "unstated assumption", "implementation-derived" },
+      { "operation count", "iteration count" },
       { "do not mechanically restore", "do not restore", "do not reapply" },
       { "stop", "finish" },
     }),
-    "successful-generation reminder directs one bounded diff audit and then stops"
+    "successful-generation reminder audits the diff and contract coverage before stopping"
   )
 
   local guard_turn = 0
@@ -5714,6 +5795,35 @@ do
   })
   check(e == false and assert(r):find("1/3 done", 1, true), "todo_write tracks completion")
   check(type(ctx.todos) == "table" and #ctx.todos == 3, "todo list stored on the agent context")
+
+  local previous_todos = ctx.todos
+  r, e = run("todo_write", {
+    items = {
+      { content = "step one", status = "in_progress" },
+      { content = "step two", status = "in_progress" },
+    },
+  })
+  check(
+    e == true and assert(r):find("at most one in_progress", 1, true),
+    "todo_write rejects ambiguous plans with multiple active steps"
+  )
+  check(ctx.todos == previous_todos, "a rejected todo update preserves the prior plan")
+
+  r, e = run("todo_write", {
+    items = {
+      { content = "step one", status = "pending" },
+      { content = "step two", status = "pending" },
+    },
+  })
+  check(e == false, "todo_write permits an all-pending plan before work starts")
+  r, e = run("todo_write", {
+    items = {
+      { content = "step one", status = "completed" },
+      { content = "step two", status = "completed" },
+    },
+  })
+  check(e == false and assert(r):find("2/2 done", 1, true), "todo_write permits an all-completed plan")
+
   r, e = run("todo_write", { items = {} })
   check(e == true, "todo_write rejects an empty list")
 

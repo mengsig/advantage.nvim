@@ -37,8 +37,8 @@ end
 ---A sub-agent gets the BASE instructions only — deliberately NOT the parent's
 ---repo-memory block or skills index. A read-only scout can't call
 ---`remember`/`use_skill` anyway, and re-shipping the full learned context to
----every worker (and 5× on a parallel fan-out, each cold-cached) is the exact
----token leak the sub-agent design is meant to avoid. The parent already digested
+---every worker (and 5× on a parallel fan-out, each cold-cached) would add the
+---same recurring context to every scout. The parent already digested
 ---memory and wrote a specific task prompt; that carries the context the scout needs.
 ---@param max_turns integer the sub-agent's total turn budget (constant for the run)
 local function system_prompt(max_turns, cwd)
@@ -51,6 +51,11 @@ local function system_prompt(max_turns, cwd)
   if lsp then
     lines[#lines + 1] = ""
     lines[#lines + 1] = lsp
+  end
+  local navgraph = agent.navgraph_guide()
+  if navgraph then
+    lines[#lines + 1] = ""
+    lines[#lines + 1] = navgraph
   end
   local research = {}
   for _, definition in ipairs(readonly_tools()) do
@@ -80,6 +85,7 @@ local function system_prompt(max_turns, cwd)
   })
   return table.concat(lines, "\n")
 end
+M._system_prompt = system_prompt
 
 local function run_tool_call(call, ctx, s, cb)
   if s.cancelled then return end
