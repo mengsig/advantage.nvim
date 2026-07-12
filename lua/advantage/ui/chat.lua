@@ -1117,6 +1117,10 @@ function M.confirm(preview, cb)
     done = true
     cb(what, comment)
   end
+  -- The prompt is submitted from insert mode, and nvim_open_win carries that
+  -- mode into the float — so force normal mode, letting the single-key a/y/d
+  -- decision maps fire immediately without an extra <Esc>.
+  vim.cmd.stopinsert()
   local buf
   win, buf = M.float({
     title = preview.title or "allow?",
