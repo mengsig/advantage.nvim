@@ -153,6 +153,7 @@ Full defaults live in `lua/advantage/config.lua`. Key options: >lua
         navgraph = {              -- optional external semantic navigator
           enabled = false,        -- schema stays unchanged unless opted in
           executable = "navgraph", -- or a pinned absolute executable path
+          allow_legacy_benchmark = false, -- opt into exact-SHA benchmark fallback
           timeout_ms = 30000,
           max_results = 80,
           max_output_bytes = 12000,
@@ -336,8 +337,14 @@ instructions inside a page never become agent instructions. Both tools are safe
 API search requires `$BRAVE_API_KEY` or `tools.web_search.api_key`.
 
 NavGraph integration is deliberately opt-in. Set
-`tools.navgraph.enabled = true`; the tool appears only when its configured
-`executable` is executable. This safe tool is auto-approved, so enabling it
+`tools.navgraph.enabled = true`; the tool appears only after its configured
+`executable` passes the `navgraph.capabilities.v1` / agent-protocol handshake.
+Advantage negotiates once per stable executable identity, freezes a deterministic
+read-only intersection, and fails closed with one diagnostic when the contract
+is malformed or incompatible. The pre-contract `84986b8` benchmark binary is
+accepted only by its exact SHA-256 and can be disabled with
+`allow_legacy_benchmark = false`; arbitrary old binaries are never guessed.
+This safe tool is auto-approved, so enabling it
 trusts that external executable; prefer a pinned absolute path for reproducible
 environments and to prevent PATH shadowing. The parent and read-only scouts
 receive the same conservative query-only command set. Each invocation is a
@@ -352,6 +359,19 @@ other exit-1 diagnostics are reported as operational errors. Forcing
 `--no-cache` means every call reindexes; this deliberately trades latency on
 very large repositories for no workspace writes, so avoid redundant parallel
 queries.
+
+Current NavGraph advertises a compact typed MCP `navgraph.query` surface. This
+release records that capability but still executes the conservative one-shot CLI
+adapter described here; typed MCP session/reload/pagination adoption remains a
+separate integration step.
+
+Leading-hyphen positional data is exposed only when the executable passes a
+`--` terminator probe; for example, `strings` may then search for literal
+`--no-tests` without interpreting it as an option. Oversized valid `read`
+selections return a deterministic ascending prefix with explicit partial-result
+metadata. Indexed commands require and receive `--no-cache`; a command whose
+manifest declares both `requiresIndex = false` and `cacheEffect = "none"` may
+omit that unsupported flag while remaining inside the read-only intersection.
 
 The tool interface is typed: `target` is one symbol/name pattern/path/filter,
 `destination` is the second symbol for `path`, and `limit`, `depth`, `kind`,

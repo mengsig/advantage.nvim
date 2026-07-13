@@ -125,9 +125,10 @@ M.defaults = {
       ---latency; scouts and summarizers disable it automatically because they
       ---discard thinking output.
       reasoning_summary = "auto", -- "auto" | "concise" | "detailed" | false
-      ---Some subscription streams return a retryable overload/transport event
-      ---inside HTTP 200 SSE. Retry only when no text/thinking/tool payload was
-      ---delivered, so recovery can never duplicate visible work or tool calls.
+      ---Some subscription streams return a retryable overload/transport or
+      ---explicit provider-advised failure inside HTTP 200 SSE. Retry only when
+      ---no text/thinking/tool payload was delivered, so recovery can never
+      ---duplicate visible work or tool calls.
       stream_error_retries = 2,
       stream_error_retry_base_ms = 2000,
     },
@@ -220,6 +221,10 @@ M.defaults = {
       ---A PATH command or an absolute executable path. Absolute paths make
       ---benchmarks and managed installations deterministic.
       executable = "navgraph",
+      -- Exact-hash compatibility for the frozen 84986b8 benchmark binary,
+      -- which predates `navgraph capabilities`. Disabled by default; unknown
+      -- legacy builds fail closed even when explicitly enabled.
+      allow_legacy_benchmark = false,
       timeout_ms = 30000, -- hard per-call ceiling (allowed range: 100..300000)
       max_results = 80, -- hard cap; discovery commands use smaller compact defaults
       max_output_bytes = 12000, -- final byte ceiling after result shaping (max: 1 MiB)
@@ -691,6 +696,9 @@ local function validate(o)
     elseif type(navgraph) == "table" then
       if navgraph.enabled ~= nil and type(navgraph.enabled) ~= "boolean" then
         errs[#errs + 1] = "tools.navgraph.enabled must be boolean"
+      end
+      if navgraph.allow_legacy_benchmark ~= nil and type(navgraph.allow_legacy_benchmark) ~= "boolean" then
+        errs[#errs + 1] = "tools.navgraph.allow_legacy_benchmark must be boolean"
       end
       if
         navgraph.executable ~= nil

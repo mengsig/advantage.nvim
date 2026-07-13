@@ -27,10 +27,18 @@ feeds on the fallout, and keeps swinging until the task is dead.
   and executable, both the parent and read-only scouts automatically receive
   the typed tool plus a conditional routing guide. The model still decides
   whether to call it and is instructed to abstain for known-file and greenfield
-  work; availability never forces a ceremonial query. `--no-cache`
-  means each call reindexes: a deliberate no-workspace-writes tradeoff on very
-  large repositories. A selected call runs the configured external executable,
-  so trust it and prefer an absolute pin to prevent PATH shadowing.
+  work; availability never forces a ceremonial query. Indexed queries run with
+  `--no-cache` and therefore reindex—a deliberate no-workspace-writes tradeoff
+  on very large repositories—while commands that negotiate themselves as
+  no-index/cacheless omit that inapplicable flag. A selected call runs the configured external executable,
+  so trust it and prefer an absolute pin to prevent PATH shadowing. Before the
+  tool is exposed, Advantage negotiates and validates
+  `navgraph.capabilities.v1`, freezes the safe read-only intersection for that
+  executable identity, and fails closed on incompatible contracts. The exact
+  frozen `84986b8` benchmark binary has a SHA-256-gated legacy fallback; unknown
+  pre-contract binaries do not. This release still executes the conservative
+  one-shot CLI adapter. It detects and records availability of NavGraph's newer
+  typed `navgraph.query` MCP surface but does not yet claim or use that transport.
   Compact name-only discovery and one-shot full-definition source are the
   defaults. Typed command options, focused-query validation, merged line-range
   caps, and replay-safe receipt aging keep graph evidence from accumulating
@@ -58,99 +66,86 @@ I'll look at the current flag handling first.
 Added the flag and threaded it through the formatter…
 ```
 
-## Benchmark — exact Advantage, NavGraph quality regression
+## Benchmark — exact quality with current NavGraph available
 
-On 12 July 2026, the quality-hardened harness ran a fresh, balanced eight-cell
-matrix: four hidden-graded tasks under Advantage and the same four with NavGraph
-available. Every first attempt completed normally using `openai/gpt-5.6-sol` at
-`xhigh` through one ChatGPT login. Default Codex was intentionally **not
-rerun**; its validated 11 July artifacts remain an immutable cross-epoch
-reference, not a contemporaneous control.
+On 12 July 2026, the harness ran a fresh, balanced eight-cell matrix: four
+hidden-graded tasks under Advantage and the same four with the current NavGraph
+integration available. Every first attempt completed normally with
+`openai/gpt-5.6-sol`, `xhigh` effort, and the `xhigh` harness through one
+ChatGPT login. Both arms scored an exact **400/400**, and all **35/35** matrix
+integrity checks and all quality-gate checks passed.
 
-| Harness | Epoch | Hidden score | Exact | Completed | Gross input | Cached | Uncached | Output | Reasoning¹ | Requests | Elapsed |
-|---|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|
-| **Advantage** | 12 Jul · fresh | **400/400** | **4/4** | 4/4 | **2,905,539** | **2,284,032** | 621,507 | 74,951 | 27,177 | **128** | **23.88m** |
-| **Advantage + NavGraph** | 12 Jul · fresh | 370/400 | 3/4 | 4/4 | 5,693,505 | 5,061,632 | 631,873 | 97,762 | 31,787 | 156 | 31.38m |
-| **Default Codex reference** | 11 Jul · retained | **400/400** | **4/4** | 4/4 | 6,531,475 | 6,201,856 | **329,619** | **69,039** | **24,627** | — | 31.36m |
+| Harness | Hidden score | Exact | Gross input | Cached | Uncached | Output | Reasoning¹ | Requests | Elapsed |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|
+| **Advantage** | **400/400** | **4/4** | 3,720,488 | 3,088,896 | 631,592 | 92,285 | 34,145 | 144 | 30.36m |
+| **Advantage + NavGraph available** | **400/400** | **4/4** | 3,771,391 | 3,196,928 | **574,463** | **83,587** | **22,618** | **133** | **25.54m** |
 
-Standard Advantage now matches retained Codex's exact **400/400** while using
-**55.5% less gross input** and **23.8% less wall time**. Its uncached input was
-88.6% higher and output 8.6% higher. Those Codex ratios are descriptive only:
-the task inputs, model, effort, and timeout match, but date, account load/cache,
-plugin, and runner epochs do not.
+Relative to the contemporaneous control, the NavGraph-available arm used 9.0%
+less uncached input, 9.4% less output, 33.8% less reasoning, 7.6% fewer requests,
+and 15.9% less wall time, while gross input rose 1.4% because cached input rose
+3.5%. This is a valid **availability observation**, not yet a semantic NavGraph
+efficiency result: only one task received successful graph results, two tasks
+abstained, and NG-CLI's one selected call was rejected before execution.
 
-The NavGraph condition did not preserve quality and is not eligible for an
-efficiency claim. Relative to the contemporaneous Advantage control it scored
-30 points lower, used **96.0% more gross input**, 1.7% more uncached input, 21.9%
-more requests, and 31.4% more wall time.
+Each task cell is `score · gross / uncached input · requests · elapsed`.
 
-Each task cell is `hidden score · gross input · elapsed`.
+| Task | Advantage | Advantage + NavGraph available | NavGraph lifecycle |
+|---|---:|---:|---|
+| NG-CLI | 100/100 · 773,679 / 151,087 · 39 · 6.23m | 100/100 · **525,137 / 132,945 · 31 · 4.20m** | attempted; 1 selected, 0 semantic successes |
+| NG-POLYGLOT | 100/100 · **1,613,819** / 235,515 · **50 · 9.54m** | 100/100 · 2,064,870 / **177,126** · 52 · 11.04m | adopted; 9 selected, 5 semantic successes |
+| NG-SCOPE | 100/100 · 1,139,514 / **203,578** · 39 · 8.81m | 100/100 · **970,975** / 214,239 · **31 · 5.32m** | abstained |
+| PIECE-TABLE | 100/100 · **193,476 / 41,412 · 16** · 5.78m | 100/100 · 210,409 / 50,153 · 19 · **4.98m** | abstained |
 
-| Task | Advantage · fresh | Advantage + NavGraph · fresh | Default Codex · retained 11 Jul |
-|---|---:|---:|---:|
-| NG-SCOPE | **100/100** · **926,755** · **5.92m** | 70/100 · 2,072,324 · 10.18m | 100/100 · 2,821,288 · 10.22m |
-| NG-CLI | **100/100** · 817,304 · 5.07m | **100/100** · **613,240** · **4.34m** | 100/100 · 1,025,566 · 3.98m |
-| NG-POLYGLOT | **100/100** · **938,796** · **6.47m** | **100/100** · 2,828,588 · 11.63m | 100/100 · 2,427,190 · 7.42m |
-| PIECE-TABLE | **100/100** · 222,684 · 6.43m | **100/100** · **179,353** · **5.23m** | 100/100 · 257,431 · 9.74m |
+### What the run establishes
 
-### What changed—and what still failed
+Quality is restored across the complete suite: both arms passed all 6 NG-SCOPE,
+9 NG-CLI, 10 NG-POLYGLOT, and 57 PieceTable hidden cases. Exposure remained
+conditional and model-selected. All ten NavGraph selections came from scouts;
+parents made zero selections. Five calls produced semantic results and five were
+rejected before spawn (three oversized reads and two invalid inputs). The five
+semantic CLI calls completed without wrapper failure in 234ms and returned
+16,851 bytes. Four per-run capability probes took another 41ms and returned
+93,464 bytes.
 
-The contract-preservation fix reproduced: both NG-CLI arms passed all nine
-hidden cases, including `-h` after positional arguments. The stateful-oracle
-fix also reproduced: both PieceTable arms passed all **57/57** cases, including
-canceling batches and error taxonomy.
+The analyzer therefore reports
+`valid_matrix_with_navgraph_execution_failure`: the matrix and quality gate are
+valid, but NG-CLI attempted NavGraph without receiving any successful semantic
+result. Aggregate treatment/control differences mix one adopted task, two
+abstentions, one failed attempt, and normal model variance. They must not be
+presented as proof that semantic retrieval itself caused the savings.
 
-NG-SCOPE exposed a different orchestration defect. NavGraph returned accurate
-structural evidence and its scouts used 44.7% less gross input than control
-scouts. The parent nevertheless created a parallel transient `JsLocal`
-representation instead of extending the existing canonical binding state. It
-tested absent references but not persisted untyped parameter/local bindings,
-then broadened into unrelated query work. The treatment therefore missed the
-two untyped-binding hidden cases. Direct graph process time was only 271ms;
-97.1% of the extra elapsed time accumulated after the scout wave.
-
-NG-POLYGLOT is the other dominant aggregate movement: the treatment correctly
-made no NavGraph call, yet its parent took 21 additional requests and 1.89M more
-gross tokens. That cell is ordinary stochastic orchestration/schema-condition
-variance, not semantic retrieval efficacy.
-
-### NavGraph lifecycle
-
-Use remained model-selected. NavGraph was adopted in NG-SCOPE and NG-CLI and
-correctly abstained in NG-POLYGLOT and greenfield PieceTable. Every selection
-came from a scout; parents made zero calls.
-
-| Task | Status | Selected | Spawned / successful | Validation rejects | Commands selected | Process time |
-|---|---|---:|---:|---:|---|---:|
-| NG-SCOPE | adopted | 12 | 6 / 6 | 6 | `files` ×2, `outline` ×4, `read` ×6 | 271ms |
-| NG-CLI | adopted | 9 | 5 / 5 | 4 | `outline` ×2, `read` ×4, `strings` ×3 | 281ms |
-| NG-POLYGLOT | abstained | 0 | 0 / 0 | 0 | — | 0ms |
-| PIECE-TABLE | abstained | 0 | 0 / 0 | 0 | — | 0ms |
-
-All **21/21** model selections reached the adapter. Eleven processes completed
-successfully with zero wrapper failures in 552ms and returned 14,227 stdout
-bytes. Ten calls were rejected before spawn—nine oversized `read` ranges and
-one other invalid input—so routing quality still needs work. Scout gross input
-fell 25.0%, but parent gross input rose 131.0%; non-NavGraph tool calls also
-increased by 12. NavGraph therefore did not produce aggregate substitution in
-this run.
+After this matrix was frozen, the live adapter was hardened against the two
+one-shot failure classes it exposed: negotiated `--` handling now preserves
+flag-shaped literal targets, and oversized valid reads return an explicit
+bounded prefix instead of being discarded. It also honors newer manifest
+commands that declare themselves no-index/cacheless without sending an
+unsupported `--no-cache`. Those follow-up fixes pass the complete smoke suite
+and direct installed-binary integration checks. Capability startup now also
+fails closed on non-executable/spawn-race pins without a second timeout, and
+bounded output preserves source while oversized diagnostics remain errors.
+These changes are intentionally not back-projected into the v2 measurements
+above.
 
 ### Method and limits
 
 The matrix used a balanced order, one first attempt per task and arm, a
 1,200-second cap, an empty-home `bwrap` sandbox, and deterministic post-run
-graders with no LLM judge. Prompt, seed, task suite, plugin, runner, and pinned
-pre-reference-fix NavGraph binary identities were frozen. All **34/34** matrix
-integrity checks, the strict first-attempt/dynamic-guidance audit, and all
-**19/19** retained-Codex checks passed. No compactor request occurred.
+graders with no LLM judge. Prompt, seed, task suite, plugin, runner, source
+archive, capabilities, and binary identities were frozen and reconciled. The
+NavGraph arm used commit `d5eab29e0c90b275fd8d250b0be34b7daf301215`
+through Advantage's negotiated one-shot read-only CLI adapter with `--no-cache`.
+The typed `navgraph.query` MCP surface was available but not used, and Java was
+present in the capability manifest but was not behaviorally exercised.
 
-This is one stochastic repetition per task, not a confidence interval. Gross
-input includes cached input; reasoning is already included in output. The
-machine-readable source of truth and every prompt, patch, grade, request ledger,
-tool trace, and lifecycle record are in
-[`2026-07-12-quality-hardened-pair-xhigh`](.benchmarks/harness_compare/results/2026-07-12-quality-hardened-pair-xhigh).
-The earlier 12 July matrix and focused probes remain archived but are deprecated
-as headline evidence.
+This is one stochastic repetition per task, not a confidence interval. The
+current binary postdates the historical NavGraph task fixes, so this matrix is
+also **not leakage-controlled** for those tasks. Gross input includes cached
+input; reasoning is already included in output. The machine-readable source of
+truth and every frozen artifact are in
+[`2026-07-12-current-navgraph-pair-xhigh-v2`](.benchmarks/harness_compare/results/2026-07-12-current-navgraph-pair-xhigh-v2).
+Older Advantage/NavGraph token tables remain archived but are deprecated as
+headline evidence. The retained 11 July Default Codex run is cross-epoch and is
+not mixed into this contemporaneous result.
 
 ¹ Reasoning tokens are already included in output tokens.
 
@@ -163,7 +158,9 @@ as headline evidence.
   `$ANTHROPIC_API_KEY` / `$OPENAI_API_KEY`
 - `ripgrep` (optional, for fast `grep` / `find_files`)
 - [`NavGraph`](https://github.com/mengsig/NavGraph) (optional, for the opt-in
-  `navgraph` tool; pin an absolute executable path for reproducible environments)
+  `navgraph` tool; Advantage negotiates `navgraph.capabilities.v1` and pins a
+  read-only policy intersection for each executable identity; pin an absolute
+  executable path for reproducible environments)
 - a language server per language (optional but recommended — powers the semantic
   navigation tools and the edit diagnostics loop; see the suggested list below)
 
@@ -776,6 +773,7 @@ require("advantage").setup({
     navgraph = {                 -- optional first-class semantic graph navigator
       enabled = false,           -- schema stays absent unless enabled + executable
       executable = "navgraph",   -- PATH command or pinned absolute executable
+      allow_legacy_benchmark = false, -- opt into the exact-SHA frozen benchmark fallback
       timeout_ms = 30000,
       max_results = 80,          -- outline/search default lower; model cannot exceed this
       max_output_bytes = 12000,  -- final guard after compact result shaping

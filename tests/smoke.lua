@@ -581,21 +581,35 @@ do
   local uv = vim.uv or vim.loop
   local saved = vim.deepcopy(config.options.tools.navgraph)
   local old_log = vim.env.ADV_NAVGRAPH_TEST_LOG
+  local old_capabilities = vim.env.ADV_NAVGRAPH_TEST_CAPABILITIES
+  local old_probe_log = vim.env.ADV_NAVGRAPH_TEST_PROBE_LOG
   local tmp = vim.fn.tempname()
   local repo = tmp .. "/repo root"
   local executable = tmp .. "/pinned navgraph"
   local log = tmp .. "/argv.log"
+  local probe_log = tmp .. "/probe.log"
+  local capability_file = tmp .. "/capabilities.json"
   local injected_file = tmp .. "/shell-injection-ran"
   vim.fn.mkdir(repo .. "/src", "p")
   vim.fn.writefile({ "return 1" }, repo .. "/src/a.lua")
-  vim.fn.writefile({
+  local fake_script = {
     "#!/bin/sh",
+    'if [ "$1" = "capabilities" ]; then',
+    '  printf x >> "$ADV_NAVGRAPH_TEST_PROBE_LOG"',
+    '  cat "$ADV_NAVGRAPH_TEST_CAPABILITIES"',
+    "  exit 0",
+    "fi",
     'printf \'%s\\n\' "$@" > "$ADV_NAVGRAPH_TEST_LOG"',
     'if [ "$2" = "slow" ]; then exec sleep 5; fi',
-    'if [ "$2" = "flood" ]; then',
+    'if [ "${2%%:*}" = "flood" ]; then',
     "  i=0",
     '  while [ "$i" -lt 2000 ]; do printf x; i=$((i + 1)); done',
     "  exit 0",
+    "fi",
+    'if [ "$2" = "stderr-flood" ]; then',
+    "  i=0",
+    '  while [ "$i" -lt 2000 ]; do printf e >&2; i=$((i + 1)); done',
+    "  exit 2",
     "fi",
     'if [ "$2" = "missing" ]; then printf \'(no symbol matching missing)\\n\'; exit 1; fi',
     "if [ \"$2\" = \"missingwarn\" ]; then printf '(no symbol matching missingwarn)\\n'; printf 'navgraph: parse-health: bad.js: tokenizer lost sync\\n' >&2; exit 1; fi",
@@ -603,9 +617,113 @@ do
     'if [ "$2" = "bad" ]; then printf \'bad invocation\\n\' >&2; exit 2; fi',
     "if [ \"$2\" = \"warn\" ]; then printf 'one row\\n'; printf 'parse warning\\n' >&2; exit 0; fi",
     "printf 'query ok\\n'",
-  }, executable)
+  }
+  vim.fn.writefile(fake_script, executable)
   vim.fn.system({ "chmod", "+x", executable })
   vim.env.ADV_NAVGRAPH_TEST_LOG = log
+  vim.env.ADV_NAVGRAPH_TEST_CAPABILITIES = capability_file
+  vim.env.ADV_NAVGRAPH_TEST_PROBE_LOG = probe_log
+
+  local live_options = {
+    outline = { "root", "no_cache", "limit", "verbosity", "kind" },
+    def = { "root", "no_cache", "verbosity" },
+    calls = { "root", "no_cache", "limit", "verbosity", "depth", "refs", "strict" },
+    callers = { "root", "no_cache", "limit", "verbosity", "depth", "strict" },
+    search = { "root", "no_cache", "limit", "verbosity", "kind", "refs" },
+    routes = { "root", "no_cache", "limit", "verbosity" },
+    -- Indexed/cache-writing commands that omit no_cache must be intersected
+    -- out of the model-facing profile.
+    events = { "root", "limit" },
+    neighbors = { "root", "no_cache", "limit", "verbosity", "refs", "strict" },
+    unused = { "root", "no_cache", "limit", "verbosity", "no_public", "follow_imports" },
+    imports = { "root", "no_cache" },
+    importers = { "root", "no_cache" },
+    path = { "root", "no_cache", "verbosity", "strict" },
+    hot = { "root", "no_cache", "limit", "verbosity" },
+    files = { "root", "no_cache", "limit", "sort" },
+    -- Hardened NavGraph read is intrinsically cacheless and therefore does not
+    -- advertise an inapplicable no_cache option.
+    read = { "root", "limit" },
+    strings = { "root", "no_cache", "limit" },
+  }
+  local argument_count = {
+    outline = 1,
+    def = 1,
+    calls = 1,
+    callers = 1,
+    search = 1,
+    routes = 1,
+    events = 1,
+    neighbors = 1,
+    unused = 1,
+    imports = 1,
+    importers = 1,
+    path = 2,
+    hot = 1,
+    files = 1,
+    read = 1,
+    strings = 1,
+  }
+  local function capability_manifest(overrides)
+    local commands = {}
+    for _, name in ipairs(require("advantage.navgraph_capabilities").policy_commands) do
+      local arguments = {}
+      for i = 1, argument_count[name] do
+        arguments[#arguments + 1] = { name = "arg" .. i, kind = "string", required = i <= (name == "path" and 2 or 0) }
+      end
+      commands[#commands + 1] = {
+        name = name,
+        arguments = arguments,
+        options = vim.deepcopy(live_options[name]),
+        outputModes = { "text", "json" },
+        access = "read_only",
+        requiresIndex = name ~= "read",
+        cacheEffect = name == "read" and "none" or "may_read_write",
+      }
+    end
+    commands[#commands + 1] = {
+      name = "flow",
+      arguments = { { name = "symbol", kind = "symbol", required = true } },
+      options = { "root", "no_cache", "limit" },
+      outputModes = { "text", "json" },
+      access = "read_only",
+      requiresIndex = true,
+      cacheEffect = "may_read_write",
+    }
+    commands[#commands + 1] = {
+      name = "rename",
+      arguments = {
+        { name = "symbol", kind = "symbol", required = true },
+        { name = "new_name", kind = "new_name", required = true },
+      },
+      options = { "root", "no_cache", "preview" },
+      outputModes = { "text", "json" },
+      access = "mutating",
+      requiresIndex = true,
+      cacheEffect = "may_read_write",
+    }
+    return vim.tbl_deep_extend("force", {
+      schema = "navgraph.capabilities.v1",
+      schemaVersion = 1,
+      agentProtocolVersion = "1.0",
+      build = { product = "navgraph", buildId = "navgraph@test-current", version = "0.1.0" },
+      schemaHash = "wyhash64:test-current",
+      languages = {
+        { name = "lua", family = "lua", extensions = { ".lua" }, analysis = "heuristic" },
+        { name = "java", family = "java", extensions = { ".java" }, analysis = "heuristic" },
+      },
+      server = {
+        queryTool = "navgraph.query",
+        querySchema = "navgraph.agent.query.v1",
+        resultSchema = "navgraph.agent.result.v1",
+      },
+      commands = commands,
+      options = {},
+    }, overrides or {})
+  end
+  local valid_manifest = capability_manifest()
+  vim.fn.writefile({ vim.json.encode(valid_manifest) }, capability_file)
+  require("advantage.navgraph_capabilities")._reset_cache()
 
   local function has_schema(name)
     for _, schema in ipairs(tools.schemas()) do
@@ -635,10 +753,94 @@ do
   config.options.tools.navgraph.enabled = true
   config.options.tools.navgraph.executable = tmp .. "/missing"
   check(not has_schema("navgraph"), "navgraph schema is withheld when the configured executable is unavailable")
+  local non_executable = tmp .. "/not-executable"
+  vim.fn.writefile({ "not a program" }, non_executable)
+  vim.fn.system({ "chmod", "-x", non_executable })
+  config.options.tools.navgraph.executable = non_executable
+  local nonexec_ok, nonexec_schema = pcall(has_schema, "navgraph")
+  check(
+    nonexec_ok and nonexec_schema == nil,
+    "navgraph withholds a non-executable regular-file pin instead of crashing schema generation"
+  )
+
+  -- Executability can change after stat and a provider can wedge. Both cases
+  -- must fail closed without throwing from schema generation or immediately
+  -- attempting the same synchronous handshake twice.
+  local capability_state = require("advantage.navgraph_capabilities")
+  local race_executable = tmp .. "/race-navgraph"
+  vim.fn.writefile(fake_script, race_executable)
+  vim.fn.system({ "chmod", "+x", race_executable })
+  local old_system, old_notify = vim.system, vim.notify
+  local spawn_calls = 0
+  vim.system = function(argv, options, on_exit)
+    if argv[1] == race_executable then
+      spawn_calls = spawn_calls + 1
+      error("simulated executable replacement race")
+    end
+    return old_system(argv, options, on_exit)
+  end
+  vim.notify = function() end
+  capability_state._reset_cache()
+  local spawn_ok, spawn_profile, spawn_err = pcall(capability_state.profile, {
+    executable = race_executable,
+    timeout_ms = 5000,
+  })
+  vim.wait(20)
+  vim.system, vim.notify = old_system, old_notify
+  check(
+    spawn_ok and spawn_profile == nil and spawn_err:find("could not start", 1, true) and spawn_calls == 1,
+    "navgraph contains a capability-spawn race and does not retry the same broken executable"
+  )
+
+  local timeout_executable = tmp .. "/timeout-navgraph"
+  vim.fn.writefile(fake_script, timeout_executable)
+  vim.fn.system({ "chmod", "+x", timeout_executable })
+  local timeout_probe_calls = 0
+  old_system, old_notify = vim.system, vim.notify
+  vim.system = function(argv, options, on_exit)
+    if argv[1] == timeout_executable then
+      timeout_probe_calls = timeout_probe_calls + 1
+      return {
+        wait = function()
+          return { code = 124, signal = 0, stdout = "", stderr = "Command timed out" }
+        end,
+      }
+    end
+    return old_system(argv, options, on_exit)
+  end
+  vim.notify = function() end
+  capability_state._reset_cache()
+  local timeout_ok, timeout_profile = pcall(capability_state.profile, {
+    executable = timeout_executable,
+    timeout_ms = 5000,
+  })
+  vim.wait(20)
+  vim.system, vim.notify = old_system, old_notify
+  check(
+    timeout_ok and timeout_profile == nil and timeout_probe_calls == 1,
+    "a timed-out capability probe never doubles the synchronous startup delay with a fallback probe"
+  )
 
   config.options.tools.navgraph.executable = executable
   local schema = has_schema("navgraph")
   check(schema ~= nil, "an enabled, executable NavGraph pin exposes the tool")
+  local profile = tools.get("navgraph").capability_profile()
+  local schema_again = has_schema("navgraph")
+  check(
+    profile
+      and profile.mode == "negotiated"
+      and profile.build.buildId == "navgraph@test-current"
+      and profile.language_set.java == true
+      and profile.typed_query_available == true
+      and profile.literal_positionals == true
+      and profile.adapter_transport == "cli"
+      and profile.cache_policy.read.intrinsically_cacheless == true
+      and profile.cache_policy.read.inject_no_cache == false
+      and profile.cache_policy.files.inject_no_cache == true
+      and vim.deep_equal(schema, schema_again)
+      and #(vim.fn.readfile(probe_log)[1] or "") == 1,
+    "NavGraph negotiates the current Java-aware contract once per executable identity and freezes a deterministic schema"
+  )
   local agent_mod = require("advantage.agent")
   local navgraph_guide = agent_mod.navgraph_guide()
   check(
@@ -653,7 +855,8 @@ do
       and navgraph_guide:find("literal substring", 1, true)
       and navgraph_guide:find("route/event-key filters", 1, true)
       and navgraph_guide:find("language/topic", 1, true)
-      and navgraph_guide:find("CLI flag", 1, true)
+      and navgraph_guide:find("flag-shaped text", 1, true)
+      and navgraph_guide:find("ascending bounded prefix", 1, true)
       and navgraph_guide:find("Switch routes only", 1, true),
     "enabled NavGraph receives a conditional semantic-routing guide rather than a mandatory-use prompt"
   )
@@ -670,11 +873,13 @@ do
   check(
     vim.tbl_contains(enum, "outline")
       and vim.tbl_contains(enum, "read")
+      and not vim.tbl_contains(enum, "events")
       and not vim.tbl_contains(enum, "diff")
+      and not vim.tbl_contains(enum, "flow")
       and not vim.tbl_contains(enum, "rename")
       and not vim.tbl_contains(enum, "serve")
       and not vim.tbl_contains(enum, "mcp"),
-    "navgraph schema advertises only the conservative read-only command set"
+    "navgraph schema intersects live capabilities with conservative access and cache policy"
   )
   check(
     properties.target
@@ -701,7 +906,9 @@ do
       and properties.target.description:find("strings=literal substring", 1, true)
       and properties.target.description:find("routes/events=route/event%-key")
       and properties.target.description:find("imports/importers=repository path filter", 1, true)
-      and properties.target.description:find("CLI flags/options", 1, true),
+      and properties.target.description:find("flag text", 1, true)
+      and properties.target.description:find("safely supports leading%-hyphen")
+      and properties.target.description:find("first bounded prefix", 1, true),
     "NavGraph schema teaches optional single-route use and command-specific positional contracts"
   )
   check(
@@ -928,8 +1135,11 @@ do
     execution_meta
       and execution_meta.phase == "execution"
       and execution_meta.spawned == true
-      and execution_meta.outcome == "success",
-    "navgraph reports execution lifecycle metadata independently of process-wrapper completion"
+      and execution_meta.outcome == "success"
+      and execution_meta.navgraph_build_id == "navgraph@test-current"
+      and execution_meta.adapter_transport == "cli"
+      and execution_meta.typed_query_available == true,
+    "navgraph reports execution and negotiated-contract metadata without claiming typed transport adoption"
   )
   check(
     vim.deep_equal(argv, { "files", "--limit", "80", "-C", real_repo, "--no-cache" }),
@@ -946,6 +1156,19 @@ do
     is_error == false and vim.fn.filereadable(injected_file) == 0 and argv[2] == "$(touch " .. injected_file .. ")",
     "navgraph omits model-materialized empty optional fields and passes literal argv without shell expansion"
   )
+
+  output, is_error = run({ command = "strings", target = "--no-tests" })
+  argv = vim.fn.readfile(log)
+  check(is_error == false and vim.deep_equal(argv, {
+    "strings",
+    "--limit",
+    "40",
+    "-C",
+    real_repo,
+    "--no-cache",
+    "--",
+    "--no-tests",
+  }), "navgraph passes flag-shaped string data after the negotiated positional terminator")
 
   output, is_error = run({ command = "outline", target = "src/a.lua", limit = 7, kind = "fn,struct" })
   argv = vim.fn.readfile(log)
@@ -992,21 +1215,19 @@ do
     real_repo,
     "--no-cache",
   }), "navgraph maps typed graph options without ambiguous or command-inapplicable flags")
-  output, is_error = run({ command = "path", target = "Start", destination = "Finish", strict = true })
+  output, is_error = run({ command = "path", target = "Start", destination = "Finish", strict = true, limit = 40 })
   argv = vim.fn.readfile(log)
   check(is_error == false and vim.deep_equal(argv, {
     "path",
     "Start",
     "Finish",
     "--strict",
-    "--limit",
-    "40",
     "--verbosity",
     "names",
     "-C",
     real_repo,
     "--no-cache",
-  }), "navgraph maps the typed two-symbol path query exactly")
+  }), "navgraph maps the typed two-symbol path query and omits unsupported materialized options")
   output, is_error = run({
     command = "files",
     target = "",
@@ -1073,7 +1294,14 @@ do
   )
 
   output, is_error = run({ command = "read", target = "src/a.lua:1-1" })
-  check(is_error == false and output and output:find("query ok", 1, true), "navgraph read accepts a contained range")
+  argv = vim.fn.readfile(log)
+  check(
+    is_error == false
+      and output
+      and output:find("query ok", 1, true)
+      and vim.deep_equal(argv, { "read", "src/a.lua:1-1", "--limit", "80", "-C", real_repo }),
+    "navgraph read accepts a contained range without emitting its unsupported cache flag"
+  )
   output, is_error = run({ command = "read", target = "src/a.lua:1-10,50-60", limit = 21 })
   check(
     is_error == false and output and output:find("query ok", 1, true),
@@ -1084,26 +1312,44 @@ do
     is_error == false and output and output:find("query ok", 1, true),
     "navgraph read merges overlapping ranges before enforcing its line budget"
   )
-  local log_before_range_rejection = table.concat(vim.fn.readfile(log), "\n")
   local range_meta
-  rejected, rejected_err, _, _, range_meta = run({ command = "read", target = "src/a.lua:1-10,5-15", limit = 14 })
+  output, is_error, _, _, range_meta = run({ command = "read", target = "src/a.lua:1-10,5-15", limit = 14 })
+  argv = vim.fn.readfile(log)
   check(
-    rejected_err == true
-      and rejected:find("15 unique lines", 1, true)
-      and range_meta.phase == "validation"
-      and range_meta.spawned == false
-      and table.concat(vim.fn.readfile(log), "\n") == log_before_range_rejection,
-    "navgraph rejects an over-budget merged read before spawning"
+    is_error == false
+      and output:find("first 14 of 15 requested unique lines", 1, true)
+      and output:find("src/a.lua:1%-14")
+      and range_meta.phase == "execution"
+      and range_meta.spawned == true
+      and range_meta.outcome == "partial_success"
+      and range_meta.read_range_truncated == true
+      and range_meta.read_requested_unique_lines == 15
+      and range_meta.read_returned_unique_lines == 14
+      and argv[2] == "src/a.lua:1-14",
+    "navgraph turns an oversized overlapping read into an explicit truth-preserving bounded prefix"
   )
-  rejected, rejected_err, _, _, range_meta = run({ command = "read", target = "src/a.lua:1-81" })
+  output, is_error, _, _, range_meta = run({ command = "read", target = "src/a.lua:1-81" })
+  argv = vim.fn.readfile(log)
   check(
-    rejected_err == true and rejected:find("at most 80", 1, true) and range_meta.outcome == "read_range_exceeded",
-    "navgraph read enforces the live default line cap independently of its byte guard"
+    is_error == false
+      and output:find("first 80 of 81 requested unique lines", 1, true)
+      and range_meta.outcome == "partial_success"
+      and argv[2] == "src/a.lua:1-80",
+    "navgraph read enforces its live default line cap by returning an explicit bounded prefix"
   )
-  rejected, rejected_err = run({ command = "read", target = "src/a.lua:1-21", limit = 20 })
+  output, is_error = run({ command = "read", target = "src/a.lua:1-21", limit = 20 })
+  argv = vim.fn.readfile(log)
   check(
-    rejected_err == true and rejected:find("at most 20", 1, true),
-    "an explicit lower NavGraph limit also bounds requested source lines"
+    is_error == false and output:find("first 20 of 21 requested unique lines", 1, true) and argv[2] == "src/a.lua:1-20",
+    "an explicit lower NavGraph limit bounds the returned source without discarding the whole call"
+  )
+  output, is_error = run({ command = "read", target = "src/a.lua:1-10,50-60", limit = 12 })
+  argv = vim.fn.readfile(log)
+  check(
+    is_error == false
+      and output:find("first 12 of 21 requested unique lines", 1, true)
+      and argv[2] == "src/a.lua:1-10,50-51",
+    "navgraph truncates disjoint reads deterministically across the normalized ascending ranges"
   )
   rejected, rejected_err = run({ command = "read", target = "src/a.lua" })
   check(
@@ -1207,12 +1453,239 @@ do
     is_error == false and output and #output <= 256 and output:find("useful 256%-byte partial result"),
     "navgraph stops a runaway producer but returns useful bounded partial context"
   )
+  local overflow_meta
+  output, is_error, _, _, overflow_meta = run({ command = "read", target = "flood:1-100", limit = 10 })
+  check(
+    is_error == false
+      and output
+      and #output <= 256
+      and output:find("^x+")
+      and output:find("output capped at 256 bytes", 1, true)
+      and output:find("first 10/100 requested lines", 1, true)
+      and output:find("Request only the next exact range.%)$")
+      and overflow_meta.outcome == "partial_success"
+      and overflow_meta.output_truncated == true
+      and overflow_meta.overflow_stream == "stdout",
+    "a bounded read under the minimum byte cap preserves source plus one complete truthful partial note"
+  )
+  output, is_error, _, _, overflow_meta = run({ command = "search", target = "stderr-flood" })
+  check(
+    is_error == true
+      and output
+      and #output <= 256
+      and output:find("diagnostic output exceeded", 1, true)
+      and overflow_meta.outcome == "diagnostic_overflow"
+      and overflow_meta.output_truncated == true
+      and overflow_meta.overflow_stream == "stderr",
+    "oversized stderr remains an operational error rather than useful semantic context"
+  )
 
   rejected, rejected_err = run({ command = "calls", target = "Thing", depth = 9 })
   check(
     rejected_err == true and rejected and rejected:find("depth must be an integer from 1 to 8", 1, true),
     "navgraph enforces typed traversal bounds before spawning"
   )
+
+  -- Capability profiles are immutable for one executable identity. Changing an
+  -- external manifest file alone cannot perturb an in-flight provider schema.
+  vim.fn.writefile({ vim.json.encode(capability_manifest({ agentProtocolVersion = "9.0" })) }, capability_file)
+  local frozen_schema = has_schema("navgraph")
+  check(
+    vim.deep_equal(schema, frozen_schema) and #(vim.fn.readfile(probe_log)[1] or "") == 1,
+    "NavGraph freezes the negotiated safe profile while the executable identity remains stable"
+  )
+
+  local notifications = {}
+  local old_notify = vim.notify
+  vim.notify = function(message, level, opts)
+    notifications[#notifications + 1] = { message = message, level = level, opts = opts }
+  end
+
+  -- Replacing the executable invalidates the old identity and forces exactly
+  -- one fresh handshake. Malformed output is withheld from parent and scouts.
+  local malformed_script = vim.deepcopy(fake_script)
+  malformed_script[#malformed_script + 1] = "# malformed replacement identity"
+  vim.fn.writefile(malformed_script, executable)
+  vim.fn.system({ "chmod", "+x", executable })
+  vim.fn.writefile({ "{not-json" }, capability_file)
+  local malformed_schema = has_schema("navgraph")
+  local malformed_schema_again = has_schema("navgraph")
+  vim.wait(1000, function()
+    return #notifications >= 1
+  end, 10)
+  local malformed_output, malformed_error, _, _, malformed_meta = run({ command = "files" })
+  check(
+    malformed_schema == nil
+      and malformed_schema_again == nil
+      and malformed_error == true
+      and malformed_meta.outcome == "incompatible_contract"
+      and malformed_output:find("malformed JSON", 1, true)
+      and #notifications == 1
+      and notifications[1].message:find("navgraph capabilities %-j")
+      and notifications[1].message:find("agent protocol 1.0", 1, true),
+    "a replaced executable with malformed capabilities fails closed with one actionable diagnostic"
+  )
+
+  -- Cache-safety metadata is security-relevant rather than advisory. A
+  -- producer cannot smuggle a stringly/missing value through as a false-ish
+  -- requiresIndex declaration and thereby evade the no-cache boundary.
+  local malformed_cache_manifest = capability_manifest()
+  malformed_cache_manifest.commands[1].requiresIndex = "false"
+  local malformed_cache_script = vim.deepcopy(fake_script)
+  malformed_cache_script[#malformed_cache_script + 1] = "# malformed cache-policy replacement identity"
+  vim.fn.writefile(malformed_cache_script, executable)
+  vim.fn.system({ "chmod", "+x", executable })
+  vim.fn.writefile({ vim.json.encode(malformed_cache_manifest) }, capability_file)
+  local malformed_cache_profile, malformed_cache_err = tools.get("navgraph").capability_profile()
+  vim.wait(1000, function()
+    return #notifications >= 2
+  end, 10)
+  check(
+    malformed_cache_profile == nil
+      and malformed_cache_err:find("malformed command descriptor", 1, true)
+      and has_schema("navgraph") == nil
+      and #notifications == 2,
+    "malformed cache metadata fails the complete capability handshake closed"
+  )
+
+  -- A syntactically valid future/incompatible protocol also fails closed; it
+  -- is never mistaken for an old binary and no model-facing schema is emitted.
+  local incompatible_script = vim.deepcopy(fake_script)
+  incompatible_script[#incompatible_script + 1] = "# incompatible replacement identity is longer"
+  vim.fn.writefile(incompatible_script, executable)
+  vim.fn.system({ "chmod", "+x", executable })
+  vim.fn.writefile({ vim.json.encode(capability_manifest({ agentProtocolVersion = "2.0" })) }, capability_file)
+  local incompatible_profile, incompatible_err = tools.get("navgraph").capability_profile()
+  vim.wait(1000, function()
+    return #notifications >= 3
+  end, 10)
+  check(
+    incompatible_profile == nil
+      and incompatible_err:find("unsupported agent protocol 2.0", 1, true)
+      and has_schema("navgraph") == nil
+      and #notifications == 3,
+    "an incompatible NavGraph schema/protocol is rejected instead of guessed"
+  )
+
+  -- Manifest ordering is producer-owned; the policy order keeps provider
+  -- schemas byte-stable after a legitimate binary upgrade.
+  local reordered = capability_manifest()
+  local reversed = {}
+  for i = #reordered.commands, 1, -1 do
+    reversed[#reversed + 1] = reordered.commands[i]
+  end
+  reordered.commands = reversed
+  local restored_script = vim.deepcopy(fake_script)
+  restored_script[#restored_script + 1] = "# compatible replacement identity with reordered manifest"
+  vim.fn.writefile(restored_script, executable)
+  vim.fn.system({ "chmod", "+x", executable })
+  vim.fn.writefile({ vim.json.encode(reordered) }, capability_file)
+  local restored_schema = has_schema("navgraph")
+  check(
+    restored_schema
+      and vim.deep_equal(
+        schema.input_schema.properties.command.enum,
+        restored_schema.input_schema.properties.command.enum
+      ),
+    "a compatible replacement renegotiates while preserving deterministic provider command order"
+  )
+
+  -- Capability schema v1 predates the CLI's `--` positional terminator. A
+  -- capability-aware older parser remains available for ordinary queries, but
+  -- its leading-dash literals stay disabled rather than being guessed.
+  local no_terminator_script = {
+    "#!/bin/sh",
+    'if [ "$1" = "capabilities" ]; then',
+    '  printf x >> "$ADV_NAVGRAPH_TEST_PROBE_LOG"',
+    '  if [ "$3" = "--" ]; then exit 2; fi',
+    '  cat "$ADV_NAVGRAPH_TEST_CAPABILITIES"',
+    "  exit 0",
+    "fi",
+    'printf \'%s\\n\' "$@" > "$ADV_NAVGRAPH_TEST_LOG"',
+    "printf 'older negotiated query ok\\n'",
+  }
+  vim.fn.writefile({}, probe_log)
+  vim.fn.writefile(no_terminator_script, executable)
+  vim.fn.system({ "chmod", "+x", executable })
+  local no_terminator_schema = has_schema("navgraph")
+  local no_terminator_profile = tools.get("navgraph").capability_profile()
+  local no_terminator_output, no_terminator_error, _, _, no_terminator_meta =
+    run({ command = "strings", target = "--no-tests" })
+  local ordinary_output, ordinary_error = run({ command = "files" })
+  check(
+    no_terminator_schema
+      and no_terminator_profile.mode == "negotiated"
+      and no_terminator_profile.literal_positionals == false
+      and no_terminator_schema.input_schema.properties.target.description:find("older binary", 1, true)
+      and #(vim.fn.readfile(probe_log)[1] or "") == 2
+      and no_terminator_error == true
+      and no_terminator_output:find("cannot represent a positional beginning", 1, true)
+      and no_terminator_meta.spawned == false
+      and ordinary_error == false
+      and ordinary_output:find("older negotiated query ok", 1, true),
+    "an older negotiated binary falls back once and only withholds unsupported flag-shaped positionals"
+  )
+
+  -- Exercise the exact-hash legacy path without committing the historical
+  -- benchmark executable as a test fixture.
+  local legacy_script = {
+    "#!/bin/sh",
+    'if [ "$1" = "capabilities" ]; then exit 2; fi',
+    'printf \'%s\\n\' "$@" > "$ADV_NAVGRAPH_TEST_LOG"',
+    "printf 'legacy query ok\\n'",
+  }
+  vim.fn.writefile(legacy_script, executable)
+  vim.fn.system({ "chmod", "+x", executable })
+  local legacy_stat = assert(uv.fs_stat(executable))
+  local legacy_fd = assert(uv.fs_open(executable, "r", 438))
+  local legacy_bytes = assert(uv.fs_read(legacy_fd, legacy_stat.size, 0))
+  uv.fs_close(legacy_fd)
+  local capability_state = require("advantage.navgraph_capabilities")
+  capability_state._test_legacy_sha256 = vim.fn.sha256(legacy_bytes)
+  capability_state._reset_cache()
+  config.options.tools.navgraph.allow_legacy_benchmark = true
+  local legacy_schema = has_schema("navgraph")
+  local legacy_profile = tools.get("navgraph").capability_profile()
+  check(
+    legacy_schema
+      and legacy_profile
+      and legacy_profile.mode == "legacy_benchmark"
+      and legacy_profile.literal_positionals == false
+      and legacy_profile.cache_policy.files.inject_no_cache == true
+      and vim.deep_equal(legacy_schema.input_schema.properties.command.enum, capability_state.policy_commands),
+    "the frozen legacy benchmark contract remains available only through exact executable SHA-256"
+  )
+  local legacy_output, legacy_error = run({ command = "files" })
+  argv = vim.fn.readfile(log)
+  check(
+    legacy_error == false
+      and legacy_output:find("legacy query ok", 1, true)
+      and vim.deep_equal(argv, { "files", "--limit", "80", "-C", real_repo, "--no-cache" }),
+    "the exact-hash legacy profile still emits its known-supported no-cache boundary"
+  )
+  local legacy_log_before = vim.fn.filereadable(log) == 1 and table.concat(vim.fn.readfile(log), "\n") or ""
+  local legacy_literal_output, legacy_literal_error, _, _, legacy_literal_meta =
+    run({ command = "strings", target = "--no-tests" })
+  check(
+    legacy_literal_error == true
+      and legacy_literal_output:find("cannot represent a positional beginning", 1, true)
+      and legacy_literal_meta.phase == "validation"
+      and legacy_literal_meta.spawned == false
+      and (vim.fn.filereadable(log) == 0 or table.concat(vim.fn.readfile(log), "\n") == legacy_log_before),
+    "the legacy binary rejects unsupported flag-shaped data before spawn with a lexical fallback"
+  )
+  config.options.tools.navgraph.allow_legacy_benchmark = false
+  local disabled_legacy = has_schema("navgraph")
+  vim.wait(1000, function()
+    return #notifications >= 4
+  end, 10)
+  check(
+    disabled_legacy == nil and #notifications == 4,
+    "configuration can explicitly disable the exact-hash legacy compatibility profile"
+  )
+  capability_state._test_legacy_sha256 = nil
+  capability_state._reset_cache()
+  vim.notify = old_notify
 
   config.options.tools.navgraph = saved
   check(require("advantage.agent").navgraph_guide() == nil, "NavGraph guide disappears when the tool is disabled")
@@ -1222,6 +1695,8 @@ do
     "disabled NavGraph leaves neither its tool guidance nor a dangling parent/scout prompt reference"
   )
   vim.env.ADV_NAVGRAPH_TEST_LOG = old_log
+  vim.env.ADV_NAVGRAPH_TEST_CAPABILITIES = old_capabilities
+  vim.env.ADV_NAVGRAPH_TEST_PROBE_LOG = old_probe_log
   vim.fn.delete(tmp, "rf")
 end
 
@@ -1677,6 +2152,8 @@ do
   end
 
   local overloaded = "Our servers are currently overloaded. Please try again shortly."
+  local provider_advised = "An error occurred while processing your request. You can retry your request, "
+    .. "or contact us through our help center at help.openai.com if the error persists."
   local recovered = run_case("recovers", function(attempt, opts)
     if attempt == 1 then return emit(opts, { { "error", { type = "error", error = { message = overloaded } } } }) end
     if attempt == 2 then
@@ -1732,6 +2209,33 @@ do
       and table.concat(recovered.text) == "recovered"
       and recovered.complete[1].blocks[1].text == "recovered",
     "success after overload retry streams and completes exactly once"
+  )
+
+  local provider_advised_recovered = run_case("provider-advised-recovers", function(attempt, opts)
+    if attempt == 1 then
+      return emit(opts, {
+        {
+          "response.failed",
+          { type = "response.failed", response = { error = { message = provider_advised } } },
+        },
+      })
+    end
+    emit(opts, {
+      { "response.output_text.delta", { type = "response.output_text.delta", delta = "provider retry recovered" } },
+      {
+        "response.completed",
+        { type = "response.completed", response = { usage = { input_tokens = 9, output_tokens = 3 } } },
+      },
+    })
+  end)
+  check(
+    provider_advised_recovered.attempts == 2
+      and #provider_advised_recovered.delays == 1
+      and #provider_advised_recovered.complete == 1
+      and #provider_advised_recovered.errors == 0
+      and table.concat(provider_advised_recovered.text) == "provider retry recovered"
+      and vim.deep_equal(provider_advised_recovered.bodies[1], provider_advised_recovered.bodies[2]),
+    "OpenAI's exact pre-payload provider-advised response.failed class retries the identical request once"
   )
 
   -- curl can report code 18 after the server has sent lifecycle SSE events but
@@ -1806,7 +2310,10 @@ do
     local committed = run_case("committed-" .. kind, function(_, opts)
       emit(opts, {
         payload,
-        { "error", { type = "error", error = { message = overloaded } } },
+        {
+          "response.failed",
+          { type = "response.failed", response = { error = { message = provider_advised } } },
+        },
       })
     end)
     local delivered = kind == "text" and table.concat(committed.text) == "partial"
@@ -1821,7 +2328,7 @@ do
   end
   check(
     all_payloads_guarded,
-    "an overload after text, thinking, or tool payload never retries or duplicates streamed work"
+    "a provider-advised retry after text, thinking, or tool payload never retries or duplicates streamed work"
   )
 
   local bad_request = run_case("bad-request", function(_, opts)
@@ -1829,6 +2336,17 @@ do
   end)
   local missing_model = run_case("missing-model", function(_, opts)
     opts.on_error("HTTP 404: Model not found gpt-5.6-sol", 404)
+  end)
+  local vague_retry_advice = run_case("vague-retry-advice", function(_, opts)
+    emit(opts, {
+      {
+        "response.failed",
+        {
+          type = "response.failed",
+          response = { error = { message = "You can retry your request after correcting the invalid input." } },
+        },
+      },
+    })
   end)
   local missing_auth = run_case("missing-auth", function()
     error("request_sse must not start after auth rejection")
@@ -1840,10 +2358,13 @@ do
       and missing_model.attempts == 1
       and #missing_model.errors == 1
       and #missing_model.delays == 0
+      and vague_retry_advice.attempts == 1
+      and #vague_retry_advice.errors == 1
+      and #vague_retry_advice.delays == 0
       and missing_auth.attempts == 0
       and #missing_auth.errors == 1
       and #missing_auth.delays == 0,
-    "auth, model, and deterministic HTTP 400 failures remain non-retryable"
+    "auth, model, deterministic HTTP 400, and incomplete retry wording remain non-retryable"
   )
 
   local exhausted = run_case("exhausted", function(_, opts)
@@ -5209,6 +5730,9 @@ do
         { "wrong types", "wrong value types" },
         { "invalid values", "invalid value" },
         { "error classes", "error taxonomy" },
+        { "overlap", "intersection" },
+        { "most specific contract", "specific contract rule" },
+        { "host-language convention", "language convention" },
         { "history" },
         { "invariant" },
         { "iteration count is not", "operation count is not" },
@@ -5246,7 +5770,7 @@ do
       { "oracle", "reference model" },
       { "every stated contract partition", "all stated contract partitions" },
       { "canceling compositions", "cancelling compositions" },
-      { "error taxonomy", "error classes" },
+      { "overlapping error-taxonomy", "overlapping error taxonomy", "overlapping error classes" },
       { "unstated assumption", "implementation-derived" },
       { "operation count", "iteration count" },
       { "do not mechanically restore", "do not restore", "do not reapply" },
@@ -6400,10 +6924,15 @@ do
       and vim.tbl_contains(errs, "harness.sync_effort must be boolean"),
     "validation rejects malformed harness policy"
   )
+  check(
+    config.defaults.tools.navgraph.enabled == false and config.defaults.tools.navgraph.allow_legacy_benchmark == false,
+    "NavGraph and its legacy benchmark compatibility default to disabled"
+  )
   local malformed_navgraph = vim.deepcopy(config.defaults)
   malformed_navgraph.tools.navgraph = {
     enabled = "sometimes",
     executable = "relative/bin/navgraph",
+    allow_legacy_benchmark = "sometimes",
     timeout_ms = 99,
     max_results = 201,
     max_output_bytes = 1048577,
@@ -6412,10 +6941,11 @@ do
   check(
     vim.tbl_contains(errs, "tools.navgraph.enabled must be boolean")
       and vim.tbl_contains(errs, "tools.navgraph.executable must be a PATH command or absolute executable path")
+      and vim.tbl_contains(errs, "tools.navgraph.allow_legacy_benchmark must be boolean")
       and vim.tbl_contains(errs, "tools.navgraph.timeout_ms must be an integer from 100 to 300000")
       and vim.tbl_contains(errs, "tools.navgraph.max_results must be an integer from 1 to 200")
       and vim.tbl_contains(errs, "tools.navgraph.max_output_bytes must be an integer from 256 to 1048576"),
-    "validation rejects malformed NavGraph availability and resource bounds"
+    "validation rejects malformed NavGraph compatibility, availability, and resource bounds"
   )
   local valid_navgraph = vim.deepcopy(config.defaults)
   valid_navgraph.tools.navgraph.executable = "/opt/bench tools/pinned-navgraph"

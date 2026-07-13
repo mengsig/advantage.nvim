@@ -217,7 +217,13 @@ local function apply_live_subagent_bounds(name, schema)
   return schema
 end
 
+local function definition_schema(def)
+  if type(def.live_input_schema) == "function" then return def.live_input_schema() end
+  return def.input_schema
+end
+
 local function apply_live_bounds(name, schema)
+  if type(schema) ~= "table" then return nil end
   schema = apply_live_subagent_bounds(name, schema)
   if name ~= "navgraph" then return schema end
   schema = vim.deepcopy(schema)
@@ -235,7 +241,7 @@ end
 ---shared by parent and scout surfaces so configured limits cannot diverge.
 function M.input_schema(name)
   local def = by_name[name]
-  return def and apply_live_bounds(name, def.input_schema) or nil
+  return def and apply_live_bounds(name, definition_schema(def)) or nil
 end
 
 local function schema_error(value, schema, path)
@@ -314,7 +320,7 @@ end
 ---@return string|nil err  nil if valid, else a message naming the missing args
 function M.validate_input(name, input)
   local def = by_name[name]
-  local schema = def and apply_live_bounds(name, def.input_schema)
+  local schema = def and apply_live_bounds(name, definition_schema(def))
   if not schema then return nil end
   if type(input) ~= "table" then return ("%s: input must be object (got %s)"):format(name, type(input)) end
   local req = schema.required or {}
@@ -385,7 +391,7 @@ function M.enabled(def)
   if def.feature == "navgraph" then
     local t = (require("advantage.config").options.tools or {}).navgraph
     if type(t) ~= "table" or t.enabled ~= true then return false end
-    return type(t.executable) == "string" and vim.trim(t.executable) ~= "" and vim.fn.executable(t.executable) == 1
+    return require("advantage.navgraph_capabilities").profile(t) ~= nil
   end
   if def.feature == "subagents" then
     local t = require("advantage.config").options.subagents
@@ -399,8 +405,8 @@ function M.schemas(parent_model)
   local out = {}
   for _, def in ipairs(M.list) do
     if M.enabled(def) then
-      local input_schema = apply_live_bounds(def.name, def.input_schema)
-      local include = true
+      local input_schema = apply_live_bounds(def.name, definition_schema(def))
+      local include = input_schema ~= nil
       if def.name == "sub_agent" or def.name == "sub_agent_batch" then
         local choices, mappings = {}, {}
         local ok_aliases, available = pcall(function()

@@ -354,7 +354,10 @@ function M.stream(req)
   local function retryable_stream_error(message, meta)
     if type(meta) == "table" and meta.retryable == true then return true end
     local lower = tostring(message or ""):lower()
-    return lower:find("overloaded", 1, true) ~= nil
+    local provider_advised_retry = lower:find("an error occurred while processing your request", 1, true) ~= nil
+      and lower:find("you can retry your request", 1, true) ~= nil
+    return provider_advised_retry
+      or lower:find("overloaded", 1, true) ~= nil
       or lower:find("try again later", 1, true) ~= nil
       or lower:find("temporarily unavailable", 1, true) ~= nil
       or lower:find("at capacity", 1, true) ~= nil
