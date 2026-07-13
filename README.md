@@ -79,6 +79,12 @@ integrity checks and all quality-gate checks passed.
 |---|---:|---:|---:|---:|---:|---:|---:|---:|---:|
 | **Advantage** | **400/400** | **4/4** | 3,720,488 | 3,088,896 | 631,592 | 92,285 | 34,145 | 144 | 30.36m |
 | **Advantage + NavGraph available** | **400/400** | **4/4** | 3,771,391 | 3,196,928 | **574,463** | **83,587** | **22,618** | **133** | **25.54m** |
+| **Default Codex reference · retained 11 Jul** | **400/400** | **4/4** | 6,531,475 | 6,201,856 | 329,619 | 69,039 | 24,627 | — | 31.36m |
+
+Default Codex was not rerun for this matrix. Its validated 11 July artifacts are
+shown as a labeled cross-epoch reference; task inputs, prompts, seeds, model,
+effort, and timeout match, but date, provider cache/load, runner, and plugin
+provenance do not. Its request count was not captured.
 
 Relative to the contemporaneous control, the NavGraph-available arm used 9.0%
 less uncached input, 9.4% less output, 33.8% less reasoning, 7.6% fewer requests,
@@ -89,12 +95,12 @@ abstained, and NG-CLI's one selected call was rejected before execution.
 
 Each task cell is `score · gross / uncached input · requests · elapsed`.
 
-| Task | Advantage | Advantage + NavGraph available | NavGraph lifecycle |
-|---|---:|---:|---|
-| NG-CLI | 100/100 · 773,679 / 151,087 · 39 · 6.23m | 100/100 · **525,137 / 132,945 · 31 · 4.20m** | attempted; 1 selected, 0 semantic successes |
-| NG-POLYGLOT | 100/100 · **1,613,819** / 235,515 · **50 · 9.54m** | 100/100 · 2,064,870 / **177,126** · 52 · 11.04m | adopted; 9 selected, 5 semantic successes |
-| NG-SCOPE | 100/100 · 1,139,514 / **203,578** · 39 · 8.81m | 100/100 · **970,975** / 214,239 · **31 · 5.32m** | abstained |
-| PIECE-TABLE | 100/100 · **193,476 / 41,412 · 16** · 5.78m | 100/100 · 210,409 / 50,153 · 19 · **4.98m** | abstained |
+| Task | Advantage | Advantage + NavGraph available | Default Codex · retained 11 Jul | NavGraph lifecycle |
+|---|---:|---:|---:|---|
+| NG-CLI | 100/100 · 773,679 / 151,087 · 39 · 6.23m | 100/100 · **525,137 / 132,945 · 31 · 4.20m** | 100/100 · 1,025,566 / 65,310 · — · 3.98m | attempted; 1 selected, 0 semantic successes |
+| NG-POLYGLOT | 100/100 · **1,613,819** / 235,515 · **50 · 9.54m** | 100/100 · 2,064,870 / **177,126** · 52 · 11.04m | 100/100 · 2,427,190 / 105,526 · — · 7.42m | adopted; 9 selected, 5 semantic successes |
+| NG-SCOPE | 100/100 · 1,139,514 / **203,578** · 39 · 8.81m | 100/100 · **970,975** / 214,239 · **31 · 5.32m** | 100/100 · 2,821,288 / 127,144 · — · 10.22m | abstained |
+| PIECE-TABLE | 100/100 · **193,476 / 41,412 · 16** · 5.78m | 100/100 · 210,409 / 50,153 · 19 · **4.98m** | 100/100 · 257,431 / 31,639 · — · 9.74m | abstained |
 
 ### What the run establishes
 
@@ -144,8 +150,9 @@ input; reasoning is already included in output. The machine-readable source of
 truth and every frozen artifact are in
 [`2026-07-12-current-navgraph-pair-xhigh-v2`](.benchmarks/harness_compare/results/2026-07-12-current-navgraph-pair-xhigh-v2).
 Older Advantage/NavGraph token tables remain archived but are deprecated as
-headline evidence. The retained 11 July Default Codex run is cross-epoch and is
-not mixed into this contemporaneous result.
+headline evidence. The retained 11 July Default Codex run is included above
+only as a labeled cross-epoch reference and is not mixed into the
+contemporaneous treatment/control claims.
 
 ¹ Reasoning tokens are already included in output tokens.
 
