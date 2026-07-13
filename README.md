@@ -606,15 +606,21 @@ it in every session.
   (`memory.skills_index_budget_tokens`) so a big library can't re-bloat the prefix,
   with deterministic truncation that keeps the cache stable; skills past the cap stay
   loadable by name. The full body loads on demand when the agent calls `use_skill`.
-  The agent codifies new ones with `save_skill`. Skills interoperate with
-  `.claude/skills/`.
+  The agent codifies new ones with `save_skill`. Skills interoperate with both
+  `.agents/skills/` (Open Agent Skills / Codex) and `.claude/skills/`, including
+  nested launch-directory scopes and bundled relative references/scripts.
+  `disable-model-invocation: true` and OpenAI's
+  `agents/openai.yaml` `allow_implicit_invocation: false` are honored by the
+  automatic matcher.
 - Skills are also **auto-surfaced**: a deterministic keyword match against your
   prompt appends a one-line hint to the outgoing message when a skill looks
   relevant ("the deploy-docs skill may apply — load it with use_skill"), at most
   once per skill per session. The hint rides the message, never the system
   prompt, so the cached prefix stays byte-identical.
-- Your committed `AGENTS.md` / `CLAUDE.md` is ingested too (parity with the real
-  CLIs), with `@file` imports resolved.
+- Committed instructions are layered from the Git root down to the launch
+  directory (`AGENTS.override.md`, `AGENTS.md`, `CLAUDE.local.md`, then
+  `CLAUDE.md` per directory), with `@file` imports resolved. File tools remain
+  rooted at the canonical Git workspace even when Neovim starts in a subfolder.
 - **Add your own standing instructions** by dropping any Markdown file into
   `<repo>/.advantage/` — every `.advantage/<name>.md` is injected verbatim into
   the system prompt (name-sorted so the frozen prefix stays cache-stable, each
@@ -650,6 +656,32 @@ teaches the agent the repo in one pass; `/context curate` compresses it;
 `/context verify` flags facts whose referenced files have since moved or
 vanished; `/context forget <text>` drops matching facts. Turn it off with
 `memory = { enabled = false }`.
+
+**Extensions.** `opts.extensions` loads small Lua modules once during setup.
+An extension receives a stable API for registering provider-visible tools,
+providers, harness presets, and session-frozen prompt parts; every registration
+returns a disposer for clean development reloads. The empty default does no work
+and leaves the baseline prompt/tool schema byte-for-byte unchanged.
+
+```lua
+-- lua/my_advantage_extension.lua
+return function(api)
+  api.register_harness("review", {
+    label = "review", description = "Review-first workflow.", effort = "high",
+    proactive = false, parallel = true, max_parallel = 2,
+    guide = "Inspect the relevant diff and run focused checks before finishing.",
+  })
+  api.register_prompt_part("team policy", function(ctx)
+    return "Team policy for " .. ctx.cwd .. ": preserve public compatibility."
+  end)
+end
+
+require("advantage").setup({ extensions = { "my_advantage_extension" } })
+```
+
+A skill may declare `advantage-harness: review` in its frontmatter. This only
+changes the live harness when `memory.allow_skill_harness = true`; it is disabled
+by default so sharing a skill can never silently increase orchestration or cost.
 
 **Context preview.** `/context preview` (or `:Advantage context preview`,
 `<leader>cP`) renders the exact packet that goes to the model each turn — the
@@ -743,6 +775,7 @@ require("advantage").setup({
     sync_effort = true,           -- preset selection initializes matching effort
   },
   system_prompt = nil,           -- string to replace, function(default) to extend
+  extensions = {},               -- setup(api) modules: tools/providers/harness/prompt parts
   max_agent_turns = 100,         -- safety cap on tool-loop round-trips per user turn
   ui = {
     width = 0.42,                -- panel width (fraction of columns)
@@ -846,6 +879,7 @@ require("advantage").setup({
   },
   memory = {                     -- per-repo self-learning harness (remember/use_skill)
     enabled = true,
+    allow_skill_harness = false, -- opt in to `advantage-harness` skill frontmatter
     budget_tokens = 2000,        -- cap on the always-loaded facts block (crisp signposts;
                                  -- push DEPTH into on-demand skills, not this tier)
     skill_body_budget_tokens = 8000, -- cap for on-demand use_skill bodies
@@ -909,11 +943,12 @@ require("advantage").setup({
 
 ```sh
 nvim -l tests/smoke.lua   # parser, providers, tools, and a full fake-provider turn
+nvim -l tests/perf.lua    # request hot paths + a warm 200-skill library budget
 stylua --check .          # formatting (config in stylua.toml)
 ```
 
-CI (`.github/workflows/ci.yml`) runs the smoke suite on Neovim 0.10/stable/nightly
-and checks formatting on every push.
+CI (`.github/workflows/ci.yml`) runs smoke and performance budgets on Neovim
+0.10/stable/nightly and checks formatting on every push.
 
 ## Roadmap
 

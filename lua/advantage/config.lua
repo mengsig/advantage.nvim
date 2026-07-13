@@ -137,6 +137,11 @@ M.defaults = {
   ---Override the built-in system prompt (string), or extend it (function(default) -> string).
   system_prompt = nil,
 
+  ---Optional extension modules. Each module returns a setup(api) function (or a
+  ---table with one) and can register tools, providers, harness modes, or a stable
+  ---prompt part. Empty by default, so the baseline request/schema is unchanged.
+  extensions = {},
+
   ---Safety cap on how many provider round-trips one user message may drive in the
   ---tool loop (edit→test→re-edit…). Prevents a thrashing/looping model from
   ---burning tokens unbounded, especially under yolo/auto_approve. On hit, the turn
@@ -389,6 +394,10 @@ M.defaults = {
   ---and offline — no embeddings, no validator model. Files live under `<root>/.advantage/`.
   memory = {
     enabled = true,
+    ---Opt in to skills whose `advantage-harness` frontmatter changes the live
+    ---orchestration mode when loaded. Off by default: reusable instructions are
+    ---safe to share across harnesses without silently changing cost/behavior.
+    allow_skill_harness = false,
     ---Rough token cap (chars/4) for the always-loaded learned-facts block. It
     ---rides the cached system prefix (billed ~10% after turn one), so this is a
     ---recurring per-turn tax — keep it lean. Oldest facts are evicted past it. The
@@ -673,15 +682,19 @@ local function validate(o)
     end
   end
   if type(o.harness) == "table" then
-    if
-      o.harness.mode ~= nil
-      and not vim.tbl_contains({ "auto", "low", "medium", "high", "xhigh", "max", "ultra" }, o.harness.mode)
-    then
+    if o.harness.mode ~= nil and not require("advantage.harness").valid(o.harness.mode) then
       errs[#errs + 1] = "harness.mode is not recognized"
     end
     if o.harness.sync_effort ~= nil and type(o.harness.sync_effort) ~= "boolean" then
       errs[#errs + 1] = "harness.sync_effort must be boolean"
     end
+  end
+  if
+    type(o.memory) == "table"
+    and o.memory.allow_skill_harness ~= nil
+    and type(o.memory.allow_skill_harness) ~= "boolean"
+  then
+    errs[#errs + 1] = "memory.allow_skill_harness must be boolean"
   end
   if type(o.tools) == "table" and type(o.tools.diagnostics) == "table" then
     local sev = o.tools.diagnostics.severity
@@ -796,7 +809,8 @@ function M.setup(opts)
       M.options.subagents.model = nil
     end
   end
-  local errs = validate(M.options)
+  local errs = require("advantage.extensions").load(M.options.extensions)
+  vim.list_extend(errs, validate(M.options))
   -- Structural options must be tables; revert any scalar override (e.g. a
   -- mistaken `tools = false`) to its default so it can't crash a later
   -- `config.options.tools.x` access. The mistake is still surfaced via `errs`.

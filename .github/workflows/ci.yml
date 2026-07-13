@@ -24,6 +24,9 @@ jobs:
       - name: Run smoke tests
         run: nvim -l tests/smoke.lua
 
+      - name: Enforce local performance budgets
+        run: nvim -l tests/perf.lua
+
   lint:
     runs-on: ubuntu-latest
     steps:

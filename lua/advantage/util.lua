@@ -37,6 +37,23 @@ end
 
 local uv = vim.uv or vim.loop
 
+-- Canonical workspace discovery shared by agents, sessions, memory, and tools.
+-- Keeping this in one small helper prevents a subdirectory launch from giving
+-- each subsystem a subtly different idea of the project boundary.
+local _project_roots = {}
+
+---@param cwd? string
+---@return string
+function M.project_root(cwd)
+  cwd = vim.fs.normalize(cwd or uv.cwd() or "")
+  if _project_roots[cwd] then return _project_roots[cwd] end
+  local git = cwd ~= "" and vim.fs.find(".git", { path = cwd, upward = true })[1] or nil
+  local root = git and vim.fs.dirname(git) or cwd
+  root = uv.fs_realpath(root) or root
+  _project_roots[cwd] = root
+  return root
+end
+
 function M.buf_valid(buf)
   return buf and vim.api.nvim_buf_is_valid(buf)
 end

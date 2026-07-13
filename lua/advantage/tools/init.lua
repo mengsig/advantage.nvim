@@ -10,15 +10,34 @@ local M = {}
 local support = require("advantage.tools.support")
 
 M.list = {}
+local by_name = {}
 
 ---Register a tool definition. Order of registration is the order tools appear in
 ---M.schemas(); the modules below are required in the original tool order so the
 ---emitted schema is unchanged from the pre-split single-file layout.
-local function tool(def)
+---Returns a disposer so development-time extensions can reload cleanly.
+function M.register(def)
   assert(type(def) == "table" and type(def.name) == "string", "tool: def with a name required")
   assert(type(def.run) == "function", "tool: def.run must be a function")
+  assert(not by_name[def.name], "duplicate tool name: " .. def.name)
   M.list[#M.list + 1] = def
+  by_name[def.name] = def
+  local active = true
+  return function()
+    if not active or by_name[def.name] ~= def then return false end
+    active = false
+    by_name[def.name] = nil
+    for i, item in ipairs(M.list) do
+      if item == def then
+        table.remove(M.list, i)
+        break
+      end
+    end
+    return true
+  end
 end
+
+local tool = M.register
 
 -- Register each tool group. The require order reproduces the pre-split order:
 -- read/write/edit/multi_edit, bash, grep/find_files/list_dir, web_search,
@@ -35,12 +54,6 @@ require("advantage.tools.agentic")(tool, support)
 require("advantage.tools.memory_tools")(tool, support)
 
 -- registry --------------------------------------------------------------
-
-local by_name = {}
-for _, def in ipairs(M.list) do
-  assert(not by_name[def.name], "duplicate tool name: " .. def.name)
-  by_name[def.name] = def
-end
 
 function M.get(name)
   return by_name[name]

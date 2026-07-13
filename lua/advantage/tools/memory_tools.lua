@@ -50,7 +50,7 @@ return function(tool, s)
   assert(type(tool) == "function", "memory tools: tool registrar required")
   assert(type(s) == "table", "memory tools: support module required")
   local function scoped(memory, ctx, fn)
-    return memory.with_root(ctx.cwd, fn)
+    return memory.with_root(ctx.start_cwd or ctx.cwd, fn)
   end
 
   tool({
@@ -129,7 +129,7 @@ return function(tool, s)
     end,
     run = function(input, ctx, cb)
       local memory = require("advantage.memory")
-      local body, desc = scoped(memory, ctx, function()
+      local body, desc, skill = scoped(memory, ctx, function()
         return memory.use_skill(input.name)
       end)
       if not body then
@@ -145,7 +145,33 @@ return function(tool, s)
           true
         )
       end
-      cb(("Skill: %s — %s\n\n%s"):format(input.name, desc or "", body), false)
+      local root = scoped(memory, ctx, memory.root)
+      local dir = skill and skill.dir or nil
+      local relative_dir = dir and dir:sub(1, #root + 1) == root .. "/" and dir:sub(#root + 2) or dir
+      local activation = ""
+      local requested_mode = skill and skill.meta and skill.meta["advantage-harness"] or nil
+      if requested_mode and (require("advantage.config").options.memory or {}).allow_skill_harness == true then
+        local harness = require("advantage.harness")
+        if harness.valid(requested_mode) and ctx.agent then
+          ctx.agent.harness_mode = requested_mode
+          ctx.agent:refresh_prompt_policy()
+          activation = ("\nHarness mode activated by this skill: %s.\n"):format(requested_mode)
+        elseif harness.valid(requested_mode) then
+          activation = "\nHarness mode was not changed because this call has no live parent agent.\n"
+        else
+          activation = ("\nIgnored invalid advantage-harness mode %q.\n"):format(requested_mode)
+        end
+      end
+      cb(
+        ("Skill: %s — %s\nSkill directory: %s (resolve relative references/scripts from here).%s\n%s"):format(
+          input.name,
+          desc or "",
+          relative_dir or "(unknown)",
+          activation,
+          body
+        ),
+        false
+      )
     end,
   })
 

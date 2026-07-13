@@ -13,6 +13,7 @@ CONTENTS                                                  *advantage-contents*
   6. Configuration ........... |advantage-configuration|
   7. Tools & security ........ |advantage-tools|
   8. Memory & skills ......... |advantage-memory|
+  9. Extensions .............. |advantage-extensions|
 
 ==============================================================================
 1. INTRODUCTION                                       *advantage-introduction*
@@ -194,7 +195,9 @@ Full defaults live in `lua/advantage/config.lua`. Key options: >lua
         max_result_bytes = 64000,
         tool_timeout_ms = 45000,  -- watchdog for each scout read-only tool
       },
-      memory = { enabled = true, budget_tokens = 2000, skill_body_budget_tokens = 8000,
+      extensions = {},           -- setup(api) modules; empty has zero prompt/schema cost
+      memory = { enabled = true, allow_skill_harness = false,
+                 budget_tokens = 2000, skill_body_budget_tokens = 8000,
                  skills_index_budget_tokens = 1200 },
       sessions = { autosave = true },
     })
@@ -423,7 +426,11 @@ context packet that will be sent — system prompt, tool schemas and transcript 
 with the cache boundary drawn and a per-section token breakdown, so you can see
 what each part costs and confirm the memory block is frozen for cache reuse;
 `context forget <text>` drops matching facts. Disable with
-`memory = { enabled = false }`. AGENTS.md / CLAUDE.md are also ingested.
+`memory = { enabled = false }`. Instructions layer from the Git root down to
+the launch directory (`AGENTS.override.md`, `AGENTS.md`, `CLAUDE.local.md`,
+then `CLAUDE.md` per directory). Skills are discovered from
+`.advantage/skills`, `.agents/skills` and `.claude/skills`; use_skill reports
+the skill directory so bundled relative references and scripts remain usable.
 
 CUSTOM CONFIG DOCS                                    *advantage-config-docs*
 
@@ -436,5 +443,23 @@ prompt each turn (name-sorted for a cache-stable prefix, each capped by
   NOTE: `context.md` CANNOT be used this way. It is the managed memory file
   (owned by the remember/curate machinery) and is excluded from config-doc
   ingestion. Put hand-authored instructions in any OTHER `.md` filename.
+
+==============================================================================
+9. EXTENSIONS                                             *advantage-extensions*
+
+`extensions = { "my_module" }` loads each Lua module once during setup. A module
+returns `function(api)` or `{ setup = function(api) ... end }`. The API exposes:
+
+  api.register_tool(def)              add a provider-visible tool
+  api.register_provider(name, mod)    add/replace a provider implementation
+  api.register_harness(name, policy)  add an orchestration preset
+  api.register_prompt_part(name, fn)  add stable session-frozen instructions
+
+All registrations return disposer functions for clean
+development reloads. With the default empty list, no extension code runs and
+the baseline prompt and schema are unchanged.
+
+Skills may set `advantage-harness: <registered-mode>` in YAML frontmatter.
+Activation requires `memory.allow_skill_harness = true`; the default is false.
 
 vim:tw=78:ts=8:ft=help:norl:

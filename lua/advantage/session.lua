@@ -51,10 +51,7 @@ end
 
 ---Sessions are scoped per project so `resume` only offers relevant ones.
 local function project_root(cwd)
-  cwd = vim.fs.normalize(cwd or uv.cwd() or "")
-  local git = cwd ~= "" and vim.fs.find(".git", { path = cwd, upward = true })[1] or nil
-  local root = git and vim.fs.dirname(git) or cwd
-  return uv.fs_realpath(root) or root
+  return require("advantage.util").project_root(cwd)
 end
 
 local function project_key(cwd)
@@ -109,6 +106,7 @@ function M.save(agent)
     context_results = require("advantage.tools").snapshot_context_results(agent.messages),
     usage = agent.usage,
     cwd = cwd,
+    start_cwd = agent.ctx and agent.ctx.start_cwd or cwd,
     updated_at = os.time(),
   }
   local ok, encoded = pcall(vim.json.encode, payload)

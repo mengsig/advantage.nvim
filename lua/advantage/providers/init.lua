@@ -19,7 +19,17 @@ local M = {}
 local registered = {}
 
 function M.register(name, mod)
+  assert(type(name) == "string" and name ~= "", "provider name required")
+  assert(type(mod) == "table" and type(mod.stream) == "function", "provider stream implementation required")
+  local previous = registered[name]
   registered[name] = mod
+  local active = true
+  return function()
+    if not active or registered[name] ~= mod then return false end
+    active = false
+    registered[name] = previous
+    return true
+  end
 end
 
 function M.get(name)

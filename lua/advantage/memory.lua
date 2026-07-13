@@ -53,11 +53,11 @@ local PREAMBLE = {
 ---sub-directory Neovim was opened in; fall back to cwd.
 local _root_cache = {}
 local _scoped_root = nil
+local _scoped_cwd = nil
 local function discover_root(cwd)
   cwd = cwd or uv.cwd() or ""
   if _root_cache[cwd] ~= nil then return _root_cache[cwd] end
-  local found = vim.fs.find(".git", { path = cwd, upward = true })[1]
-  local root = found and vim.fs.dirname(found) or cwd
+  local root = util.project_root(cwd)
   _root_cache[cwd] = root
   return root
 end
@@ -67,13 +67,25 @@ function M.root()
   return _scoped_root or discover_root()
 end
 
+---The launch directory inside the frozen workspace. Instruction and skill
+---discovery use it for nested repo scopes while file tools stay rooted at the
+---canonical project boundary.
+function M.cwd()
+  local root = vim.fs.normalize(M.root())
+  local cwd = vim.fs.normalize(_scoped_cwd or root)
+  if cwd == root or cwd:sub(1, #root + 1) == root .. "/" then return cwd end
+  return root
+end
+
 ---Run one synchronous memory operation against an agent's frozen workspace even
 ---if the user executes :cd mid-session. The previous scope is restored on error.
 function M.with_root(cwd, fn)
-  local previous = _scoped_root
+  local previous, previous_cwd = _scoped_root, _scoped_cwd
+  cwd = cwd or uv.cwd() or ""
   _scoped_root = discover_root(cwd)
+  _scoped_cwd = uv.fs_realpath(cwd) or vim.fs.normalize(cwd)
   local ok, a, b, c, d = pcall(fn)
-  _scoped_root = previous
+  _scoped_root, _scoped_cwd = previous, previous_cwd
   if not ok then error(a, 0) end
   return a, b, c, d
 end
@@ -694,28 +706,65 @@ local function expand_project_imports(text, root, cap)
   return table.concat(out), truncated
 end
 
----Read the project's committed memory file, resolving one level of `@file`
----imports (Claude Code style, e.g. CLAUDE.md that just holds `@AGENTS.md`).
+local function instruction_dirs()
+  local root, cwd = vim.fs.normalize(M.root()), vim.fs.normalize(M.cwd())
+  local dirs = { root }
+  if cwd == root then return dirs end
+  local rel = cwd:sub(#root + 2)
+  local current = root
+  for segment in rel:gmatch("[^/]+") do
+    current = current .. "/" .. segment
+    dirs[#dirs + 1] = current
+  end
+  return dirs
+end
+
+---Read the project's committed instruction chain, resolving one level of
+---`@file` imports. The closest file wins within each directory and nested files
+---are appended after root guidance, matching the override semantics used by
+---modern coding harnesses without paying for unrelated subtrees.
 local function project_memory()
-  local root, text, source_truncated = M.root(), nil, false
+  local root = M.root()
   local cap = configured_byte_cap("project_budget_tokens", 2000)
   local source_cap = math.min(MAX_REPO_FILE_BYTES, math.max(64 * 1024, cap * 4))
-  for _, name in ipairs({ "AGENTS.md", "CLAUDE.md" }) do
-    local path = M.contain(name)
-    local candidate, truncated
-    if path then
-      candidate, truncated = read_file(path, source_cap)
+  local candidates = { "AGENTS.override.md", "AGENTS.md", "CLAUDE.local.md", "CLAUDE.md" }
+  local blocks, used, any_truncated = {}, 0, false
+  local dirs = instruction_dirs()
+  for _, dir in ipairs(dirs) do
+    for _, name in ipairs(candidates) do
+      local path = M.contain(dir .. "/" .. name)
+      local candidate, truncated
+      if path then
+        candidate, truncated = read_file(path, source_cap)
+      end
+      if candidate and vim.trim(candidate) ~= "" then
+        local room = cap - used
+        if room <= 0 then
+          any_truncated = true
+          break
+        end
+        local expanded, expanded_truncated = expand_project_imports(candidate, root, room)
+        expanded = vim.trim(expanded:gsub("<!%-%-.-%-%->", ""))
+        local rel = path:sub(#root + 2)
+        -- Preserve the historical single-root-file bytes. Source labels are
+        -- only needed once multiple directory scopes can participate.
+        local header = #dirs > 1 and ("## Instructions: %s\n"):format(rel) or ""
+        local block = header .. expanded
+        if #block > room then
+          block = utf8_safe_sub(block, room)
+          expanded_truncated = true
+        end
+        blocks[#blocks + 1] = block
+        used = used + #block + 2
+        any_truncated = any_truncated or truncated or expanded_truncated
+        break
+      end
     end
-    if candidate ~= nil then
-      text, source_truncated = candidate, truncated
-      break
-    end
+    if used >= cap then break end
   end
-  if text == nil then return nil end
-  local expanded_truncated
-  text, expanded_truncated = expand_project_imports(text, root, cap)
-  text = text:gsub("<!%-%-.-%-%->", "") -- strip HTML-comment noise (e.g. tool markers)
-  if source_truncated or expanded_truncated then
+  if #blocks == 0 then return nil end
+  local text = table.concat(blocks, "\n\n")
+  if any_truncated then
     local marker = "\n… [project memory truncated]"
     text = utf8_safe_sub(text, math.max(0, cap - #marker)) .. marker
   end
@@ -865,7 +914,7 @@ local function skills_index_part()
     -- can't bloat the always-loaded tier (the body loads on demand anyway).
     local d = s.description or ""
     if #d > 200 then d = utf8_safe_sub(d, 197) .. "…" end
-    local line = ("- %s: %s"):format(s.name, d)
+    local line = ("- %s%s: %s"):format(s.name, s.implicit == false and " (explicit only)" or "", d)
     -- always keep at least one; otherwise stop once the index budget is spent
     if shown == 0 or used + #line + 1 <= budget then
       lines[#lines + 1] = line

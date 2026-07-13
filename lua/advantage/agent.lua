@@ -121,6 +121,8 @@ function M.base_system_prompt(cwd)
   elseif type(cfg) == "function" then
     base = cfg(base)
   end
+  local extension_text = require("advantage.extensions").prompt_text(cwd)
+  if extension_text ~= "" then base = base .. "\n\n" .. extension_text end
   return base
 end
 
@@ -186,7 +188,13 @@ function M.new(opts)
   self.job = nil
   self.cancelled = false
   self.epoch = 0 -- invalidates every callback belonging to an abandoned operation
-  self.ctx = { cwd = opts.cwd or uv.cwd(), model = self.model, agent = self }
+  local start_cwd = vim.fs.normalize(opts.start_cwd or opts.cwd or uv.cwd() or "")
+  self.ctx = {
+    cwd = require("advantage.util").project_root(start_cwd),
+    start_cwd = start_cwd,
+    model = self.model,
+    agent = self,
+  }
   local actual_cwd = vim.fs.normalize(self.ctx.cwd or "")
   local digest = vim.fn.sha256(actual_cwd .. "\0" .. self.id)
   self.request_key = digest:sub(1, 8)
@@ -230,7 +238,7 @@ function M.new(opts)
   pcall(function()
     local memory = require("advantage.memory")
     memory.reset_session()
-    if memory.with_root(self.ctx.cwd, memory.bootstrap) then
+    if memory.with_root(self.ctx.start_cwd, memory.bootstrap) then
       vim.schedule(function()
         pcall(
           require("advantage.ui.chat").notify,
@@ -296,7 +304,7 @@ end
 function Agent:_memory_prompt_block()
   if self._memory_block == nil then
     local ok, memory = pcall(require, "advantage.memory")
-    self._memory_block = (ok and memory.with_root(self.ctx.cwd, memory.render)) or ""
+    self._memory_block = (ok and memory.with_root(self.ctx.start_cwd, memory.render)) or ""
   end
   return self._memory_block
 end
@@ -333,7 +341,7 @@ function Agent:compact(opts, callback)
   end)
 end
 
-local function user_content(text, opts, cwd)
+local function user_content(text, opts, cwd, memory_cwd)
   opts = opts or {}
   -- inline @file mentions; the transcript shows the original text
   local send_text = require("advantage.attach").expand_mentions(text, cwd)
@@ -343,7 +351,7 @@ local function user_content(text, opts, cwd)
   -- per session; the transcript shows the user's original text.
   local mok, memory = pcall(require, "advantage.memory")
   if mok then
-    local hints = memory.with_root(cwd, function()
+    local hints = memory.with_root(memory_cwd or cwd, function()
       return memory.skill_hints(text)
     end)
     if #hints > 0 then
@@ -370,7 +378,7 @@ local function user_content(text, opts, cwd)
 end
 
 function Agent:_push_user_message(text, opts, show)
-  local content = user_content(text, opts, self.ctx.cwd)
+  local content = user_content(text, opts, self.ctx.cwd, self.ctx.start_cwd)
   local names = {}
   for _, img in ipairs((opts and opts.images) or {}) do
     names[#names + 1] = img.name or "image"
@@ -408,7 +416,7 @@ function Agent:send(text, opts)
       self:ui().queued(#self.queue, text)
       return
     end
-    local item = { text = text, opts = opts, content = user_content(text, opts, self.ctx.cwd) }
+    local item = { text = text, opts = opts, content = user_content(text, opts, self.ctx.cwd, self.ctx.start_cwd) }
     self.interrupts[#self.interrupts + 1] = item
     if requested_parallel then
       self.parallel_intent = true

@@ -206,6 +206,7 @@ function M.resume()
       context_results = data.context_results,
       usage = data.usage,
       cwd = data.cwd or cwd,
+      start_cwd = data.start_cwd or data.cwd or cwd,
       harness_mode = data.harness_mode,
     })
     ui.open(false)

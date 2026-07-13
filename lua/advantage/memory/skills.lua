@@ -35,23 +35,24 @@ end
 
 ---Parse `---` frontmatter (key: value) + body from a SKILL.md.
 function S.parse_skill(text)
-  local name, desc, body_start = nil, nil, 1
+  local name, desc, body_start, meta = nil, nil, 1, {}
   local lines = vim.split(text, "\n", { plain = true })
   if lines[1] == "---" then
     local i = 2
     while i <= #lines and lines[i] ~= "---" do
-      local k, v = lines[i]:match("^(%w+):%s*(.*)$")
+      local k, v = lines[i]:match("^([%w_-]+):%s*(.*)$")
       if k == "name" then
         name = vim.trim(v)
       elseif k == "description" then
         desc = vim.trim(v)
       end
+      if k then meta[k] = vim.trim(v) end
       i = i + 1
     end
     body_start = i + 1
   end
   local body = table.concat(vim.list_slice(lines, body_start), "\n")
-  return name, desc, vim.trim(body)
+  return name, desc, vim.trim(body), meta
 end
 
 -- Cache parsed skills across turns. `render()`/`skill_hints()`/`stats()` all scan
@@ -69,13 +70,35 @@ local function skill_body_cap()
 end
 
 local function skill_roots()
-  local out = {}
-  local candidates = { deps.mem.root() .. "/.claude/skills" }
+  local out, seen = {}, {}
+  local candidates = {}
   local primary = deps.skills_dir()
-  if primary then table.insert(candidates, 1, primary) end
+  if primary then candidates[#candidates + 1] = primary end
+
+  -- Open Agent Skills / Codex uses .agents/skills, while Claude Code uses
+  -- .claude/skills. Discover both from the launch directory back to the repo
+  -- root so one checked-in skill library works across all three harnesses.
+  local root, cwd = deps.mem.root(), deps.mem.cwd()
+  local dirs = { root }
+  if cwd ~= root then
+    local current = root
+    for segment in cwd:sub(#root + 2):gmatch("[^/]+") do
+      current = current .. "/" .. segment
+      dirs[#dirs + 1] = current
+    end
+  end
+  for i = #dirs, 1, -1 do
+    candidates[#candidates + 1] = dirs[i] .. "/.agents/skills"
+  end
+  for i = #dirs, 1, -1 do
+    candidates[#candidates + 1] = dirs[i] .. "/.claude/skills"
+  end
   for _, path in ipairs(candidates) do
     local safe = path and deps.mem.contain(path) or nil
-    if safe then out[#out + 1] = safe end
+    if safe and not seen[safe] then
+      seen[safe] = true
+      out[#out + 1] = safe
+    end
   end
   return out
 end
@@ -84,58 +107,94 @@ local function safe_skill_path(root, entry)
   return deps.mem.contain(root .. "/" .. entry .. "/SKILL.md")
 end
 
-local function skills_signature()
-  local parts = {}
+local function scan_skill_files()
+  local files = {}
   for _, root in ipairs(skill_roots()) do
     local dir = uv.fs_scandir(root)
     if dir then
       while true do
         local entry = uv.fs_scandir_next(dir)
         if not entry then break end
-        local p = safe_skill_path(root, entry)
-        local st = p and uv.fs_stat(p) or nil
-        if st then
-          parts[#parts + 1] = ("%s:%d:%d:%d"):format(
-            p,
-            st.mtime and st.mtime.sec or 0,
-            st.mtime and st.mtime.nsec or 0,
-            st.size or 0
-          )
+        local path = safe_skill_path(root, entry)
+        local stat = path and uv.fs_stat(path) or nil
+        if stat and stat.type == "file" then
+          local metadata_path = deps.mem.contain(root .. "/" .. entry .. "/agents/openai.yaml")
+          files[#files + 1] = {
+            root = root,
+            entry = entry,
+            path = path,
+            stat = stat,
+            metadata_path = metadata_path,
+            metadata_stat = metadata_path and uv.fs_stat(metadata_path) or nil,
+          }
         end
       end
+    end
+  end
+  return files
+end
+
+local function skills_signature(files)
+  local parts = {}
+  for _, file in ipairs(files) do
+    local st = file.stat
+    parts[#parts + 1] = ("%s:%d:%d:%d"):format(
+      file.path,
+      st.mtime and st.mtime.sec or 0,
+      st.mtime and st.mtime.nsec or 0,
+      st.size or 0
+    )
+    if file.metadata_stat then
+      local mst = file.metadata_stat
+      parts[#parts + 1] = ("%s:%d:%d:%d"):format(
+        file.metadata_path,
+        mst.mtime and mst.mtime.sec or 0,
+        mst.mtime and mst.mtime.nsec or 0,
+        mst.size or 0
+      )
     end
   end
   table.sort(parts)
   return table.concat(parts, "|")
 end
 
+local function openai_allows_implicit(file)
+  local text = file.metadata_path and deps.read_file(file.metadata_path, 8 * 1024) or nil
+  if not text then return true end
+  return text:match("allow_implicit_invocation:%s*false") == nil
+end
+
 ---Scan skill directories (.advantage/skills and, for interop, .claude/skills).
 ---Returns { {name=, description=, path=} } sorted by name, de-duplicated by name.
 ---@return {name:string, description:string, path:string}[]
 function S.scan_skills()
-  local sig = skills_signature()
+  local files = scan_skill_files()
+  local sig = skills_signature(files)
   if _skills_cache.sig == sig and _skills_cache.value then return _skills_cache.value end
-  local roots = skill_roots()
   local seen, out = {}, {}
-  for _, root in ipairs(roots) do
-    local dir = uv.fs_scandir(root)
-    if dir then
-      while true do
-        local entry = uv.fs_scandir_next(dir)
-        if not entry then break end
-        local skill_path = safe_skill_path(root, entry)
-        -- Indexing needs only frontmatter. Never read a giant runbook body merely
-        -- to discover its name and one-line description.
-        local text = skill_path and deps.read_file(skill_path, SKILL_INDEX_READ_BYTES) or nil
-        if text and not seen[entry] then
-          local name, desc = S.parse_skill(text)
-          name = name or entry
-          if not seen[name] then
-            seen[name] = true
-            local st = uv.fs_stat(skill_path)
-            out[#out + 1] = { name = name, description = desc or "", path = skill_path, bytes = st and st.size or 0 }
-          end
-        end
+  for _, file in ipairs(files) do
+    -- Indexing needs only frontmatter. Never read a giant runbook body merely
+    -- to discover its name and one-line description.
+    local text = deps.read_file(file.path, SKILL_INDEX_READ_BYTES)
+    if text and not seen[file.entry] then
+      local name, desc, _, meta = S.parse_skill(text)
+      name = name or file.entry
+      if not seen[name] then
+        seen[name] = true
+        local implicit = meta["disable-model-invocation"] ~= "true" and openai_allows_implicit(file)
+        local name_words = deps.word_set(name:gsub("[-_]", " "))
+        local desc_words = deps.word_set(desc or "")
+        out[#out + 1] = {
+          name = name,
+          description = desc or "",
+          path = file.path,
+          dir = vim.fs.dirname(file.path),
+          bytes = file.stat.size or 0,
+          implicit = implicit,
+          meta = meta,
+          _name_words = name_words,
+          _desc_words = desc_words,
+        }
       end
     end
   end
@@ -168,7 +227,7 @@ function S.use_skill(name)
         session.skill_loads = session.skill_loads + 1
         session.skill_load_tokens = session.skill_load_tokens + deps.tokens(body)
       end
-      return body, s.description
+      return body, s.description, s
     end
   end
   return nil
@@ -186,21 +245,20 @@ function S.skill_hints(text, limit)
   local session = deps.mem._session
   local scored = {}
   for _, s in ipairs(S.scan_skills()) do
-    if not session.loaded[s.name] and not session.hinted[s.name] then
+    if s.implicit ~= false and not session.loaded[s.name] and not session.hinted[s.name] then
       local score = 0
-      local nw = deps.word_set((s.name or ""):gsub("[-_]", " "))
-      for w in pairs(nw) do
+      for w in pairs(s._name_words or {}) do
         if pw[w] then score = score + 3 end
       end
-      local dw = deps.word_set(s.description)
-      for w in pairs(dw) do
+      for w in pairs(s._desc_words or {}) do
         if pw[w] then score = score + 1 end
       end
       if score >= 3 then scored[#scored + 1] = { skill = s, score = score } end
     end
   end
   table.sort(scored, function(a, b)
-    return a.score > b.score
+    if a.score ~= b.score then return a.score > b.score end
+    return a.skill.name < b.skill.name
   end)
   local out = {}
   for i = 1, math.min(limit or 2, #scored) do

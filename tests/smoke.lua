@@ -4549,6 +4549,59 @@ do
     "skill BODY stays out of the always-on context"
   )
 
+  -- Cross-harness skill discovery: Open Agent Skills / Codex uses
+  -- .agents/skills. Explicit-only metadata must suppress automatic hints, and
+  -- relative resources need an unambiguous base directory when loaded.
+  local portable_dir = tmp .. "/.agents/skills/portable-release"
+  vim.fn.mkdir(portable_dir .. "/agents", "p")
+  vim.fn.writefile({ "release checklist" }, portable_dir .. "/reference.md")
+  vim.fn.writefile({
+    "---",
+    "name: portable-release",
+    "description: Prepare a portable release checklist",
+    "advantage-harness: high",
+    "---",
+    "",
+    "Read [reference.md](reference.md), then prepare the release.",
+  }, portable_dir .. "/SKILL.md")
+  vim.fn.writefile({ "policy:", "  allow_implicit_invocation: false" }, portable_dir .. "/agents/openai.yaml")
+  local portable
+  for _, skill in ipairs(memory.skills_index()) do
+    if skill.name == "portable-release" then portable = skill end
+  end
+  check(portable and portable.implicit == false, ".agents/skills is discovered with explicit-only metadata")
+  memory.reset_session()
+  local hinted_portable = false
+  for _, skill in ipairs(memory.skill_hints("prepare the portable release checklist")) do
+    if skill.name == "portable-release" then hinted_portable = true end
+  end
+  check(not hinted_portable, "explicit-only skills never auto-surface from prompt matching")
+  local portable_body, _, portable_meta = memory.use_skill("portable-release")
+  check(
+    portable_body and portable_meta and portable_meta.dir == portable_dir,
+    "loaded skills retain their directory for relative references"
+  )
+  local refreshed, skill_result = false, nil
+  config.options.memory.allow_skill_harness = true
+  require("advantage.tools").get("use_skill").run({ name = "portable-release" }, {
+    cwd = tmp,
+    start_cwd = tmp,
+    agent = {
+      harness_mode = "low",
+      refresh_prompt_policy = function(self)
+        refreshed = self.harness_mode == "high"
+      end,
+    },
+  }, function(out)
+    skill_result = out
+  end)
+  check(refreshed, "opt-in skill frontmatter can activate a registered harness mode")
+  check(
+    skill_result and skill_result:find(".agents/skills/portable-release", 1, true),
+    "use_skill reports the base directory for bundled references and scripts"
+  )
+  config.options.memory.allow_skill_harness = false
+
   -- verify: flag facts whose path anchor is gone, keep ones that resolve
   vim.fn.writefile({ "x" }, tmp .. "/real_file.lua")
   memory.remember("Config defaults live in real_file.lua at the repo root", "Architecture")
@@ -6570,15 +6623,26 @@ do
   local repo = vim.fn.tempname()
   vim.fn.mkdir(repo .. "/.git", "p")
   vim.fn.mkdir(repo .. "/src/deep", "p")
+  vim.fn.writefile({ "root instruction marker" }, repo .. "/AGENTS.md")
+  vim.fn.writefile({ "nested instruction marker" }, repo .. "/src/deep/AGENTS.override.md")
   memory._root_override = nil -- exercise the real git-root walk
   local prev_cwd = vim.fn.getcwd()
   vim.fn.chdir(repo .. "/src/deep")
 
   check(memory.root() == repo, "memory root walks up to the git root from a subdirectory")
-  agent_mod.new({ model = { provider = "fake", id = "m", label = "m" } })
+  local fresh_agent = agent_mod.new({ model = { provider = "fake", id = "m", label = "m" } })
+  check(fresh_agent.ctx.cwd == repo, "agent tools canonicalize a subdirectory launch to the git root")
+  check(fresh_agent.ctx.start_cwd == repo .. "/src/deep", "agent retains the launch directory for nested guidance")
   check(
     vim.fn.filereadable(repo .. "/.advantage/context.md") == 1,
     "bootstrap lands at the git root, not the subdirectory"
+  )
+  local layered = memory.with_root(repo .. "/src/deep", memory.render)
+  local root_pos = layered:find("root instruction marker", 1, true)
+  local nested_pos = layered:find("nested instruction marker", 1, true)
+  check(
+    root_pos and nested_pos and root_pos < nested_pos,
+    "nested instruction files layer from repo root to launch cwd"
   )
 
   -- the model is taught the harness, and told the memory is empty
@@ -8175,6 +8239,81 @@ do
     "grep ignore_case matches case-insensitively"
   )
   check(assert(run({ pattern = "zzzznomatch" })):find("No matches", 1, true), "grep reports no matches cleanly")
+end
+
+-- 4-ext. public extension surface ---------------------------------------------
+
+section("extension registry")
+do
+  local extensions = require("advantage.extensions")
+  local tools = require("advantage.tools")
+  local harness = require("advantage.harness")
+  local agent_mod = require("advantage.agent")
+  local baseline_schema = vim.json.encode(tools.schemas())
+  local baseline_prompt = agent_mod.base_system_prompt("/tmp/extension-root")
+  local loads = 0
+  local extension_spec = function()
+    loads = loads + 1
+  end
+  check(#extensions.load({ extension_spec }) == 0, "configured extension setup functions load without errors")
+  extensions.load({ extension_spec })
+  check(loads == 1, "configured extensions load once across repeated setup calls")
+  local dispose_tool = extensions.api.register_tool({
+    name = "extension_probe",
+    description = "Test-only extension probe",
+    safe = true,
+    input_schema = { type = "object", properties = {}, additionalProperties = false },
+    run = function(_, _, cb)
+      cb("ok", false)
+    end,
+  })
+  local dispose_provider = extensions.api.register_provider("extension_probe", {
+    stream = function()
+      return { stop = function() end }
+    end,
+  })
+  local dispose_harness = extensions.api.register_harness("focused_test", {
+    label = "focused test",
+    description = "Focused extension policy.",
+    effort = "medium",
+    proactive = false,
+    parallel = false,
+    max_parallel = 1,
+    guide = "Extension-specific verification rule.",
+  })
+  local builds = 0
+  local dispose_prompt = extensions.api.register_prompt_part("test extension", function(ctx)
+    builds = builds + 1
+    return "Extension prompt for " .. ctx.cwd
+  end)
+
+  check(tools.get("extension_probe") ~= nil, "extensions can register provider-visible tools")
+  check(require("advantage.providers").get("extension_probe") ~= nil, "extensions can register providers")
+  check(harness.valid("focused_test"), "extensions can register harness modes")
+  check(
+    harness.guide("focused_test", { provider = "fake", id = "m" }):find("Extension-specific", 1, true) ~= nil,
+    "custom harness guidance composes with core guardrails"
+  )
+  local base = agent_mod.base_system_prompt("/tmp/extension-root")
+  check(
+    builds == 1 and base:find("Extension prompt for /tmp/extension-root", 1, true),
+    "extension prompt builders compose into the session-frozen base prompt"
+  )
+  check(
+    dispose_prompt() and dispose_harness() and dispose_provider() and dispose_tool(),
+    "extension registrations return clean reload disposers"
+  )
+  check(
+    tools.get("extension_probe") == nil
+      and require("advantage.providers").get("extension_probe") == nil
+      and not harness.valid("focused_test"),
+    "disposing an extension restores the baseline registries"
+  )
+  check(
+    vim.json.encode(tools.schemas()) == baseline_schema
+      and agent_mod.base_system_prompt("/tmp/extension-root") == baseline_prompt,
+    "the unloaded extension leaves baseline prompt and schema bytes unchanged"
+  )
 end
 
 -- 4-sub. sub-agent lean context (no memory leak, capped report) ----------------

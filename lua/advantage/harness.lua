@@ -59,6 +59,47 @@ local POLICIES = {
   },
 }
 
+---Register an additional orchestration preset without patching the core loop.
+---The policy is declarative so it remains cheap, prompt-cacheable, and subject
+---to the same concurrency and verification guardrails as built-in modes.
+function M.register(name, policy)
+  assert(type(name) == "string" and name:match("^[%l][%l%d_-]*$"), "harness: simple lowercase mode required")
+  assert(name ~= "auto" and not POLICIES[name], "duplicate harness mode: " .. tostring(name))
+  assert(type(policy) == "table", "harness: policy table required")
+  assert(type(policy.label) == "string" and policy.label ~= "", "harness: policy.label required")
+  assert(type(policy.description) == "string" and policy.description ~= "", "harness: policy.description required")
+  assert(
+    type(policy.effort) == "string" and vim.tbl_contains({ "low", "medium", "high", "xhigh", "max" }, policy.effort),
+    "harness: policy.effort must be low, medium, high, xhigh, or max"
+  )
+  assert(
+    type(policy.proactive) == "boolean" and type(policy.parallel) == "boolean",
+    "harness: boolean policy flags required"
+  )
+  assert(
+    type(policy.max_parallel) == "number"
+      and policy.max_parallel >= 1
+      and policy.max_parallel == math.floor(policy.max_parallel),
+    "harness: positive integer max_parallel required"
+  )
+  local stored = vim.deepcopy(policy)
+  POLICIES[name] = stored
+  ORDER[#ORDER + 1] = name
+  local active = true
+  return function()
+    if not active or POLICIES[name] ~= stored then return false end
+    active = false
+    POLICIES[name] = nil
+    for i, mode in ipairs(ORDER) do
+      if mode == name then
+        table.remove(ORDER, i)
+        break
+      end
+    end
+    return true
+  end
+end
+
 local function selected_effort(model)
   if not model then return "medium" end
   if model.provider == "openai" then
@@ -212,6 +253,12 @@ function M.guide(mode, model, parallel_requested)
   local lines = {
     ("Harness mode: %s. %s"):format(p.mode, p.description),
   }
+  if type(p.guide) == "string" and p.guide ~= "" then
+    lines[#lines + 1] = p.guide
+  elseif type(p.guide) == "function" then
+    local extra = p.guide({ model = model, parallel_requested = parallel_requested, policy = vim.deepcopy(p) })
+    if type(extra) == "string" and extra ~= "" then lines[#lines + 1] = extra end
+  end
   if not enabled then
     lines[#lines + 1] = "- Sub-agents are disabled. Work directly and keep verification proportional to this mode."
   elseif #choices == 0 and route_state == "unconfigured" then
