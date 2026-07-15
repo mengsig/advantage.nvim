@@ -267,41 +267,39 @@ function M.guide(mode, model, parallel_requested)
   elseif #choices == 0 then
     lines[#lines + 1] =
       "- All configured sub-agent routes are temporarily unavailable after a deterministic provider/model failure. Do not retry or guess IDs; continue directly with parent tools."
-  elseif p.proactive and concurrent then
-    lines[#lines + 1] = model_instruction
-    lines[#lines + 1] =
-      '- When two or more independent scouts materially help, use one sub_agent_batch(mode="parallel") in the initial investigation turn. Never serialize independent scouts across later turns. Batch mode="sequential" only serializes self-contained prompts; for a true data dependency, wait for the report and issue the dependent scout from a later parent turn.'
-    lines[#lines + 1] = ("- Proactively CONSIDER delegation, but it is optional: direct parent work is normally better for a simple/localized defect or a greenfield implementation. Size the first wave to distinct unresolved domains (up to %d concurrent), with no generic architecture, test-survey, validation-workflow, or duplicate-review scout."):format(
-      max_parallel
-    )
-    lines[#lines + 1] =
-      "- The concurrency width is not a scout-count quota: a larger justified wave may queue, but every added scout needs a distinct non-overlapping question. Prefer more short focused scouts over a few broad scouts that each consume their full turn ceiling."
-    lines[#lines + 1] =
-      "- Use one initial scout wave by default, then synthesize and ACT. A later wave is only for a new concrete blocker exposed by evidence; never start post-implementation scouts merely to review code or rerun validation. The parent owns mutations and final verification."
-    lines[#lines + 1] =
-      "- Keep scouts task-proportional: medium/high effort and about 3-6 turns normally suffice. Use 8-12 turns only for one genuinely deep isolated blocker; never give every member of a breadth-oriented wave the maximum."
-    lines[#lines + 1] =
-      "- Scouts are read-only and cannot run shell commands, create fixtures, or execute a CLI. Assign them static inspection or web research only. If every scout depends on shared runtime evidence, the parent may run one bounded prerequisite command batch before fan-out and include that evidence in the scout prompts."
-  elseif p.proactive then
-    lines[#lines + 1] = model_instruction
-    lines[#lines + 1] =
-      '- You may use sub_agent_batch(mode="sequential") to serialize self-contained scouts. It does not feed earlier reports into later batch prompts; issue genuinely dependent scouts from separate parent turns.'
-    lines[#lines + 1] =
-      "- Proactively consider a scout only when its evidence will materially reduce parent work. Direct work is normally better for localized defects and greenfield implementation; never delegate generic repository/test surveys or duplicate review."
-    lines[#lines + 1] =
-      "- Use one initial wave by default, then synthesize and act. Further sequential scouts require a concrete dependency on the previous report; never launch post-implementation review scouts. The parent owns mutations and final verification."
-    lines[#lines + 1] =
-      "- Medium/high effort and about 3-6 turns normally suffice for a scoped scout; reserve 8-12 turns for one concrete hard blocker, never a whole breadth wave. Scouts cannot run shell commands or create fixtures; the parent owns runtime verification."
   else
     lines[#lines + 1] = model_instruction
     lines[#lines + 1] =
-      '- You may use sub_agent_batch(mode="parallel"|"sequential") to choose concurrency for self-contained prompts. Data-dependent scouts require separate parent turns so the later prompt can use the earlier report.'
+      "- Treat scout reports as evidence to reconcile, not implementation authority. Ask for the narrowest investigation that reuses existing representations and invariants. Seek complete behavioral coverage, not a comprehensive redesign; recommend a new data model only when evidence proves the current representation cannot satisfy the contract."
     lines[#lines + 1] =
-      "- Prefer direct parent work. Delegate only on explicit request or when a scout has a clear, material advantage."
+      "- Give each discovery question one owner. While a scout maps an area, do not run a broad parent survey of the same area in the same response. Consume an unambiguous exact source or precise span and never re-read it ceremonially; perform one narrow confirmation only for concrete ambiguity, truncation, or conflict."
+
+    if p.proactive and concurrent then
+      lines[#lines + 1] =
+        '- When two or more independent scouts materially help, use one sub_agent_batch(mode="parallel") in the initial investigation turn. Never serialize independent scouts across later turns. Batch mode="sequential" only serializes self-contained prompts; wait for the report before issuing a genuinely dependent scout from a separate parent turn.'
+      lines[#lines + 1] = ("- Proactively consider delegation, but keep it task-proportional and optional. Direct parent work is normally better for a simple localized defect or greenfield implementation. Use distinct, non-overlapping questions rather than a scout-count quota (up to %d concurrent); do not delegate generic architecture, test-survey, validation, or duplicate-review roles."):format(
+        max_parallel
+      )
+      lines[#lines + 1] =
+        "- Use one task-sized investigation wave by default, then synthesize and act. A later scout is justified only by a new concrete blocker exposed by evidence, never by a desire for post-implementation review."
+      lines[#lines + 1] =
+        "- Medium/high effort and 3-6 turns normally suffice. Reserve 8-12 turns for one genuinely deep isolated blocker; never give every scout in a breadth wave the maximum."
+    elseif p.proactive then
+      lines[#lines + 1] =
+        '- The parallel scheduler is unavailable for this mode. Use sub_agent_batch(mode="sequential") only for self-contained scouts; it does not pass earlier reports into later prompts, so issue dependent scouts from separate parent turns.'
+      lines[#lines + 1] =
+        "- Proactively consider one scout only when its evidence will materially reduce parent work. Direct work is normally better for localized defects and greenfield implementation; never delegate generic surveys or duplicate review."
+      lines[#lines + 1] =
+        "- Use one task-sized investigation wave, then synthesize and act. Further scouts require a concrete dependency on prior evidence; never launch post-implementation review scouts. Medium/high effort and 3-6 turns normally suffice; reserve 8-12 for one hard blocker."
+    else
+      lines[#lines + 1] =
+        '- You may use sub_agent_batch(mode="parallel"|"sequential") for self-contained prompts. Data-dependent scouts require separate parent turns so each later prompt can use the earlier report.'
+      lines[#lines + 1] =
+        "- Prefer direct parent work. Delegate only on explicit request or when a scout has a clear material advantage. Keep any delegation task-sized, non-overlapping, and free of generic surveys, duplicate review, or post-implementation fan-out."
+    end
+
     lines[#lines + 1] =
-      "- If delegation is useful, size it to distinct unresolved domains and do not manufacture generic surveys, duplicate review, or post-implementation fan-out. For dependent work, wait for the first report before issuing the next scout."
-    lines[#lines + 1] =
-      "- Scouts cannot run shell commands, create fixtures, or execute a CLI. Use them for static inspection or web research; keep runtime verification in the parent."
+      "- Scouts are read-only: they cannot edit, run shell commands, create fixtures, or execute a CLI. Use them for static inspection or web research. The parent owns mutations, runtime evidence, and final verification."
   end
   if parallel_requested and concurrent then
     lines[#lines + 1] = ("- The user explicitly requested parallel research. Emit all independent sub_agent calls together in THIS response (one call per requested, non-overlapping role, with explicit model and effort); do not add generic extra reviewers or serialize them across later turns. A single concrete prerequisite command batch is allowed first only when every scout needs its runtime evidence. Dependent work remains sequential. Up to %d scouts run concurrently; additional justified scouts queue rather than being rejected."):format(

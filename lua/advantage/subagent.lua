@@ -52,11 +52,6 @@ local function system_prompt(max_turns, cwd)
     lines[#lines + 1] = ""
     lines[#lines + 1] = lsp
   end
-  local navgraph = agent.navgraph_guide()
-  if navgraph then
-    lines[#lines + 1] = ""
-    lines[#lines + 1] = navgraph
-  end
   local research = {}
   for _, definition in ipairs(readonly_tools()) do
     research[definition.name] = true

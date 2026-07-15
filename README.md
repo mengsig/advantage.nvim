@@ -24,10 +24,10 @@ feeds on the fallout, and keeps swinging until the task is dead.
   (never a shell), fixes the root to the project, disables cache writes, rejects
   Git-backed history/diff, mutating/server commands, and external reads, and
   stays out of the baseline schema when disabled or unavailable. Once enabled
-  and executable, both the parent and read-only scouts automatically receive
-  the typed tool plus a conditional routing guide. The model still decides
-  whether to call it and is instructed to abstain for known-file and greenfield
-  work; availability never forces a ceremonial query. Indexed queries run with
+  and executable, both the parent and read-only scouts receive the same typed,
+  bounded tool. No NavGraph-specific standing prompt is injected: the schema and
+  validation contract describe its operations without adding tool-specific policy
+  to every turn. Indexed queries run with
   `--no-cache` and therefore reindex—a deliberate no-workspace-writes tradeoff
   on very large repositories—while commands that negotiate themselves as
   no-index/cacheless omit that inapplicable flag. A selected call runs the configured external executable,
@@ -702,6 +702,15 @@ require("advantage").setup({ extensions = { "my_advantage_extension" } })
 A skill may declare `advantage-harness: review` in its frontmatter. This only
 changes the live harness when `memory.allow_skill_harness = true`; it is disabled
 by default so sharing a skill can never silently increase orchestration or cost.
+
+**Built-in engineering policy.** The default system prompt is language-agnostic
+and carries ten ordered commandments covering human-readable code, cohesive
+units, enforced invariants, visible failures, explicit data flow and ownership,
+problem-fit design, behavioral verification, clean boundaries, sound data models,
+and narrow compatible changes. Tool-, memory-, verification-, and harness-specific
+instructions are separate conditional blocks, keeping unavailable capabilities and
+mode-specific orchestration out of the core policy. `system_prompt` may still
+replace the default with a string or extend it with `function(default)`.
 
 **Context preview.** `/context preview` (or `:Advantage context preview`,
 `<leader>cP`) renders the exact packet that goes to the model each turn — the

@@ -1059,31 +1059,18 @@ do
     "NavGraph negotiates the current Java-aware contract once per executable identity and freezes a deterministic schema"
   )
   local agent_mod = require("advantage.agent")
-  local navgraph_guide = agent_mod.navgraph_guide()
-  check(
-    navgraph_guide
-      and navgraph_guide:find("Unknown cross%-file")
-      and navgraph_guide:find("Known file/line")
-      and navgraph_guide:find("Literal prose")
-      and navgraph_guide:find("greenfield")
-      and navgraph_guide:find("ONE owner", 1, true)
-      and navgraph_guide:find("Never call NavGraph merely", 1, true)
-      and navgraph_guide:find("repository path filter", 1, true)
-      and navgraph_guide:find("literal substring", 1, true)
-      and navgraph_guide:find("route/event-key filters", 1, true)
-      and navgraph_guide:find("language/topic", 1, true)
-      and navgraph_guide:find("flag-shaped text", 1, true)
-      and navgraph_guide:find("ascending bounded prefix", 1, true)
-      and navgraph_guide:find("Switch routes only", 1, true),
-    "enabled NavGraph receives a conditional semantic-routing guide rather than a mandatory-use prompt"
-  )
-  local navgraph_part, scout_navgraph_prompt = false, require("advantage.subagent")._system_prompt(2, repo)
+  local scout_navgraph_prompt = require("advantage.subagent")._system_prompt(2, repo)
+  local navgraph_part, built_in_parts = false, {}
   for _, part in ipairs(agent_mod.system_prompt_parts(nil)) do
     if part.label == "navgraph guide" then navgraph_part = true end
+    if not part.is_memory then built_in_parts[#built_in_parts + 1] = part.text end
   end
+  local built_in_prompt = table.concat(built_in_parts, "\n\n")
   check(
-    navgraph_part and scout_navgraph_prompt:find("Semantic discovery routing", 1, true),
-    "the same conditional NavGraph routing guide reaches parent and scout prompts"
+    not navgraph_part
+      and not built_in_prompt:find("NavGraph", 1, true)
+      and not scout_navgraph_prompt:find("NavGraph", 1, true),
+    "enabled NavGraph relies on its typed tool schema without injecting tool-specific prompt guidance"
   )
   local enum = schema and schema.input_schema.properties.command.enum or {}
   local properties = schema and schema.input_schema.properties or {}
@@ -1905,11 +1892,10 @@ do
   vim.notify = old_notify
 
   config.options.tools.navgraph = saved
-  check(require("advantage.agent").navgraph_guide() == nil, "NavGraph guide disappears when the tool is disabled")
   check(
     not require("advantage.agent").system_prompt(nil, repo):find("NavGraph", 1, true)
       and not require("advantage.subagent")._system_prompt(2, repo):find("NavGraph", 1, true),
-    "disabled NavGraph leaves neither its tool guidance nor a dangling parent/scout prompt reference"
+    "disabled NavGraph leaves no dangling parent/scout prompt reference"
   )
   vim.env.ADV_NAVGRAPH_TEST_LOG = old_log
   vim.env.ADV_NAVGRAPH_TEST_CAPABILITIES = old_capabilities
@@ -4431,6 +4417,8 @@ do
 
   local config = require("advantage.config")
   local old_verification = config.options.verification
+  local old_yolo = config.options.tools.yolo
+  config.options.tools.yolo = false
   config.options.verification = {
     enabled = true,
     commands = {},
@@ -4532,8 +4520,22 @@ do
   gate_callback({ ok = true, commands_run = 1 })
   check(finished == 5, "approved manifest gates finish normally")
 
+  vim.fn.writefile({ '{"version":1,"commands":["make test --yolo"]}' }, manifest_file)
+  local yolo_snapshot = manifest.load(root, ".advantage/verification.json")
+  agent._verification_snapshot = yolo_snapshot
+  gate_callback, approval_callback = nil, nil
+  config.options.tools.yolo = true
+  agent:_run_automatic_verification()
+  check(
+    gate_callback and not approval_callback and manifest.is_trusted(root, yolo_snapshot),
+    "yolo trusts the exact manifest hash and starts verification without prompting"
+  )
+  gate_callback({ ok = true, commands_run = 1 })
+  check(finished == 6, "yolo-trusted manifest gates finish normally")
+
   verification.run = original_run
   manifest._trust_path_override = nil
+  config.options.tools.yolo = old_yolo
   config.options.verification = old_verification
   vim.fn.delete(root, "rf")
 end
@@ -5820,6 +5822,37 @@ do
   end
 
   local base_discipline = agent_mod.base_system_prompt(vim.fn.getcwd())
+  local commandment_titles = {
+    "Write for humans first",
+    "Keep units cohesive",
+    "Express and enforce meaningful invariants",
+    "Never hide failure",
+    "Make data flow, ownership, and dependencies explicit",
+    "Fit the design to the actual problem",
+    "Verify changed behavior",
+    "Avoid tight coupling; design clean boundaries",
+    "Get the data model right first",
+    "Keep changes scoped and compatible",
+  }
+  local commandment_cursor, commandments_ordered, numbered_lines = 1, true, 0
+  for _, title in ipairs(commandment_titles) do
+    local marker = ("%d. %s."):format(numbered_lines + 1, title)
+    local found = base_discipline:find(marker, commandment_cursor, true)
+    if not found then
+      commandments_ordered = false
+      break
+    end
+    commandment_cursor = found + #marker
+    numbered_lines = numbered_lines + 1
+  end
+  local actual_numbered_lines = 0
+  for line in base_discipline:gmatch("[^\n]+") do
+    if line:match("^%d+%. ") then actual_numbered_lines = actual_numbered_lines + 1 end
+  end
+  check(
+    commandments_ordered and numbered_lines == 10 and actual_numbered_lines == 10,
+    "base instructions contain the ten engineering commandments exactly once and in priority order"
+  )
   check(
     has_all_concepts(base_discipline, {
       { "narrowest", "smallest compatible", "minimal compatible" },
@@ -5840,8 +5873,17 @@ do
     }),
     "base instructions forbid weakening passing assertions and require hermetic tests"
   )
+
+  require("advantage.subagent")._reset_route_health()
+  local saved_models = vim.deepcopy(config.options.models)
+  local saved_aliases = vim.deepcopy(config.options.subagents.model_aliases)
+  config.options.models[#config.options.models + 1] = { ref = "fakephase/parent", label = "phase parent" }
+  config.options.subagents.model_aliases = config.options.subagents.model_aliases or {}
+  config.options.subagents.model_aliases.phase_policy = "fakephase/parent"
+  local delegation_discipline = harness.guide("ultra", { provider = "fakephase", id = "parent" })
+  local proportional = delegation_discipline:lower()
   check(
-    has_all_concepts(base_discipline, {
+    has_all_concepts(delegation_discipline, {
       { "reuse" },
       { "existing representation", "existing invariant" },
       { "behavioral coverage", "complete behavior" },
@@ -5850,7 +5892,7 @@ do
     "delegation guidance separates complete behavior from architectural breadth"
   )
   check(
-    has_all_concepts(base_discipline, {
+    has_all_concepts(delegation_discipline, {
       { "one owner" },
       { "same response" },
       { "broad parent" },
@@ -5859,14 +5901,6 @@ do
     }),
     "delegation guidance prevents additive parent discovery and ceremonial re-reads"
   )
-
-  require("advantage.subagent")._reset_route_health()
-  local saved_models = vim.deepcopy(config.options.models)
-  local saved_aliases = vim.deepcopy(config.options.subagents.model_aliases)
-  config.options.models[#config.options.models + 1] = { ref = "fakephase/parent", label = "phase parent" }
-  config.options.subagents.model_aliases = config.options.subagents.model_aliases or {}
-  config.options.subagents.model_aliases.phase_policy = "fakephase/parent"
-  local proportional = harness.guide("ultra", { provider = "fakephase", id = "parent" }):lower()
   config.options.models = saved_models
   config.options.subagents.model_aliases = saved_aliases
   check(

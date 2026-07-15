@@ -208,6 +208,17 @@ Full defaults live in `lua/advantage/config.lua`. Key options: >lua
 Note: `models` and other list options are replaced wholesale when you supply
 them (not merged element-wise with the defaults).
 
+BUILT-IN ENGINEERING POLICY                         *advantage-system-prompt*
+
+The default system prompt is language-agnostic and carries ten ordered
+commandments: write for humans, keep units cohesive, enforce invariants, expose
+failures, make data flow and ownership explicit, fit the design to the problem,
+verify behavior, preserve clean boundaries, model state soundly, and keep changes
+narrow and compatible. Tool-, memory-, verification-, and harness-specific
+instructions are separate conditional blocks. Configure `system_prompt` with a
+string to replace the default or `function(default)` to extend it. Use
+`context preview` to inspect the exact composed prompt and per-part token cost.
+
 THINKING AND REASONING                              *advantage-effort-levels*
 
 `:Advantage effort [mode]` and `/effort [mode]` only offer values supported by
