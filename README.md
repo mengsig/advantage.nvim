@@ -238,14 +238,15 @@ because their thinking output is not shown.
 
 `:Advantage` opens the panel. Type in the prompt, `⏎` sends immediately. If a
 turn is already running, Enter does **not** cancel it: the message is injected
-before the next tool call, like Claude Code. Use `⌃s` to queue a message until
-the agent is completely done with its current flow; queued messages dispatch one
+before the next tool call. The agent answers it, then receives an explicit hidden
+continuation and resumes the unfinished original task. Use `⌃s` to queue a message
+until the agent is completely done with its current flow; queued messages dispatch one
 by one after the flow finishes (`⌃c` cancels the turn *and* drops the queue). The
 prompt grows with your message as you type.
 
 | where  | key            | action                                    |
 | ------ | -------------- | ----------------------------------------- |
-| prompt | `⏎`            | send now (before next tool call if running) |
+| prompt | `⏎`            | answer now, then resume running task       |
 | prompt | `⌃s`           | queue until the agent is completely done  |
 | prompt | `⇧⏎` / `⌃j`    | newline                                   |
 | prompt | `@`            | complete a project file to mention        |

@@ -102,8 +102,8 @@ function M.cwd()
 end
 
 ---Send a prompt (opens the panel if hidden). While a turn is running, the
----default `mode = "instant"` injects it before the next tool call; `mode = "queued"`
----waits until the whole agent flow is idle.
+---default `mode = "instant"` injects it before the next tool call, answers it,
+---then resumes unfinished work; `mode = "queued"` waits for the flow to become idle.
 ---@param opts? {images?: table[], mode?: "instant"|"queued"}
 function M.ask(text, opts)
   local agent = ensure_agent()

@@ -225,6 +225,7 @@ function M.new(opts)
   self.allowed = {} -- per-session "always allow" tool names
   self.queue = {} -- Ctrl-S messages submitted while a turn was running
   self.interrupts = {} -- Enter messages to inject before the next tool call
+  self._resume_after_interrupt = false -- answer injected guidance, then resume the original task
   self.pending_permission = nil -- callable that resolves the active permission card
   self.active_tools = {} -- tool_use_id -> cancellable handle returned by a running tool
   self.parallel_batch = nil -- active fan-out scheduler, including queued (not-yet-started) scouts
@@ -406,8 +407,8 @@ function Agent:_push_user_message(text, opts, show)
 end
 
 ---Entry point: user sends a prompt. While a turn is running, `mode = "queued"`
----queues behind the whole agent flow; the default `mode = "instant"` injects the
----message before the next tool call without cancelling the current response.
+---queues behind the whole flow; `mode = "instant"` injects the message without
+---cancelling, answers it, then explicitly resumes the unfinished task.
 ---@param opts? {images?: {name:string, media_type:string, data:string}[], mode?: "instant"|"queued"}
 function Agent:send(text, opts)
   opts = opts or {}
@@ -436,7 +437,7 @@ function Agent:send(text, opts)
       self:refresh_prompt_policy()
     end
     self:ui().user_message(text, opts.images)
-    self:ui().notice("will send before the next tool call")
+    self:ui().notice("will answer before the next tool call, then resume the task")
     if self.pending_permission then self.pending_permission("interrupt") end
     return
   end
@@ -451,6 +452,7 @@ function Agent:send(text, opts)
   self.turn_usage = { input = 0, output = 0, cached = 0, reasoning = 0, cache_write = 0 }
   self.turn_open = false
   self.turn_changed = {}
+  self._resume_after_interrupt = false
   self._verification_repairs = 0
   self._verification_snapshot = nil
   local verification_cfg = config.options.verification or {}
@@ -503,6 +505,7 @@ function Agent:_drain_interrupts(results, remaining_calls)
     table.insert(self.messages, { role = "user", content = item.content })
   end
   self.interrupts = {}
+  self._resume_after_interrupt = true
   self.loop = 0 -- fresh user input restarts the runaway budget
   return true
 end
@@ -1192,6 +1195,26 @@ function Agent:_run_automatic_verification()
   self:_start_automatic_verification(commands)
 end
 
+function Agent:_resume_interrupted_task()
+  if not self._resume_after_interrupt then return false end
+  assert(type(self.messages) == "table", "interrupt continuation requires message history")
+  assert(not self.cancelled, "cancelled turns cannot resume after an interrupt")
+  self._resume_after_interrupt = false
+  table.insert(self.messages, {
+    role = "user",
+    content = {
+      {
+        type = "text",
+        text = "<harness_continuation>Resume the original task now. Incorporate the interruption, continue the unfinished work, and do not repeat the interruption answer.</harness_continuation>",
+      },
+    },
+    synthetic = true,
+  })
+  self:ui().notice("interrupt answered — resuming the original task")
+  self:_restart_turn()
+  return true
+end
+
 ---Handle a completed model response: record the assistant blocks, then route to
 ---tool execution, an interrupt-driven restart, verification, or turn completion.
 function Agent:_on_stream_complete(blocks, stop_reason)
@@ -1223,6 +1246,7 @@ function Agent:_on_stream_complete(blocks, stop_reason)
     self:ui().notice("response hit the output-token limit and was truncated")
     return self:_finish()
   end
+  if self:_resume_interrupted_task() then return end
   self:_run_automatic_verification()
 end
 
@@ -1750,6 +1774,7 @@ end
 
 function Agent:_finish(errored)
   self.status = "idle"
+  self._resume_after_interrupt = false
   local ui = self:ui()
   ui.finish_turn()
   ui.set_status("idle")
@@ -1785,6 +1810,7 @@ function Agent:cancel(opts)
   if not self:busy() then return end
   local was_compacting = self.status == "compacting"
   self.cancelled = true
+  self._resume_after_interrupt = false
   self.epoch = self.epoch + 1
   -- job.stop() below never invokes the summarizer's completion callback, which
   -- is the only place that otherwise clears this flag — reset it here so a

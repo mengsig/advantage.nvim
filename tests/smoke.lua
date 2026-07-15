@@ -4647,11 +4647,20 @@ do
   local providers = require("advantage.providers")
   local agent_mod = require("advantage.agent")
   local ui = require("advantage.ui.chat")
-  local turn, stopped, seen = 0, false, nil
+  local function has_continuation(messages)
+    for _, message in ipairs(messages or {}) do
+      for _, block in ipairs(type(message.content) == "table" and message.content or {}) do
+        if block.type == "text" and block.text:find("<harness_continuation>", 1, true) then return true end
+      end
+    end
+    return false
+  end
+  local turn, stopped, seen, resumed_seen = 0, false, nil, nil
   providers.register("fakeinterrupt", {
     stream = function(req)
       turn = turn + 1
       if turn == 2 then seen = req.messages end
+      if turn == 3 then resumed_seen = req.messages end
       local on = req.on
       vim.defer_fn(function()
         if turn == 1 then
@@ -4661,9 +4670,12 @@ do
             { type = "text", text = "I may need a command." },
             { type = "tool_use", id = "tu_interrupt", name = "bash", input = { command = "echo should-not-run" } },
           }, "tool_use")
+        elseif turn == 2 then
+          on.text("The interruption is answered.")
+          on.complete({ { type = "text", text = "The interruption is answered." } }, "end_turn")
         else
-          on.text("Adjusted before running the tool.")
-          on.complete({ { type = "text", text = "Adjusted before running the tool." } }, "end_turn")
+          on.text("Resumed and completed the original task.")
+          on.complete({ { type = "text", text = "Resumed and completed the original task." } }, "end_turn")
         end
       end, turn == 1 and 30 or 10)
       return {
@@ -4680,11 +4692,11 @@ do
     ag:send("second before tool")
   end, 5)
   vim.wait(8000, function()
-    return turn >= 2 and ui.state.status == "idle"
+    return turn >= 3 and ui.state.status == "idle"
   end, 25)
 
   check(stopped == false, "enter while running does not cancel the stream")
-  check(turn == 2, "interrupt triggered a follow-up model turn")
+  check(turn == 3, "interrupt answer is followed by an automatic continuation turn")
   check(seen and seen[3] and seen[3].role == "user", "interrupt inserted tool-result turn before follow-up")
   check(
     seen and seen[3] and seen[3].content[1].type == "tool_result" and seen[3].content[1].is_error == true,
@@ -4699,12 +4711,15 @@ do
     "interrupt text sent as its own user turn"
   )
 
+  check(has_continuation(resumed_seen), "the harness explicitly resumes unfinished work after answering the interrupt")
+
   require("advantage.config").options.tools.auto_approve = {}
-  local wait_turn, wait_seen = 0, nil
+  local wait_turn, wait_seen, wait_resumed_seen = 0, nil, nil
   providers.register("fakewaitinterrupt", {
     stream = function(req)
       wait_turn = wait_turn + 1
       if wait_turn == 2 then wait_seen = req.messages end
+      if wait_turn == 3 then wait_resumed_seen = req.messages end
       local on = req.on
       vim.defer_fn(function()
         if wait_turn == 1 then
@@ -4712,9 +4727,12 @@ do
           on.complete({
             { type = "tool_use", id = "tu_wait_interrupt", name = "bash", input = { command = "echo should-not-run" } },
           }, "tool_use")
+        elseif wait_turn == 2 then
+          on.text("Permission interruption answered.")
+          on.complete({ { type = "text", text = "Permission interruption answered." } }, "end_turn")
         else
-          on.text("Continued after permission interrupt.")
-          on.complete({ { type = "text", text = "Continued after permission interrupt." } }, "end_turn")
+          on.text("Original permission-gated task resumed.")
+          on.complete({ { type = "text", text = "Original permission-gated task resumed." } }, "end_turn")
         end
       end, 10)
       return { stop = function() end }
@@ -4727,9 +4745,9 @@ do
   end, 25)
   ag_wait:send("interrupt permission")
   vim.wait(8000, function()
-    return wait_turn >= 2 and ui.state.status == "idle"
+    return wait_turn >= 3 and ui.state.status == "idle"
   end, 25)
-  check(wait_turn == 2, "enter while permission is waiting skips the pending tool")
+  check(wait_turn == 3, "permission interrupt answers and then resumes the original task")
   check(
     wait_seen
       and wait_seen[3]
@@ -4737,6 +4755,39 @@ do
       and wait_seen[3].content[1].content:find("Tool skipped", 1, true),
     "permission interrupt sends skipped tool_result"
   )
+  check(has_continuation(wait_resumed_seen), "permission interruption also receives an explicit continuation turn")
+
+  local completed_turns, completed_seen = 0, nil
+  providers.register("fakecompletedinterrupt", {
+    stream = function(req)
+      completed_turns = completed_turns + 1
+      if completed_turns == 2 then completed_seen = req.messages end
+      local on = req.on
+      vim.defer_fn(function()
+        if completed_turns == 1 then
+          on.text("The original response completed normally.")
+          on.complete({ { type = "text", text = "The original response completed normally." } }, "end_turn")
+        else
+          on.text("Late interruption answered.")
+          on.complete({ { type = "text", text = "Late interruption answered." } }, "end_turn")
+        end
+      end, completed_turns == 1 and 30 or 10)
+      return { stop = function() end }
+    end,
+  })
+  local ag_completed = agent_mod.new({ model = { provider = "fakecompletedinterrupt", id = "m", label = "m" } })
+  ag_completed:send("task that completes without tools")
+  vim.defer_fn(function()
+    ag_completed:send("late interruption")
+  end, 5)
+  vim.wait(8000, function()
+    return completed_turns >= 2 and ui.state.status == "idle"
+  end, 25)
+  vim.wait(50, function()
+    return false
+  end, 5)
+  check(completed_turns == 2, "a completed original response does not receive a redundant continuation turn")
+  check(not has_continuation(completed_seen), "normal completion answers the interruption without fake unfinished work")
 end
 
 -- 8. ui regressions ---------------------------------------------------------------
