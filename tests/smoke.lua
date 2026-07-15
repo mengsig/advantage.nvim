@@ -4359,7 +4359,186 @@ do
   end
 end
 
--- 5. agent e2e with a fake provider + UI ----------------------------------------
+-- 5. deterministic verification -------------------------------------------------
+
+section("deterministic verification")
+do
+  local verification = require("advantage.verification")
+  local root = vim.fn.tempname() .. "-verification"
+  vim.fn.mkdir(root, "p")
+  local result
+  verification.run({ "printf first > first.txt", "test -f first.txt && printf second" }, {
+    cwd = root,
+    timeout_ms = 2000,
+    max_output_bytes = 1000,
+  }, function(value)
+    result = value
+  end)
+  vim.wait(3000, function()
+    return result ~= nil
+  end, 10)
+  check(result and result.ok and result.commands_run == 2, "configured verification commands run in order")
+  check(vim.fn.filereadable(root .. "/first.txt") == 1, "verification commands run in the project root")
+
+  result = nil
+  verification.run({ "printf gate-failed; exit 7", "touch should-not-run" }, {
+    cwd = root,
+    timeout_ms = 2000,
+    max_output_bytes = 1000,
+  }, function(value)
+    result = value
+  end)
+  vim.wait(3000, function()
+    return result ~= nil
+  end, 10)
+  check(result and not result.ok and result.command:find("gate%-failed"), "the first failed gate is reported")
+  check(vim.fn.filereadable(root .. "/should-not-run") == 0, "later gates do not run after a failure")
+
+  local manifest = require("advantage.verification_manifest")
+  local manifest_dir = root .. "/.advantage"
+  local manifest_file = manifest_dir .. "/verification.json"
+  vim.fn.mkdir(manifest_dir, "p")
+  vim.fn.writefile({ '{"version":1,"commands":["make test","make lint"]}' }, manifest_file)
+  manifest._trust_path_override = root .. "/state/verification-trust.json"
+  local snapshot = manifest.load(root, ".advantage/verification.json")
+  check(
+    not snapshot.error and vim.deep_equal(snapshot.commands, { "make test", "make lint" }),
+    "project verification manifest loads strict versioned commands"
+  )
+  check(not manifest.is_trusted(root, snapshot), "a new project manifest is untrusted")
+  local trusted = manifest.trust(root, snapshot)
+  check(trusted and manifest.is_trusted(root, snapshot), "an approved manifest hash persists")
+
+  vim.fn.writefile({ '{"version":1,"commands":["make test --all"]}' }, manifest_file)
+  local changed_snapshot = manifest.load(root, ".advantage/verification.json")
+  check(not manifest.is_trusted(root, changed_snapshot), "changing manifest commands requires fresh approval")
+  vim.fn.writefile({ '{"version":1,"commands":[7]}' }, manifest_file)
+  check(manifest.load(root, ".advantage/verification.json").error ~= nil, "non-string manifest commands fail closed")
+  vim.fn.writefile({ "not json" }, manifest_file)
+  check(manifest.load(root, ".advantage/verification.json").error == "invalid JSON", "malformed manifests fail closed")
+  local outside_manifest = vim.fn.tempname() .. "-outside-verification.json"
+  vim.fn.writefile({ '{"version":1,"commands":["outside"]}' }, outside_manifest)
+  vim.fn.delete(manifest_file)
+  local symlinked = (vim.uv or vim.loop).fs_symlink(outside_manifest, manifest_file)
+  check(
+    symlinked
+      and manifest.load(root, ".advantage/verification.json").error == "manifest symlink escapes the project root",
+    "manifest symlinks cannot escape the project"
+  )
+  vim.fn.delete(manifest_file)
+  vim.fn.delete(outside_manifest)
+  vim.fn.writefile({ '{"version":1,"commands":["make test --all"]}' }, manifest_file)
+
+  local config = require("advantage.config")
+  local old_verification = config.options.verification
+  config.options.verification = {
+    enabled = true,
+    commands = {},
+    manifest = ".advantage/verification.json",
+    timeout_ms = 1000,
+    max_output_bytes = 1000,
+    max_repairs = 1,
+  }
+  local agent_module = require("advantage.agent")
+  local guide = agent_module.verification_guide()
+  local initial_prompt = agent_module.system_prompt("", root)
+  check(
+    guide
+      and #guide < 300
+      and initial_prompt:find("Never invent or weaken checks", 1, true)
+      and initial_prompt:find(".advantage/verification.json", 1, true),
+    "the initial prompt gets compact manifest-maintenance guidance"
+  )
+  config.options.verification.commands = { "project-check" }
+  local agent = require("advantage.agent").new({
+    id = "verification-test",
+    model = { provider = "fake", id = "test-model", label = "fake" },
+    start_cwd = root,
+  })
+  local notices, finished, restarted = {}, 0, 0
+  local approval_callback
+  agent.ui = function()
+    return {
+      set_status = function() end,
+      notice = function(message)
+        notices[#notices + 1] = message
+      end,
+      user_message = function() end,
+      confirm = function(_, callback)
+        approval_callback = callback
+        return callback
+      end,
+    }
+  end
+  agent._finish = function(_, errored)
+    finished = finished + 1
+    agent.test_errored = errored
+  end
+  agent._restart_turn = function()
+    restarted = restarted + 1
+  end
+
+  agent.turn_changed = {}
+  agent:_run_automatic_verification()
+  check(finished == 1, "read-only turns skip automatic verification")
+
+  agent.turn_changed = { [root .. "/changed.lua"] = true }
+  config.options.verification.enabled = false
+  agent:_run_automatic_verification()
+  check(finished == 2, "disabled automatic verification adds no gate cost")
+  config.options.verification.enabled = true
+
+  local original_run = verification.run
+  local gate_callback
+  verification.run = function(_, _, callback)
+    gate_callback = callback
+    return { stop = function() end }
+  end
+  agent:_run_automatic_verification()
+  check(type(gate_callback) == "function" and agent.status == "verifying", "changed work starts verification")
+  gate_callback({ ok = true, commands_run = 1 })
+  check(finished == 3 and restarted == 0, "passing gates finish without another model turn")
+
+  gate_callback = nil
+  agent:_run_automatic_verification()
+  gate_callback({ ok = false, command = "project-check", output = "broken" })
+  check(restarted == 1 and agent._verification_repairs == 1, "one failed gate starts a same-conversation repair")
+  local repair = agent.messages[#agent.messages]
+  check(
+    repair and repair.role == "user" and repair.content[1].text:find("Do not weaken the check", 1, true),
+    "repair receives compact deterministic failure evidence"
+  )
+
+  gate_callback = nil
+  agent:_run_automatic_verification()
+  gate_callback({ ok = false, command = "project-check", output = "still broken" })
+  check(finished == 4 and restarted == 1 and agent.test_errored, "repair attempts are bounded")
+
+  config.options.verification.commands = {}
+  agent._verification_repairs = 0
+  agent._verification_snapshot = snapshot
+  local pinned_commands = agent:_verification_plan()
+  check(pinned_commands[1] == "make test", "manifest commands stay pinned for the complete user turn")
+  agent._verification_snapshot = changed_snapshot
+  agent.turn_changed = { [root .. "/changed.lua"] = true }
+  gate_callback, approval_callback = nil, nil
+  agent:_run_automatic_verification()
+  check(approval_callback and not gate_callback, "an unapproved project manifest cannot execute")
+  approval_callback("allow")
+  check(
+    gate_callback and manifest.is_trusted(root, changed_snapshot),
+    "approval trusts the exact hash before execution"
+  )
+  gate_callback({ ok = true, commands_run = 1 })
+  check(finished == 5, "approved manifest gates finish normally")
+
+  verification.run = original_run
+  manifest._trust_path_override = nil
+  config.options.verification = old_verification
+  vim.fn.delete(root, "rf")
+end
+
+-- 6. agent e2e with a fake provider + UI ----------------------------------------
 
 -- keep test token usage out of the user's real ledger
 require("advantage.usage")._ledger_override = vim.fn.tempname() .. "-usage.jsonl"

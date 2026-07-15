@@ -280,6 +280,25 @@ counts, and opens either one unified diff of everything or a real side-by-side
 vimdiff tab per file — before on the left (read-only), the live file on the
 right (editable), `q` closes. With no agent changes it falls back to `git diff`.
 
+**Deterministic verification.** Advantage maintains project-local gates in
+`.advantage/verification.json` (commit it with the project):
+
+```json
+{"version":1,"commands":["stylua --check .","nvim -l tests/smoke.lua"]}
+```
+
+A compact initial-prompt rule tells the agent to update this file only after a
+check is confirmed by repository/CI configuration or a successful run—never to
+invent or weaken checks. The manifest is snapshotted at the start of each user
+turn, so edits activate on the next turn and cannot move the goalposts during a
+repair. A new or changed manifest hash needs one permission-card approval before
+execution; the approval persists for that exact project and content hash.
+Commands run in order after a clean response with file-tool changes and stop at
+the first failure. Bounded evidence gets at most `max_repairs` same-conversation
+repair attempts. Read-only turns, refusals, truncated responses, and absent or
+empty manifests pay no gate cost. Explicit `verification.commands` override the
+manifest and remain trusted user configuration.
+
 **YOLO mode.** `/yolo` (or `:Advantage yolo [on|off]`, `<leader>cy`, or
 `tools = { yolo = true }` / `dangerously_skip_permissions = true` in setup)
 skips *all* permission cards. A red `⚡ yolo` badge stays in the winbar while
@@ -777,6 +796,14 @@ require("advantage").setup({
   system_prompt = nil,           -- string to replace, function(default) to extend
   extensions = {},               -- setup(api) modules: tools/providers/harness/prompt parts
   max_agent_turns = 100,         -- safety cap on tool-loop round-trips per user turn
+  verification = {              -- post-change deterministic project gates
+    enabled = true,
+    commands = {},              -- explicit trusted override; empty uses the manifest
+    manifest = ".advantage/verification.json", -- false disables project-local gates
+    timeout_ms = 120000,         -- per command
+    max_output_bytes = 12000,   -- bounded failure evidence sent to the model
+    max_repairs = 1,            -- same-conversation repair attempts
+  },
   ui = {
     width = 0.42,                -- panel width (fraction of columns)
     input_height = 4,

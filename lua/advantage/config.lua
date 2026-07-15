@@ -148,6 +148,18 @@ M.defaults = {
   ---stops with a notice; sending another message resumes. Resets each user turn.
   max_agent_turns = 100,
 
+  ---Deterministic project gates run after a clean terminal response with file-tool
+  ---changes. Explicit commands are trusted; project-manifest commands require
+  ---approval for each content hash. Failures get one bounded repair path.
+  verification = {
+    enabled = true,
+    commands = {},
+    manifest = ".advantage/verification.json",
+    timeout_ms = 120000,
+    max_output_bytes = 12000,
+    max_repairs = 1,
+  },
+
   ui = {
     width = 0.42, -- fraction of columns
     input_height = 4,
@@ -628,6 +640,48 @@ local function validate(o)
   end
   if o.max_agent_turns ~= nil and (type(o.max_agent_turns) ~= "number" or o.max_agent_turns < 0) then
     errs[#errs + 1] = "max_agent_turns must be a non-negative number"
+  end
+  if o.verification ~= nil and type(o.verification) ~= "table" then
+    errs[#errs + 1] = "verification must be a table"
+  elseif type(o.verification) == "table" then
+    local v = o.verification
+    if v.enabled ~= nil and type(v.enabled) ~= "boolean" then
+      errs[#errs + 1] = "verification.enabled must be boolean"
+    end
+    if v.commands ~= nil then
+      if type(v.commands) ~= "table" or not vim.islist(v.commands) then
+        errs[#errs + 1] = "verification.commands must be a list"
+      else
+        for _, command in ipairs(v.commands) do
+          if type(command) ~= "string" or vim.trim(command) == "" then
+            errs[#errs + 1] = "verification.commands entries must be non-empty strings"
+            break
+          end
+        end
+      end
+    end
+    if v.manifest ~= nil and v.manifest ~= false then
+      if
+        type(v.manifest) ~= "string"
+        or vim.trim(v.manifest) == ""
+        or v.manifest:sub(1, 1) == "/"
+        or v.manifest:sub(1, 1) == "\\"
+        or v.manifest:match("^%a:[/\\]")
+        or v.manifest:find("..", 1, true)
+      then
+        errs[#errs + 1] = "verification.manifest must be a relative contained path or false"
+      end
+    end
+    for _, field in ipairs({ "timeout_ms", "max_output_bytes" }) do
+      local value = v[field]
+      if value ~= nil and (type(value) ~= "number" or value < 1 or value ~= math.floor(value)) then
+        errs[#errs + 1] = "verification." .. field .. " must be a positive integer"
+      end
+    end
+    local repairs = v.max_repairs
+    if repairs ~= nil and (type(repairs) ~= "number" or repairs < 0 or repairs ~= math.floor(repairs)) then
+      errs[#errs + 1] = "verification.max_repairs must be a non-negative integer"
+    end
   end
   if type(o.subagents) == "table" then
     local s = o.subagents

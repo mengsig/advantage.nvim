@@ -97,6 +97,15 @@ function M.navgraph_guide()
   return NAVGRAPH_GUIDE
 end
 
+local VERIFICATION_GUIDE =
+  'Project gates — maintain `%s` as `{"version":1,"commands":[...]}` only after checks are confirmed by repo/CI or a successful run. Never invent or weaken checks; edits activate next user turn.'
+
+function M.verification_guide()
+  local cfg = config.options.verification or {}
+  if cfg.enabled == false or type(cfg.manifest) ~= "string" or #(cfg.commands or {}) > 0 then return nil end
+  return VERIFICATION_GUIDE:format(cfg.manifest)
+end
+
 ---Instructions for the memory tools. Only injected while memory is enabled —
 ---teaching the model to call `remember`/`use_skill` when those tools are absent
 ---from the schema would just produce "Unknown tool" errors.
@@ -143,6 +152,8 @@ function M.system_prompt_parts(memory_block, cwd, frozen_base, model, harness_mo
   if lsp then parts[#parts + 1] = { label = "lsp guide", text = lsp } end
   local navgraph = M.navgraph_guide()
   if navgraph then parts[#parts + 1] = { label = "navgraph guide", text = navgraph } end
+  local verification = M.verification_guide()
+  if verification then parts[#parts + 1] = { label = "verification guide", text = verification } end
   -- Append the memory-tool instructions plus the per-repo learned context and
   -- skills index. It rides the stable system prefix, making identical content
   -- eligible for provider cache reuse; relevant facts can avoid repeated
@@ -184,7 +195,7 @@ function M.new(opts)
   self.usage = opts.usage or { input = 0, output = 0, cached = 0 }
   self.usage.reasoning = self.usage.reasoning or 0
   self.usage.cache_write = self.usage.cache_write or 0
-  self.status = "idle" -- idle | streaming | tools
+  self.status = "idle" -- idle | streaming | tools | verifying
   self.job = nil
   self.cancelled = false
   self.epoch = 0 -- invalidates every callback belonging to an abandoned operation
@@ -219,6 +230,8 @@ function M.new(opts)
   self.parallel_batch = nil -- active fan-out scheduler, including queued (not-yet-started) scouts
   self.snapshots = {} -- abs path -> content before the agent's first touch (false = new file)
   self.turn_changed = {} -- abs paths changed during the current turn
+  self._verification_repairs = 0
+  self._verification_snapshot = nil
   self._scout_waves = 0 -- model guidance only; never an admission quota
   self._scout_guided = false
   self._post_scout_action_guided = false
@@ -438,6 +451,20 @@ function Agent:send(text, opts)
   self.turn_usage = { input = 0, output = 0, cached = 0, reasoning = 0, cache_write = 0 }
   self.turn_open = false
   self.turn_changed = {}
+  self._verification_repairs = 0
+  self._verification_snapshot = nil
+  local verification_cfg = config.options.verification or {}
+  if
+    verification_cfg.enabled ~= false
+    and type(verification_cfg.manifest) == "string"
+    and #(verification_cfg.commands or {}) == 0
+  then
+    self._verification_snapshot =
+      require("advantage.verification_manifest").load(self.ctx.cwd, verification_cfg.manifest)
+    if self._verification_snapshot.error then
+      self:ui().notice(("ignored invalid %s: %s"):format(verification_cfg.manifest, self._verification_snapshot.error))
+    end
+  end
   self._scout_waves = 0
   self._scout_guided = false
   self._post_scout_action_guided = false
@@ -1076,8 +1103,97 @@ function Agent:_restart_turn()
   return self:_turn()
 end
 
+function Agent:_verification_plan()
+  local cfg = config.options.verification or {}
+  local commands = cfg.commands or {}
+  assert(type(commands) == "table", "verification commands must be a table")
+  assert(type(self.turn_changed) == "table", "turn change tracking must be initialized")
+  if #commands > 0 then return commands end
+  local snapshot = self._verification_snapshot
+  if type(snapshot) == "table" and not snapshot.error then return snapshot.commands or {}, snapshot end
+  return {}
+end
+
+function Agent:_approve_verification_manifest(snapshot, continue)
+  assert(type(snapshot) == "table" and type(snapshot.hash) == "string", "verification manifest hash required")
+  assert(type(continue) == "function", "verification continuation required")
+  local ui, epoch = self:ui(), self.epoch
+  ui.set_status("waiting", "verification manifest")
+  self.pending_permission = ui.confirm({
+    title = "Trust project verification commands?",
+    lines = vim.list_extend({ snapshot.path }, vim.deepcopy(snapshot.commands)),
+    filetype = "sh",
+  }, function(decision)
+    self.pending_permission = nil
+    if self.cancelled or self.epoch ~= epoch then return end
+    if decision ~= "allow" and decision ~= "always" then
+      ui.notice("project verification manifest not trusted — gates skipped")
+      if decision == "interrupt" and self:_drain_interrupts_as_user_messages() then return self:_restart_turn() end
+      return self:_finish()
+    end
+    local trusted, err = require("advantage.verification_manifest").trust(self.ctx.cwd, snapshot)
+    if not trusted then
+      ui.notice("could not trust verification manifest: " .. tostring(err))
+      return self:_finish(true)
+    end
+    ui.notice("project verification manifest trusted")
+    continue()
+  end)
+end
+
+function Agent:_start_automatic_verification(commands)
+  assert(type(commands) == "table" and #commands > 0, "verification commands required")
+  local cfg = config.options.verification or {}
+  self.status = "verifying"
+  self:ui().set_status("tool", "verification")
+  self:ui().notice(("verifying changed work (%d command%s)"):format(#commands, #commands == 1 and "" or "s"))
+  local epoch = self.epoch
+  self.job = require("advantage.verification").run(commands, {
+    cwd = self.ctx.cwd,
+    timeout_ms = cfg.timeout_ms or 120000,
+    max_output_bytes = cfg.max_output_bytes or 12000,
+  }, function(result)
+    if self.cancelled or self.epoch ~= epoch then return end
+    self.job = nil
+    if result.ok then
+      self:ui().notice("automatic verification passed")
+      if self:_drain_interrupts_as_user_messages() then return self:_restart_turn() end
+      return self:_finish()
+    end
+
+    local max_repairs = cfg.max_repairs or 0
+    if self._verification_repairs >= max_repairs then
+      self:ui().notice(("automatic verification failed: %s\n%s"):format(result.command, result.output))
+      return self:_finish(true)
+    end
+    self._verification_repairs = self._verification_repairs + 1
+    self:_drain_interrupts_as_user_messages()
+    local prompt = require("advantage.verification").failure_prompt(result, self._verification_repairs, max_repairs)
+    table.insert(self.messages, { role = "user", content = { { type = "text", text = prompt } } })
+    self:ui().user_message(prompt)
+    self:ui().notice("verification failed — requesting a bounded repair")
+    self:_restart_turn()
+  end)
+end
+
+---Run the turn-pinned project gates after changed work.
+function Agent:_run_automatic_verification()
+  local cfg = config.options.verification or {}
+  local commands, snapshot = self:_verification_plan()
+  if cfg.enabled == false or #commands == 0 or vim.tbl_count(self.turn_changed) == 0 then return self:_finish() end
+  if snapshot then
+    local manifest = require("advantage.verification_manifest")
+    if not manifest.is_trusted(self.ctx.cwd, snapshot) then
+      return self:_approve_verification_manifest(snapshot, function()
+        self:_start_automatic_verification(commands)
+      end)
+    end
+  end
+  self:_start_automatic_verification(commands)
+end
+
 ---Handle a completed model response: record the assistant blocks, then route to
----tool execution, an interrupt-driven restart, or turn completion.
+---tool execution, an interrupt-driven restart, verification, or turn completion.
 function Agent:_on_stream_complete(blocks, stop_reason)
   assert(type(blocks) == "table", "_on_stream_complete: blocks must be a table")
   self.job = nil
@@ -1102,10 +1218,12 @@ function Agent:_on_stream_complete(blocks, stop_reason)
 
   if stop_reason == "refusal" then
     self:ui().notice("the model declined this request (safety refusal)")
+    return self:_finish()
   elseif stop_reason == "max_tokens" then
     self:ui().notice("response hit the output-token limit and was truncated")
+    return self:_finish()
   end
-  self:_finish()
+  self:_run_automatic_verification()
 end
 
 function Agent:_continue_turn()

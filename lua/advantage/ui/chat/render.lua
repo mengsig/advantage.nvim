@@ -55,21 +55,24 @@ end
 
 ---Per-status tool-line style: a traffic-light signal — running is yellow,
 ---success green, failure red — with the icon and name carrying the color.
+local TOOL_STYLES = {
+  pending = { icon = "·", icon_hl = "AdvToolGhost", line = "AdvToolGhost", name = "AdvToolGhost" },
+  waiting = { icon = "◇", icon_hl = "AdvToolWaiting", line = "AdvToolFaint", name = "AdvToolActiveName" },
+  running = {
+    icon = FRAMES[S.spinner],
+    icon_hl = "AdvToolRunning",
+    line = "AdvToolFaint",
+    name = "AdvToolRunning",
+  },
+  ok = { icon = "✓", icon_hl = "AdvToolOk", line = "AdvToolFaint", name = "AdvToolOk" },
+  error = { icon = "✗", icon_hl = "AdvToolErr", line = "AdvToolFaint", name = "AdvToolErr" },
+  denied = { icon = "◌", icon_hl = "AdvToolDenied", line = "AdvToolDenied", name = "AdvToolDenied" },
+}
+
 local function tool_style(status)
-  local styles = {
-    pending = { icon = "·", icon_hl = "AdvToolGhost", line = "AdvToolGhost", name = "AdvToolGhost" },
-    waiting = { icon = "◇", icon_hl = "AdvToolWaiting", line = "AdvToolFaint", name = "AdvToolActiveName" },
-    running = {
-      icon = FRAMES[S.spinner],
-      icon_hl = "AdvToolRunning",
-      line = "AdvToolFaint",
-      name = "AdvToolRunning",
-    },
-    ok = { icon = "✓", icon_hl = "AdvToolOk", line = "AdvToolFaint", name = "AdvToolOk" },
-    error = { icon = "✗", icon_hl = "AdvToolErr", line = "AdvToolFaint", name = "AdvToolErr" },
-    denied = { icon = "◌", icon_hl = "AdvToolDenied", line = "AdvToolDenied", name = "AdvToolDenied" },
-  }
-  return styles[status or "pending"] or styles.pending
+  local style = TOOL_STYLES[status or "pending"] or TOOL_STYLES.pending
+  if style == TOOL_STYLES.running then style.icon = FRAMES[S.spinner] end
+  return style
 end
 
 local function tool_line(t)

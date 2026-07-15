@@ -2,6 +2,7 @@ CLAUDE.md
 AGENTS.md
 .claude/
 .nvime/
-.advantage/
+.advantage/*
+!.advantage/verification.json
 */.navgraph/*
 .navgraph/
