@@ -877,18 +877,13 @@ function step(s)
     -- Four round-robin buckets retain cross-session prefix reuse without
     -- routing every concurrent scout turn through one hot cache key. The
     -- assigned bucket stays fixed for every turn of this scout session.
-    prompt_cache_key = vim.fn.sha256(
-      "advantage-scout\0"
-        .. tostring(s.model.provider)
-        .. "/"
-        .. tostring(s.model.id)
-        .. "\0"
-        .. scout_system
-        .. "\0"
-        .. encoded_tools
-        .. "\0bucket:"
-        .. tostring(s.cache_bucket)
-    ),
+    prompt_cache_key = util.hash_parts({
+      "advantage-scout",
+      tostring(s.model.provider) .. "/" .. tostring(s.model.id),
+      scout_system,
+      encoded_tools,
+      "bucket:" .. tostring(s.cache_bucket),
+    }),
     session_id = s.request_key,
     on = {
       text = function()

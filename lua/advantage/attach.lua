@@ -27,12 +27,6 @@ local function has(bin)
   return vim.fn.executable(bin) == 1
 end
 
-local function cache_dir()
-  local dir = vim.fn.stdpath("cache") .. "/advantage/images"
-  vim.fn.mkdir(dir, "p")
-  return dir
-end
-
 ---Run a command, returning binary stdout on success.
 local function run(cmd, timeout)
   local ok, res = pcall(function()
@@ -43,7 +37,7 @@ local function run(cmd, timeout)
 end
 
 ---Grab an image from the system clipboard (Wayland, X11 or macOS).
----@return {name:string, path:string, media_type:string, data:string}|nil, string|nil
+---@return {name:string, media_type:string, data:string}|nil, string|nil
 function M.clipboard_image()
   local grabbers = {}
   if vim.env.WAYLAND_DISPLAY and has("wl-paste") then
@@ -68,16 +62,14 @@ function M.clipboard_image()
     end
     if available then
       local data = run(g.get)
-      if data and too_big(data) then return nil, too_big(data) end
+      local size_err = data and too_big(data)
+      if size_err then return nil, size_err end
       if data and #data > 0 then
         local name = os.date("paste-%H%M%S") .. ".png"
-        local path = cache_dir() .. "/" .. name
-        local f = io.open(path, "wb")
-        if f then
-          f:write(data)
-          f:close()
-        end
-        return { name = name, path = path, media_type = "image/png", data = vim.base64.encode(data) }
+        -- The request/session owns the base64 payload; no later code consumes a
+        -- clipboard path. Avoid leaving a second, unbounded-lifetime plaintext
+        -- screenshot under stdpath("cache").
+        return { name = name, media_type = "image/png", data = vim.base64.encode(data) }
       end
     end
   end
@@ -90,9 +82,15 @@ function M.load_image(path)
   local ext = path:match("%.(%w+)$")
   local media = ext and M.IMAGE_TYPES[ext:lower()]
   if not media then return nil, "not a supported image (png/jpg/jpeg/gif/webp)" end
+  local stat = uv.fs_stat(path)
+  if not stat or stat.type ~= "file" then return nil, "cannot read " .. path end
+  if (stat.size or 0) > MAX_IMAGE_BYTES then
+    return nil, ("image is too large (%.1f MB, max %d MB)"):format(stat.size / 1048576, MAX_IMAGE_BYTES / 1048576)
+  end
   local f = io.open(path, "rb")
   if not f then return nil, "cannot read " .. path end
-  local data = f:read("*a")
+  -- Keep the read bounded even if the file grows between stat and read.
+  local data = f:read(MAX_IMAGE_BYTES + 1) or ""
   f:close()
   local err = too_big(data)
   if err then return nil, err end

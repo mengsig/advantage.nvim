@@ -199,7 +199,10 @@ Full defaults live in `lua/advantage/config.lua`. Key options: >lua
       memory = { enabled = true, allow_skill_harness = false,
                  budget_tokens = 2000, skill_body_budget_tokens = 8000,
                  skills_index_budget_tokens = 1200 },
-      sessions = { autosave = true },
+      sessions = {
+        autosave = true,
+        max_file_bytes = 128 * 1024 * 1024,
+      },
     })
 <
 Note: `models` and other list options are replaced wholesale when you supply

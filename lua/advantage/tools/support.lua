@@ -204,7 +204,7 @@ end
 
 function S.unified_diff(old, new, path)
   assert(type(old) == "string" and type(new) == "string", "unified_diff: old/new must be strings")
-  local diff = vim.text.diff(old, new, { result_type = "unified", ctxlen = 3 }) --[[@as string?]]
+  local diff = util.text_diff(old, new, { result_type = "unified", ctxlen = 3 }) --[[@as string?]]
   if not diff or diff == "" then return { "(no changes)" } end
   local lines = { "--- a/" .. path, "+++ b/" .. path }
   vim.list_extend(lines, vim.split(diff, "\n", { plain = true, trimempty = true }))

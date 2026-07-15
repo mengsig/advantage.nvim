@@ -196,7 +196,7 @@ function M.new(opts)
     agent = self,
   }
   local actual_cwd = vim.fs.normalize(self.ctx.cwd or "")
-  local digest = vim.fn.sha256(actual_cwd .. "\0" .. self.id)
+  local digest = require("advantage.util").hash_parts({ actual_cwd, self.id })
   self.request_key = digest:sub(1, 8)
     .. "-"
     .. digest:sub(9, 12)
@@ -1150,16 +1150,12 @@ function Agent:_continue_turn()
   local tool_schemas = tools.schemas(self.model)
   local ok_schema, encoded_schema = pcall(vim.json.encode, tool_schemas)
   if not ok_schema then encoded_schema = "" end
-  local prompt_cache_key = vim.fn.sha256(
-    "advantage-parent\0"
-      .. tostring(self.model.provider)
-      .. "/"
-      .. tostring(self.model.id)
-      .. "\0"
-      .. self.ctx.system
-      .. "\0"
-      .. encoded_schema
-  )
+  local prompt_cache_key = require("advantage.util").hash_parts({
+    "advantage-parent",
+    tostring(self.model.provider) .. "/" .. tostring(self.model.id),
+    self.ctx.system,
+    encoded_schema,
+  })
   self.job = provider.stream({
     model = self.model,
     system = self.ctx.system,

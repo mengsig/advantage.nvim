@@ -908,7 +908,10 @@ require("advantage").setup({
   usage = {
     daily_budget = nil,          -- tokens/day; enables run-out projections in /usage
   },
-  sessions = { autosave = true }, -- saved per-project, resume with :Advantage resume
+  sessions = {
+    autosave = true, -- saved per-project, resume with :Advantage resume
+    max_file_bytes = 128 * 1024 * 1024, -- bounded before save/load
+  },
 })
 ```
 
@@ -944,6 +947,7 @@ require("advantage").setup({
 ```sh
 nvim -l tests/smoke.lua   # parser, providers, tools, and a full fake-provider turn
 nvim -l tests/perf.lua    # request hot paths + a warm 200-skill library budget
+nvim -l tests/resource.lua # bounded caches, timer ownership, and UI lifecycle churn
 stylua --check .          # formatting (config in stylua.toml)
 ```
 

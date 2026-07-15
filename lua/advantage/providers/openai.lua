@@ -349,6 +349,7 @@ function M.stream(req)
   local cancelled, inner, reauthed, effort_retried = false, nil, false, false
   local stream_error_retries = 0
   local effort_override
+  local retry_ticket
   local attempt
 
   local function retryable_stream_error(message, meta)
@@ -389,8 +390,16 @@ function M.stream(req)
           vim.notify(notice, vim.log.levels.WARN)
         end)
       end
-      return vim.defer_fn(function()
+      local ticket = {}
+      ticket.resume = function()
         if not cancelled then attempt(false) end
+      end
+      retry_ticket = ticket
+      return vim.defer_fn(function()
+        local resume = ticket.resume
+        ticket.resume = nil
+        if retry_ticket == ticket then retry_ticket = nil end
+        if resume then resume() end
       end, delay)
     end
     req.on.error(message, meta)
@@ -528,6 +537,13 @@ function M.stream(req)
   return {
     stop = function()
       cancelled = true
+      -- A deferred backoff may outlive the request by several seconds. Revoke
+      -- its heavy continuation now so it no longer retains req/messages/body;
+      -- the eventual timer callback holds only the tiny ticket and does nothing.
+      if retry_ticket then
+        retry_ticket.resume = nil
+        retry_ticket = nil
+      end
       if inner then inner.stop() end
     end,
   }

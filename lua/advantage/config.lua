@@ -450,6 +450,10 @@ M.defaults = {
 
   sessions = {
     autosave = true,
+    -- Bound a single persisted transcript before write and before decode/load.
+    -- This contains corrupt files and pathological attachment
+    -- growth while leaving ample room for long source-heavy conversations.
+    max_file_bytes = 128 * 1024 * 1024,
   },
 }
 
@@ -687,6 +691,18 @@ local function validate(o)
     end
     if o.harness.sync_effort ~= nil and type(o.harness.sync_effort) ~= "boolean" then
       errs[#errs + 1] = "harness.sync_effort must be boolean"
+    end
+  end
+  if type(o.sessions) == "table" then
+    if o.sessions.autosave ~= nil and type(o.sessions.autosave) ~= "boolean" then
+      errs[#errs + 1] = "sessions.autosave must be boolean"
+    end
+    local bytes = o.sessions.max_file_bytes
+    if
+      bytes ~= nil
+      and (type(bytes) ~= "number" or bytes ~= math.floor(bytes) or bytes < 64 * 1024 or bytes > 1024 * 1024 * 1024)
+    then
+      errs[#errs + 1] = "sessions.max_file_bytes must be an integer from 65536 to 1073741824"
     end
   end
   if

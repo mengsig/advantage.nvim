@@ -47,7 +47,8 @@ end
 M._changes = changes
 
 local function diff_stat(item)
-  local diff = vim.text.diff(item.before, item.after, { result_type = "unified", ctxlen = 0 }) --[[@as string]] or ""
+  local diff = require("advantage.util").text_diff(item.before, item.after, { result_type = "unified", ctxlen = 0 }) --[[@as string]]
+    or ""
   local add, del = 0, 0
   for line in diff:gmatch("[^\n]+") do
     local c = line:sub(1, 1)
@@ -65,7 +66,8 @@ local function unified_lines(items)
     lines[#lines + 1] = ("diff · %s%s"):format(name, item.deleted and " (deleted)" or item.new and " (new file)" or "")
     lines[#lines + 1] = "--- a/" .. name
     lines[#lines + 1] = "+++ b/" .. name
-    local diff = vim.text.diff(item.before, item.after, { result_type = "unified", ctxlen = 3 }) --[[@as string]] or ""
+    local diff = require("advantage.util").text_diff(item.before, item.after, { result_type = "unified", ctxlen = 3 }) --[[@as string]]
+      or ""
     vim.list_extend(lines, vim.split(diff, "\n", { plain = true, trimempty = true }))
   end
   return lines
@@ -118,11 +120,11 @@ local function side_by_side(item)
   api.nvim_set_current_win(file_win)
 end
 
-local function git_fallback(ui)
+local function git_fallback(ui, cwd)
   -- Async so a large repo / slow FS doesn't freeze the UI on `git diff`.
   vim.system(
     { "git", "diff" },
-    { text = true },
+    { text = true, cwd = cwd },
     vim.schedule_wrap(function(res)
       if not res or res.code ~= 0 or vim.trim(res.stdout or "") == "" then
         ui.notify("no agent changes to review (and no git diff)", vim.log.levels.INFO)
@@ -142,7 +144,7 @@ end
 function M.open(agent)
   local ui = require("advantage.ui.chat")
   local items = changes(agent)
-  if #items == 0 then return git_fallback(ui) end
+  if #items == 0 then return git_fallback(ui, agent.ctx.start_cwd or agent.ctx.cwd) end
 
   local entries = {}
   if #items > 1 then

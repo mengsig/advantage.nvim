@@ -48,7 +48,7 @@ local S = {
   harness_label = nil,
   welcome_mark = nil,
   on_submit = nil,
-  attachments = {}, -- pending prompt images: {name=, path=, media_type=, data=}
+  attachments = {}, -- pending prompt images: {name=, media_type=, data=, path?=}
   follow = true, -- stick to the bottom of the transcript
   queue_count = 0, -- messages waiting for the current agent flow to finish
 }

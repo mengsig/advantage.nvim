@@ -112,12 +112,36 @@ local function executable_identity(path, stat)
 end
 
 local function sha256_file(path, stat)
+  -- Stream through the platform digest utility instead of allocating the whole
+  -- executable. This is also required on Neovim 0.10, whose Vimscript sha256()
+  -- raises E976 for binary strings containing NUL.
+  local commands = {
+    { bin = "sha256sum", argv = { "sha256sum", "--", path } },
+    { bin = "shasum", argv = { "shasum", "-a", "256", path } },
+    { bin = "openssl", argv = { "openssl", "dgst", "-sha256", path } },
+  }
+  for _, command in ipairs(commands) do
+    if vim.fn.executable(command.bin) == 1 then
+      local ok, result = pcall(function()
+        return vim.system(command.argv, { text = true }):wait(10000)
+      end)
+      if ok and result and result.code == 0 then
+        for digest in (result.stdout or ""):gmatch("[0-9a-fA-F]+") do
+          if #digest == 64 then return digest:lower() end
+        end
+      end
+    end
+  end
+
+  -- Last-resort compatibility for text-only executable scripts on minimal
+  -- systems. Guard binary failure and keep the optional legacy profile closed.
   local fd, open_err = uv.fs_open(path, "r", 438)
   if not fd then return nil, tostring(open_err or "open failed") end
   local bytes, read_err = uv.fs_read(fd, stat.size, 0)
   uv.fs_close(fd)
   if not bytes then return nil, tostring(read_err or "read failed") end
-  return vim.fn.sha256(bytes)
+  local ok, digest = pcall(vim.fn.sha256, bytes)
+  return ok and digest or nil, ok and nil or tostring(digest)
 end
 
 local function command_option_set(command)

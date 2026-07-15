@@ -51,15 +51,13 @@ local PREAMBLE = {
 
 ---Walk up from cwd to the nearest `.git` so memory is stable no matter which
 ---sub-directory Neovim was opened in; fall back to cwd.
-local _root_cache = {}
 local _scoped_root = nil
 local _scoped_cwd = nil
 local function discover_root(cwd)
   cwd = cwd or uv.cwd() or ""
-  if _root_cache[cwd] ~= nil then return _root_cache[cwd] end
-  local root = util.project_root(cwd)
-  _root_cache[cwd] = root
-  return root
+  -- util.project_root owns the shared bounded memo. Keeping a second cache here
+  -- used to double-retain every launch directory for the lifetime of Neovim.
+  return util.project_root(cwd)
 end
 
 function M.root()

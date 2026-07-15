@@ -40,7 +40,25 @@ local uv = vim.uv or vim.loop
 -- Canonical workspace discovery shared by agents, sessions, memory, and tools.
 -- Keeping this in one small helper prevents a subdirectory launch from giving
 -- each subsystem a subtly different idea of the project boundary.
+-- Neovim can stay alive for days while plugins, tests, and directory pickers
+-- ask about many unrelated paths. A plain memo table retains every cwd string
+-- and root forever, so bound this process-wide optimization. The limit is large
+-- enough to cover ordinary monorepo navigation while keeping adversarial or
+-- generated-directory workloads flat.
+local PROJECT_ROOT_CACHE_MAX = 128
 local _project_roots = {}
+local _project_root_order = {}
+
+local function cache_project_root(cwd, root)
+  if _project_roots[cwd] == nil then
+    if #_project_root_order >= PROJECT_ROOT_CACHE_MAX then
+      local evicted = table.remove(_project_root_order, 1)
+      _project_roots[evicted] = nil
+    end
+    _project_root_order[#_project_root_order + 1] = cwd
+  end
+  _project_roots[cwd] = root
+end
 
 ---@param cwd? string
 ---@return string
@@ -50,8 +68,19 @@ function M.project_root(cwd)
   local git = cwd ~= "" and vim.fs.find(".git", { path = cwd, upward = true })[1] or nil
   local root = git and vim.fs.dirname(git) or cwd
   root = uv.fs_realpath(root) or root
-  _project_roots[cwd] = root
+  cache_project_root(cwd, root)
   return root
+end
+
+-- Introspection/reset hooks keep the resource contract directly testable and
+-- make development-time module reloads deterministic.
+function M._project_root_cache_size()
+  return #_project_root_order
+end
+
+function M._reset_project_root_cache()
+  _project_roots = {}
+  _project_root_order = {}
 end
 
 function M.buf_valid(buf)
@@ -60,6 +89,27 @@ end
 
 function M.win_valid(win)
   return win and vim.api.nvim_win_is_valid(win)
+end
+
+---Version-safe text diff. `vim.text.diff` is newer than Advantage's Neovim
+---0.10 floor; `vim.diff` provides the same libvimdiff contract there.
+function M.text_diff(old, new, opts)
+  local diff = vim.text and vim.text.diff or vim.diff
+  assert(type(diff) == "function", "Neovim text diff API is unavailable")
+  return diff(old, new, opts)
+end
+
+---Stable collision-resistant identity for an ordered list of arbitrary byte
+---strings. Neovim 0.10's Vimscript sha256() rejects NUL-containing strings, so
+---frame every part as base64 plus its encoded length before hashing.
+function M.hash_parts(parts)
+  assert(type(parts) == "table", "hash_parts: parts must be a table")
+  local framed = {}
+  for i, value in ipairs(parts) do
+    local encoded = vim.base64.encode(tostring(value or ""))
+    framed[i] = tostring(#encoded) .. ":" .. encoded
+  end
+  return vim.fn.sha256(table.concat(framed, "|"))
 end
 
 local function under(root, abs)
@@ -393,10 +443,26 @@ local function on_attempt_exit(ctx, attempt_no, code, stray, stderr)
     retry_plan(code, status, retry_after, #stray, st.dispatched, st.stopped, attempt_no, ctx.max_attempts)
   if delay then
     if opts.on_retry then pcall(opts.on_retry, attempt_no, reason) end
-    vim.defer_fn(function()
+    -- vim.defer_fn does not expose a cancellation handle. Put the continuation
+    -- that closes over opts/body/ctx behind a tiny revocable ticket: stop() can
+    -- nil it immediately, so the remaining timer closure retains only this
+    -- small table until it fires (potentially 60s later for Retry-After).
+    local ticket = {}
+    ticket.resume = function()
       if not st.finished and not st.stopped then run_attempt(ctx, attempt_no + 1) end
+    end
+    st.retry_ticket = ticket
+    vim.defer_fn(function()
+      local resume = ticket.resume
+      ticket.resume = nil
+      if st.retry_ticket == ticket then st.retry_ticket = nil end
+      if resume then resume() end
     end, delay)
     return
+  end
+  if st.retry_ticket then
+    st.retry_ticket.resume = nil
+    st.retry_ticket = nil
   end
   st.finished = true
   ctx.cleanup()
@@ -450,7 +516,7 @@ function run_attempt(ctx, attempt_no)
     st.finished = true
     ctx.cleanup()
     vim.schedule(function()
-      opts.on_error("failed to start curl — is it installed?")
+      if not st.stopped then opts.on_error("failed to start curl — is it installed?") end
     end)
   end
 end
@@ -472,7 +538,7 @@ function M.request_sse(opts)
     paths = paths,
     cleanup = make_cleanup(paths),
     max_attempts = opts.max_attempts or 3,
-    st = { finished = false, dispatched = 0, stopped = false, job = nil },
+    st = { finished = false, dispatched = 0, stopped = false, job = nil, retry_ticket = nil },
   }
   run_attempt(ctx, 1)
 
@@ -480,6 +546,10 @@ function M.request_sse(opts)
   return {
     stop = function()
       st.stopped = true
+      if st.retry_ticket then
+        st.retry_ticket.resume = nil
+        st.retry_ticket = nil
+      end
       if not st.finished then
         st.finished = true
         pcall(vim.fn.jobstop, st.job)

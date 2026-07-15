@@ -399,7 +399,7 @@ local function map(buf, mode, lhs, rhs, desc, opts)
 end
 
 ---Create the transcript + prompt scratch buffers with their options set.
-local function create_chat_buffers()
+local function create_chat_buffer()
   S.buf = api.nvim_create_buf(false, true)
   api.nvim_buf_set_name(S.buf, "advantage://chat")
   vim.bo[S.buf].buftype = "nofile"
@@ -408,7 +408,9 @@ local function create_chat_buffers()
   vim.bo[S.buf].filetype = "advantage"
   vim.bo[S.buf].modifiable = false
   if not pcall(vim.treesitter.start, S.buf, "markdown") then vim.bo[S.buf].syntax = "markdown" end
+end
 
+local function create_input_buffer()
   S.input_buf = api.nvim_create_buf(false, true)
   api.nvim_buf_set_name(S.input_buf, "advantage://prompt")
   vim.bo[S.input_buf].buftype = "nofile"
@@ -536,8 +538,8 @@ local function map_input_keys()
 end
 
 ---Autocmds that keep the prompt sized and the transcript's follow state current.
-local function attach_buf_autocmds()
-  assert(util.buf_valid(S.buf) and util.buf_valid(S.input_buf), "attach_buf_autocmds: buffers must exist")
+local function attach_input_autocmds()
+  assert(util.buf_valid(S.input_buf), "attach_input_autocmds: prompt buffer must exist")
   api.nvim_create_autocmd({ "TextChanged", "TextChangedI" }, {
     buffer = S.input_buf,
     callback = function()
@@ -545,6 +547,10 @@ local function attach_buf_autocmds()
       resize_input()
     end,
   })
+end
+
+local function attach_chat_autocmds()
+  assert(util.buf_valid(S.buf), "attach_chat_autocmds: chat buffer must exist")
   -- keep `follow` in sync with where the user actually is in the transcript
   api.nvim_create_autocmd("CursorMoved", {
     buffer = S.buf,
@@ -554,6 +560,9 @@ local function attach_buf_autocmds()
       S.follow = cur >= lc - 2
     end,
   })
+end
+
+local function attach_resize_autocmd()
   api.nvim_create_autocmd("VimResized", {
     group = api.nvim_create_augroup("AdvantageResize", { clear = true }),
     callback = resize_input,
@@ -561,11 +570,42 @@ local function attach_buf_autocmds()
 end
 
 local function ensure_bufs()
-  if util.buf_valid(S.buf) then return end
-  create_chat_buffers()
-  map_chat_keys()
-  map_input_keys()
-  attach_buf_autocmds()
+  local chat_ok, input_ok = util.buf_valid(S.buf), util.buf_valid(S.input_buf)
+  if chat_ok and input_ok then return end
+
+  -- A user command or another plugin may wipe one scratch buffer independently.
+  -- Close any surviving panel windows before repairing the pair so the same
+  -- prompt buffer is never left displayed in an orphan split.
+  for _, win in ipairs({ S.input_win, S.win }) do
+    if util.win_valid(win) then pcall(api.nvim_win_close, win, true) end
+  end
+  S.win, S.input_win = nil, nil
+  stop_timer()
+
+  if not chat_ok then
+    -- Drain timers/closures that still point at the deleted transcript, then
+    -- reset only transcript-owned state. A surviving prompt remains usable.
+    flush_stream()
+    flush_tool_streams()
+    S.tools = {}
+    S.header_mark, S.meta_mark = nil, nil
+    S.think_mark, S.think_start = nil, nil
+    S.mode, S.last_kind = nil, nil
+    S.welcome_mark = nil
+    S.follow = true
+    create_chat_buffer()
+    map_chat_keys()
+    attach_chat_autocmds()
+  end
+  if not input_ok then
+    -- Attachments are chips in the prompt buffer; once that buffer is gone,
+    -- retaining their base64 payloads would be both surprising and a leak.
+    S.attachments = {}
+    create_input_buffer()
+    map_input_keys()
+    attach_input_autocmds()
+  end
+  attach_resize_autocmd()
 end
 
 function M.is_open()
@@ -823,6 +863,11 @@ function M.tool_update(id, patch)
   t.name = patch.name or t.name
   t.error = patch.error or t.error
   redraw_tool(id)
+  -- Extmarks and rendered bytes own the completed card from here on. Keeping
+  -- the Lua record only serves the spinner's running-card redraw loop, so drop
+  -- terminal cards immediately instead of retaining every tool call for the
+  -- entire conversation.
+  if t.status ~= "pending" and t.status ~= "waiting" and t.status ~= "running" then S.tools[id] = nil end
   autoscroll()
 end
 

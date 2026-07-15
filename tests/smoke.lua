@@ -52,6 +52,20 @@ do
   check(#events == 2, "dispatches complete events")
   check(events[1].name == "message_start" and events[1].data.message.usage.input_tokens == 10, "decodes payloads")
   check(#strays == 1 and strays[1]:find("plain body"), "collects non-SSE lines as stray")
+
+  local modern_diff = vim.text and vim.text.diff or nil
+  if vim.text then vim.text.diff = nil end
+  local fallback_ok, fallback_diff = pcall(util.text_diff, "before\n", "after\n", { result_type = "unified" })
+  if vim.text then vim.text.diff = modern_diff end
+  check(
+    fallback_ok and type(fallback_diff) == "string" and fallback_diff:find("after", 1, true),
+    "text diff falls back to Neovim 0.10's vim.diff API"
+  )
+  local binary_hash_ok, binary_hash = pcall(util.hash_parts, { "left\0half", "right" })
+  check(
+    binary_hash_ok and #binary_hash == 64 and binary_hash ~= util.hash_parts({ "left", "half\0right" }),
+    "cache identity hashing is NUL-safe and preserves part boundaries on Neovim 0.10"
+  )
 end
 
 -- 2. anthropic handler --------------------------------------------------------
@@ -136,6 +150,209 @@ do
     signed[2].content[1].cache_control == nil and signed[1].content[1].cache_control ~= nil,
     "anthropic cache breakpoints never mutate signed thinking blocks"
   )
+end
+
+-- 2b. anthropic credential rotation recovery ---------------------------------
+
+section("anthropic credential rotation recovery")
+do
+  local auth = require("advantage.auth")
+  local config = require("advantage.config")
+  local tmpdir = vim.fn.tempname()
+  vim.fn.mkdir(tmpdir, "p")
+  local saved_dir = vim.env.CLAUDE_CONFIG_DIR
+  local saved_env_key = vim.env.ANTHROPIC_API_KEY
+  local saved_inline_key = config.options.providers.anthropic.api_key
+  vim.env.CLAUDE_CONFIG_DIR = tmpdir
+  vim.env.ANTHROPIC_API_KEY = nil
+  config.options.providers.anthropic.api_key = nil
+  local credpath = tmpdir .. "/.credentials.json"
+
+  local function write_creds(oauth)
+    local f = assert(io.open(credpath, "w"))
+    f:write(vim.json.encode({ claudeAiOauth = oauth }))
+    f:close()
+  end
+  local function expired(access, refresh)
+    return {
+      accessToken = access,
+      refreshToken = refresh,
+      expiresAt = (os.time() - 10) * 1000,
+      subscriptionType = "pro",
+    }
+  end
+
+  -- Another process wins the refresh and writes a valid replacement before our
+  -- failed request returns. Advantage must re-read and use the winner.
+  write_creds(expired("old-access", "R1"))
+  local race_calls = 0
+  auth._post_json = function(_, _, cb)
+    race_calls = race_calls + 1
+    write_creds({
+      accessToken = "winner-access",
+      refreshToken = "R2",
+      expiresAt = (os.time() + 3600) * 1000,
+      subscriptionType = "max",
+    })
+    cb(nil, "invalid_grant")
+  end
+  local race_cred, race_err
+  auth.anthropic(function(cred, err)
+    race_cred, race_err = cred, err
+  end)
+  check(
+    race_calls == 1 and race_cred and race_cred.token == "winner-access" and race_err == nil,
+    "a lost Claude refresh race reuses the winner's freshly-written access token"
+  )
+
+  -- If only the refresh token rotated and the access token is still expired,
+  -- retry that new token exactly once and persist the successful result.
+  write_creds(expired("old-access", "R1"))
+  local retry_calls = 0
+  auth._post_json = function(_, body, cb)
+    retry_calls = retry_calls + 1
+    if retry_calls == 1 then
+      write_creds(expired("other-stale-access", "R2"))
+      return cb(nil, "invalid_grant")
+    end
+    cb({ access_token = "retried-access", refresh_token = "R3", expires_in = 3600 })
+  end
+  local retry_cred
+  auth.anthropic(function(cred)
+    retry_cred = cred
+  end)
+  check(
+    retry_calls == 2 and retry_cred and retry_cred.token == "retried-access",
+    "a rotated Claude refresh token receives one successful retry"
+  )
+
+  -- Even when the unchanged access token still has a future local expiry, a
+  -- refresh-only winner must be exchanged instead of reviving that token.
+  local refresh_only = {
+    accessToken = "same-api-rejected-access",
+    refreshToken = "before-rotation",
+    expiresAt = (os.time() + 3600) * 1000,
+    subscriptionType = "pro",
+  }
+  write_creds(refresh_only)
+  local refresh_only_calls = 0
+  auth._post_json = function(_, _, cb)
+    refresh_only_calls = refresh_only_calls + 1
+    if refresh_only_calls == 1 then
+      write_creds(vim.tbl_extend("force", refresh_only, { refreshToken = "after-rotation" }))
+      return cb(nil, "invalid_grant")
+    end
+    cb({ access_token = "fresh-after-rotation", refresh_token = "final-refresh", expires_in = 3600 })
+  end
+  local refresh_only_cred
+  auth.anthropic(function(cred)
+    refresh_only_cred = cred
+  end, true)
+  check(
+    refresh_only_calls == 2 and refresh_only_cred and refresh_only_cred.token == "fresh-after-rotation",
+    "a refresh-only race never resurrects the same future-expiry API-rejected token"
+  )
+
+  -- Forced refresh follows a real 401. A future local expiry alone must never
+  -- make the exact same rejected token look recovered.
+  local unchanged = {
+    accessToken = "same-rejected-access",
+    refreshToken = "same-refresh",
+    expiresAt = (os.time() + 3600) * 1000,
+    subscriptionType = "pro",
+  }
+  write_creds(unchanged)
+  check(
+    auth._reload_after_failed_refresh(unchanged) == nil,
+    "forced Claude recovery never reuses the unchanged API-rejected token"
+  )
+
+  -- JSON null/malformed expiry values degrade to the normal refresh/fallback
+  -- path instead of raising arithmetic errors during startup.
+  write_creds({ accessToken = "malformed", refreshToken = nil, expiresAt = vim.NIL })
+  local malformed_err
+  local malformed_ok = pcall(function()
+    auth.anthropic(function(_, err)
+      malformed_err = err
+    end)
+  end)
+  check(
+    malformed_ok and malformed_err ~= nil,
+    "malformed Claude expiry metadata fails cleanly without a login-path crash"
+  )
+
+  auth._post_json = nil
+  vim.env.CLAUDE_CONFIG_DIR = saved_dir
+  vim.env.ANTHROPIC_API_KEY = saved_env_key
+  config.options.providers.anthropic.api_key = saved_inline_key
+  vim.fn.delete(tmpdir, "rf")
+end
+
+-- 2c. openai credential validation -------------------------------------------
+
+section("openai credential validation")
+do
+  local auth = require("advantage.auth")
+  local config = require("advantage.config")
+  local tmpdir = vim.fn.tempname()
+  vim.fn.mkdir(tmpdir, "p")
+  local saved_home = vim.env.CODEX_HOME
+  local saved_env_key = vim.env.OPENAI_API_KEY
+  local saved_mode = config.options.providers.openai.auth_mode
+  local saved_inline_key = config.options.providers.openai.api_key
+  vim.env.CODEX_HOME = tmpdir
+  vim.env.OPENAI_API_KEY = nil
+  config.options.providers.openai.auth_mode = "chatgpt"
+  config.options.providers.openai.api_key = nil
+
+  local function token(exp)
+    return "x." .. vim.base64.encode(vim.json.encode({ exp = exp })) .. ".x"
+  end
+  local f = assert(io.open(tmpdir .. "/auth.json", "w"))
+  f:write(vim.json.encode({ tokens = { access_token = token("not-a-number"), account_id = {} } }))
+  f:close()
+
+  local malformed_err
+  local malformed_ok = pcall(function()
+    auth.openai(function(_, err)
+      malformed_err = err
+    end)
+  end)
+  check(
+    malformed_ok and malformed_err ~= nil,
+    "malformed Codex expiry and account metadata fail cleanly without constructing invalid headers"
+  )
+
+  f = assert(io.open(tmpdir .. "/auth.json", "w"))
+  f:write(vim.json.encode({
+    tokens = { access_token = token(os.time() - 60), refresh_token = "old-refresh", account_id = "old-account" },
+  }))
+  f:close()
+  local race_calls = 0
+  auth._post_json = function(_, _, cb)
+    race_calls = race_calls + 1
+    local winner = assert(io.open(tmpdir .. "/auth.json", "w"))
+    winner:write(vim.json.encode({
+      tokens = { access_token = token(os.time() + 3600), refresh_token = "new-refresh", account_id = "new-account" },
+    }))
+    winner:close()
+    cb(nil, "invalid_grant")
+  end
+  local race_cred
+  auth.openai(function(cred)
+    race_cred = cred
+  end)
+  check(
+    race_calls == 1 and race_cred and race_cred.account_id == "new-account",
+    "a lost Codex refresh race reuses the winner's freshly-written credentials"
+  )
+
+  auth._post_json = nil
+  vim.env.CODEX_HOME = saved_home
+  vim.env.OPENAI_API_KEY = saved_env_key
+  config.options.providers.openai.auth_mode = saved_mode
+  config.options.providers.openai.api_key = saved_inline_key
+  vim.fn.delete(tmpdir, "rf")
 end
 
 -- 3. openai handler -----------------------------------------------------------
@@ -2389,6 +2606,63 @@ do
     "bounded overload exhaustion surfaces one final error exactly once"
   )
 
+  -- Cancellation during backoff must revoke the delayed continuation. The
+  -- timer itself may still fire (vim.defer_fn has no stop handle), but it must
+  -- neither relaunch nor retain the request-heavy closure through that delay.
+  do
+    local held
+    local attempts, stopped, errors = 0, 0, 0
+    vim.defer_fn = function(fn)
+      held = fn
+    end
+    util.request_sse = function(opts)
+      attempts = attempts + 1
+      vim.schedule(function()
+        opts.on_error("HTTP 503: overloaded", 503)
+      end)
+      return {
+        stop = function()
+          stopped = stopped + 1
+        end,
+      }
+    end
+    local handle = openai.stream({
+      model = {
+        provider = "openai",
+        id = "gpt-5.6-sol",
+        label = "sol",
+        reasoning_effort = "medium",
+        reasoning_efforts = { "low", "medium", "high" },
+      },
+      messages = { { role = "user", content = { { type = "text", text = "cancel while backing off" } } } },
+      system = "retry cancellation",
+      tools = {},
+      on = {
+        auth = function() end,
+        text = function() end,
+        thinking = function() end,
+        tool_start = function() end,
+        usage = function() end,
+        complete = function() end,
+        error = function()
+          errors = errors + 1
+        end,
+      },
+    })
+    vim.wait(1000, function()
+      return held ~= nil
+    end, 5)
+    handle.stop()
+    if held then held() end
+    vim.wait(20, function()
+      return false
+    end, 5)
+    check(
+      attempts == 1 and stopped == 1 and errors == 0,
+      "cancelling OpenAI backoff revokes the delayed request continuation"
+    )
+  end
+
   auth.openai = original_auth
   util.request_sse = original_request_sse
   vim.defer_fn = original_defer_fn
@@ -4326,6 +4600,14 @@ do
   local tmp = vim.fn.tempname()
   vim.fn.mkdir(tmp, "p")
   vim.fn.writefile({ "hello", "world" }, tmp .. "/ctx.txt")
+
+  local huge_image = tmp .. "/huge.png"
+  local loop = vim.uv or vim.loop
+  local huge_fd = assert(loop.fs_open(huge_image, "w", 384))
+  assert(loop.fs_ftruncate(huge_fd, 5 * 1024 * 1024 + 1))
+  loop.fs_close(huge_fd)
+  local huge, huge_err = attach.load_image(huge_image)
+  check(not huge and huge_err:find("too large", 1, true), "oversized image files are rejected before allocation")
 
   local expanded, files = attach.expand_mentions("look at @ctx.txt please", tmp)
   check(#files == 1 and expanded:find("hello\nworld", 1, true) ~= nil, "@mention inlines file content")
@@ -6987,6 +7269,14 @@ do
     vim.tbl_contains(errs, "harness.mode is not recognized")
       and vim.tbl_contains(errs, "harness.sync_effort must be boolean"),
     "validation rejects malformed harness policy"
+  )
+  errs = config._validate(vim.tbl_extend("force", vim.deepcopy(config.defaults), {
+    sessions = { autosave = "sometimes", max_file_bytes = 1024 },
+  }))
+  check(
+    vim.tbl_contains(errs, "sessions.autosave must be boolean")
+      and vim.tbl_contains(errs, "sessions.max_file_bytes must be an integer from 65536 to 1073741824"),
+    "validation rejects malformed session persistence bounds"
   )
   check(
     config.defaults.tools.navgraph.enabled == false and config.defaults.tools.navgraph.allow_legacy_benchmark == false,
